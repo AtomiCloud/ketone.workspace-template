@@ -1,0 +1,29 @@
+username: atomi
+name: workspace
+description: AtomiCloud's default workspace scaffold
+project: https://github.com/AtomiCloud/ketone.workspace-template
+source: https://github.com/AtomiCloud/ketone.workspace-template
+email: ernest@atomi.cloud
+tags: ["atomi","workspace"]
+readme: cyan/README.MD
+templates: []
+processors:
+  - cyan/default
+plugins: []
+resolvers: []
+commands:
+  - 'chmod +x scripts/*.sh 2>/dev/null || true'
+build:
+  registry: ${DOMAIN:-docker.io}/${GITHUB_REPO_REF:-atomi}
+  platforms:
+    - linux/amd64
+    - linux/arm64
+  images:
+    template:
+      image: workspace
+      dockerfile: cyan/Dockerfile
+      context: ./cyan
+    blob:
+      image: 'workspace-blob'
+      dockerfile: cyan/blob.Dockerfile
+      context: .

@@ -1,0 +1,50 @@
+name: CI-CD
+
+on:
+  push:
+    branches:
+      - 'main'
+
+env:
+  DOCKER_DOMAIN: ghcr.io
+  DOCKER_USER: ${{ github.actor }}
+  DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+  CYAN_TOKEN: ${{ secrets.CYAN_TOKEN }}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v3
+      - name: Install CyanPrint
+        run: ./scripts/setup-ubuntu.sh
+      - name: Run CyanPrint Tests
+        run: cyanprint test template .
+  publish:
+    needs: test
+    name: Publish
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rlespinasse/github-slug-action@v3.x
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_DOMAIN }}
+          username: ${{ env.DOCKER_USER }}
+          password: ${{ env.DOCKER_PASSWORD }}
+      - name: Install CyanPrint
+        run: ./scripts/setup-ubuntu.sh
+      - name: Publish CyanPrint
+        env:
+          DOMAIN: ${{ env.DOCKER_DOMAIN }}
+          GITHUB_REPO_REF: ${{ github.repository }}
+          DOCKER_PASSWORD: ${{ env.DOCKER_PASSWORD }}
+          DOCKER_USER: ${{ env.DOCKER_USER }}
+          CYAN_TOKEN: ${{ env.CYAN_TOKEN }}
+          IMAGE_VERSION: ${{ github.sha }}-${{ env.GITHUB_REF_SLUG }}
+        run: ./scripts/publish.sh

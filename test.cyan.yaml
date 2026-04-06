@@ -1,0 +1,29 @@
+tests:
+  - name: basic_generation
+    expected:
+      type: snapshot
+      value:
+        path: cyan/fixtures/expected/basic_generation
+    answer_state:
+      cyan/new/username:
+        type: String
+        value: testuser
+      cyan/new/name:
+        type: String
+        value: test-template
+      cyan/new/description:
+        type: String
+        value: A test template
+      cyan/new/email:
+        type: String
+        value: test@example.com
+      cyan/new/more-tags/0:
+        type: String
+        value: 'no'
+      cyan/new/project:
+        type: String
+        value: 'https://github.com/test/test'
+      cyan/new/source:
+        type: String
+        value: 'https://github.com/test/test'
+    deterministic_state: {}

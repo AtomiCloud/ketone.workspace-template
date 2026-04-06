@@ -1,0 +1,49 @@
+cyan/new:
+  active: true
+  history:
+  - version: 21
+    time: 2026-04-06T23:41:56.553364Z
+    answers:
+      cyan/new/tag/1:
+        type: String
+        value: workspace
+      cyan/new/name:
+        type: String
+        value: workspace
+      cyan/new/tag/0:
+        type: String
+        value: atomi
+      cyan/new/description:
+        type: String
+        value: AtomiCloud's default workspace scaffold
+      cyan/new/more-tags/2:
+        type: String
+        value: no
+      cyan/new/more-tags/1:
+        type: String
+        value: yes
+      cyan/new/email:
+        type: String
+        value: ernest@atomi.cloud
+      cyan/new/username:
+        type: String
+        value: atomi
+      cyan/new/more-tags/0:
+        type: String
+        value: yes
+      cyan/new/project:
+        type: String
+        value: https://github.com/AtomiCloud/ketone.workspace-template
+      cyan/new/create:
+        type: String
+        value: Template
+      cyan/new/language:
+        type: String
+        value: Typescript
+      cyan/new/source:
+        type: String
+        value: https://github.com/AtomiCloud/ketone.workspace-template
+      cyan/new/skills:
+        type: String
+        value: yes
+    deterministic_states: {}
