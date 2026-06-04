@@ -1,0 +1,26 @@
+### macOS
+.DS_Store
+._*
+
+### Windows
+Thumbs.db
+desktop.ini
+
+### Linux
+*~
+
+### IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+
+### Project
+.pre-commit-config.yaml
+.kagent/
+
+### Nix
+.direnv/
+result
+result-*

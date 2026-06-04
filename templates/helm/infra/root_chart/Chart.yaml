@@ -1,0 +1,6 @@
+apiVersion: v2
+name: let__service__
+description: Helm chart for let__platform__/let__service__
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

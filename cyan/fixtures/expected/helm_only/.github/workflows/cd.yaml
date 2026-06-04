@@ -1,0 +1,22 @@
+name: CD
+on:
+  push:
+    tags:
+      - v*.*.*
+      - v*.*.*
+jobs:
+  placeholder:
+    name: Placeholder CD
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder Step
+        run: echo "Placeholder step ${{ github.ref_name }}"
+  helm-publish:
+    name: Helm Publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Publish Helm Chart
+        run: bash scripts/ci/helm-publish.sh
+
