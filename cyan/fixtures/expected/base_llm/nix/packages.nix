@@ -1,9 +1,4 @@
-{
-  pkgs,
-  pkgs-2511,
-  pkgs-unstable,
-  atomi,
-}:
+{ pkgs, pkgs-2511, pkgs-unstable, atomi }:
 let
 
   all = rec {

@@ -1,8 +1,4 @@
-{
-  packages,
-  formatter,
-  pre-commit-lib,
-}:
+{ packages, formatter, pre-commit-lib }:
 pre-commit-lib.run {
   src = ./.;
 
@@ -27,7 +23,7 @@ pre-commit-lib.run {
       name = "Secrets Scanning";
       description = "Scan for possible secrets";
       entry = "${packages.infisical}/bin/infisical scan . -v";
-      language = "system";
+      language = ''system'';
       pass_filenames = false;
     };
 
@@ -36,7 +32,7 @@ pre-commit-lib.run {
       name = "Secrets Scanning (Staged files)";
       description = "Scan for possible secrets in staged files";
       entry = "${packages.infisical}/bin/infisical scan git-changes --staged -v";
-      language = "system";
+      language = ''system'';
       pass_filenames = false;
     };
 
@@ -45,7 +41,7 @@ pre-commit-lib.run {
       name = "Gitlint";
       description = "Lints git commit message";
       entry = "${packages.gitlint}/bin/gitlint --staged --msg-filename";
-      language = "system";
+      language = ''system'';
       pass_filenames = true;
       stages = [ "commit-msg" ];
     };
@@ -56,7 +52,7 @@ pre-commit-lib.run {
       description = "Enforce atomi_releaser conforms to gitlint";
       entry = "${packages.sg}/bin/sg gitlint -c atomi_release.yaml";
       files = "(atomi_release\\.yaml|\\.gitlint)";
-      language = "system";
+      language = ''system'';
       pass_filenames = false;
     };
 
@@ -65,7 +61,7 @@ pre-commit-lib.run {
       name = "Shell Check";
       entry = "${packages.shellcheck}/bin/shellcheck";
       files = ".*sh$";
-      language = "system";
+      language = ''system'';
       pass_filenames = true;
     };
 
@@ -74,7 +70,7 @@ pre-commit-lib.run {
       name = "Enforce Shell Script executable";
       entry = "${packages.atomiutils}/bin/chmod +x";
       files = ".*sh$";
-      language = "system";
+      language = ''system'';
       pass_filenames = true;
     };
 

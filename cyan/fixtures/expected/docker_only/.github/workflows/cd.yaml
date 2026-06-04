@@ -1,0 +1,22 @@
+name: CD
+on:
+  push:
+    tags:
+      - v*.*.*
+      - v*.*.*
+jobs:
+  placeholder:
+    name: Placeholder CD
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder Step
+        run: echo "Placeholder step ${{ github.ref_name }}"
+  docker-push:
+    name: Docker Push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Push Docker Image
+        run: bash scripts/ci/docker-push.sh
+

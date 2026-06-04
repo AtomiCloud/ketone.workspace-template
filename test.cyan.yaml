@@ -79,3 +79,86 @@ tests:
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
       - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
     deterministic_state: {}
+
+  - name: docker_only
+    expected:
+      type: snapshot
+      value:
+        path: cyan/fixtures/expected/docker_only
+    answer_state:
+      atomi/platform:
+        type: String
+        value: test-platform
+      atomi/service:
+        type: String
+        value: test-service
+      atomi/llm:
+        type: Bool
+        value: true
+      atomi/docker:
+        type: Bool
+        value: true
+      atomi/helm:
+        type: Bool
+        value: false
+      atomi/secret:
+        type: Bool
+        value: false
+      cyan/nix/basic:
+        type: String
+        value: 'yes'
+      cyan/nix/llm:
+        type: String
+        value: 'no'
+    validate:
+      - find . -name '*.sh' -exec bash -n {} +
+      - grep -q '^tasks:' Taskfile.yaml
+      - grep -q 'docker-build' .github/workflows/ci.yaml
+      - test -f .claude/skills/docker-push/SKILL.md
+      - grep -q '^  docker:' Taskfile.yaml
+      - test "$(find .claude/skills -name SKILL.md | wc -l | tr -d ' ')" = "8"
+      - test ! -f flake.nix
+      - "! grep -rqE 'let__[a-zA-Z_]+__' ."
+      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+    deterministic_state: {}
+
+  - name: no_llm_docker
+    expected:
+      type: snapshot
+      value:
+        path: cyan/fixtures/expected/no_llm_docker
+    answer_state:
+      atomi/platform:
+        type: String
+        value: test-platform
+      atomi/service:
+        type: String
+        value: test-service
+      atomi/llm:
+        type: Bool
+        value: false
+      atomi/docker:
+        type: Bool
+        value: true
+      atomi/helm:
+        type: Bool
+        value: false
+      atomi/secret:
+        type: Bool
+        value: false
+      cyan/nix/basic:
+        type: String
+        value: 'yes'
+      cyan/nix/llm:
+        type: String
+        value: 'no'
+    validate:
+      - find . -name '*.sh' -exec bash -n {} +
+      - grep -q '^tasks:' Taskfile.yaml
+      - test ! -f CLAUDE.md
+      - test ! -d .claude
+      - grep -q 'docker-build' .github/workflows/ci.yaml
+      - test ! -f flake.nix
+      - "! grep -rqE 'let__[a-zA-Z_]+__' ."
+      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+    deterministic_state: {}

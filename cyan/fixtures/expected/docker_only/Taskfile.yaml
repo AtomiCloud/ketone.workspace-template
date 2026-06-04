@@ -1,0 +1,25 @@
+version: "3"
+includes:
+  docker: tasks/Taskfile.docker.yaml
+tasks:
+  setup:
+    desc: Setup the repository
+    cmds:
+      - echo "Completed"
+  lint:
+    desc: Lints the whole code-base
+    cmds:
+      - pre-commit run --all-files
+  test:
+    desc: Run tests
+    cmds:
+      - echo "No tests configured"
+  build:
+    desc: Build the project
+    cmds:
+      - echo "No build configured"
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - echo "Nothing to clean"
+
