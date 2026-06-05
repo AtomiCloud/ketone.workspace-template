@@ -1,4 +1,4 @@
-{ atomi, pkgs, pkgs-2511, pkgs-unstable }:
+{ atomi, pkgs, pkgs-2605, pkgs-unstable }:
 let
   all = rec {
     atomipkgs = (
@@ -14,8 +14,8 @@ let
       }
     );
 
-    nix-2511 = (
-      with pkgs-2511;
+    nix-2605 = (
+      with pkgs-2605;
       {
         inherit
           actionlint
@@ -41,5 +41,5 @@ let
 in
 with all;
 atomipkgs //
-nix-2511 //
+nix-2605 //
 nix-unstable

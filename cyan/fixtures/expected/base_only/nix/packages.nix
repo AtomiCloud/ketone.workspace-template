@@ -1,4 +1,4 @@
-{ pkgs, pkgs-2511, pkgs-unstable, atomi }:
+{ pkgs, pkgs-2605, pkgs-unstable, atomi }:
 let
 
   all = rec {
@@ -13,8 +13,8 @@ let
       }
     );
     nix-unstable = (with pkgs-unstable; { });
-    nix-2511 = (
-      with pkgs-2511;
+    nix-2605 = (
+      with pkgs-2605;
       {
         inherit
           git
@@ -31,4 +31,4 @@ let
   };
 in
 with all;
-nix-2511 // nix-unstable // atomipkgs
+nix-2605 // nix-unstable // atomipkgs
