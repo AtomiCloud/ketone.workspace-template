@@ -1,35 +1,49 @@
 import { StartTemplateWithLambda, GlobType } from '@atomicloud/cyan-sdk';
+import { standardPrompts } from './src/standard';
 
-StartTemplateWithLambda(async (i, d) => {
-  const name = await i.text('Project name', 'cyan/new/name');
-  const description = await i.text('Project description', 'cyan/new/description');
-  const open = '{' + '{';
-  const close = '}' + '}';
+type CyanProcessor = {
+  name: string;
+  files: { root: string; glob: string; type: GlobType; exclude: string[] }[];
+  config: unknown;
+};
 
-  return {
-    processors: [
+const llmExclude = ['**/CLAUDE.md', '**/.claude/**/*', '**/.claude/**/*.*'];
+
+const varSyntax: [string, string][] = [
+  ['let__', '__'],
+  ['// let__', '__'],
+  ['# let__', '__'],
+];
+
+StartTemplateWithLambda(async i => {
+  const { platform, service, llm, docker, helm, secret } = await standardPrompts(i);
+
+  const exclude = llm ? [] : llmExclude;
+  const config = {
+    vars: { platform, service },
+    parser: { varSyntax },
+  };
+
+  const makeProcessor = (root: string): CyanProcessor => ({
+    name: 'cyan/default',
+    files: [
       {
-        name: 'cyan/default',
-        files: [
-          {
-            root: 'templates',
-            glob: '**/*',
-            type: GlobType.Template,
-            exclude: [],
-          },
-        ],
-        config: {
-          vars: { projectName: name, projectDescription: description },
-          parser: {
-            varSyntax: [
-              [open, close],
-              ['// ' + open, close],
-              ['# ' + open, close],
-            ],
-          },
-        },
+        root,
+        glob: '**/*',
+        type: GlobType.Template,
+        exclude,
       },
     ],
+    config,
+  });
+
+  const processors: CyanProcessor[] = [makeProcessor('templates/base')];
+  if (docker) processors.push(makeProcessor('templates/docker'));
+  if (helm) processors.push(makeProcessor('templates/helm'));
+  if (secret) processors.push(makeProcessor('templates/secret'));
+
+  return {
+    processors,
     plugins: [],
   };
 });

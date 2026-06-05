@@ -1,0 +1,6 @@
+version: 2
+updates:
+  - package-ecosystem: helm
+    directory: /infra/root_chart
+    schedule:
+      interval: daily

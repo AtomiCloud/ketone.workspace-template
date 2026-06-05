@@ -1,0 +1,27 @@
+### Build
+node_modules
+dist
+.target
+*.log
+
+### VCS
+.git
+.gitignore
+
+### AtomiCloud
+.kloop/
+
+### Dev
+.env
+.envrc
+.env.*
+!.env.example
+*.md
+!README.md
+
+### IDE
+.idea
+.vscode
+*.swp
+*.swo
+*~

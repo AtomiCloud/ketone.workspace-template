@@ -1,0 +1,14 @@
+version: '3'
+tasks:
+  lint:
+    desc: 'Lint the Helm chart'
+    cmds:
+      - bash scripts/ci/helm-lint.sh
+  docs:
+    desc: 'Generate Helm chart documentation'
+    cmds:
+      - helm-docs --chart-search-root infra/root_chart
+  push:
+    desc: 'Publish the Helm chart'
+    cmds:
+      - bash scripts/ci/helm-publish.sh

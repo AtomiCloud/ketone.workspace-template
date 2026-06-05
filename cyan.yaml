@@ -6,18 +6,52 @@ source: https://github.com/AtomiCloud/ketone.workspace-template
 email: ernest@atomi.cloud
 tags: ["atomi","workspace"]
 readme: cyan/README.MD
-templates: []
+templates:
+- template: atomi/nix
+  answers:
+    cyan/nix/basic: 'yes'
+    cyan/nix/llm: 'no'
 processors:
-  - cyan/default
+- cyan/default
 plugins: []
-resolvers: []
+resolvers:
+- resolver: atomi/json-yaml
+  config:
+    arrayStrategy: concat
+  files:
+  - '.github/workflows/ci.yaml'
+  - '.github/workflows/cd.yaml'
+  - '.github/workflows/release.yaml'
+  - '.github/dependabot.yml'
+  - 'Taskfile.yaml'
+  - '.coderabbit.yaml'
+  - 'atomi_release.yaml'
+- resolver: atomi/md
+  config: {}
+  files:
+  - 'CLAUDE.md'
+  - 'README.md'
+  - '.envrc'
+- resolver: atomi/ignore
+  config: {}
+  files:
+  - '.gitignore'
+  - '.dockerignore'
+- resolver: atomi/nix
+  config: {}
+  files:
+  - 'nix/packages.nix'
+  - 'nix/env.nix'
+  - 'nix/shells.nix'
+  - 'nix/fmt.nix'
+  - 'nix/pre-commit.nix'
 commands:
-  - 'chmod +x scripts/*.sh 2>/dev/null || true'
+- 'chmod +x scripts/ci/*.sh 2>/dev/null || true'
 build:
   registry: ${DOMAIN:-docker.io}/${GITHUB_REPO_REF:-atomi}
   platforms:
-    - linux/amd64
-    - linux/arm64
+  - linux/amd64
+  - linux/arm64
   images:
     template:
       image: workspace
