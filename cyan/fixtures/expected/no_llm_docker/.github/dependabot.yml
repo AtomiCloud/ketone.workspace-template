@@ -5,7 +5,7 @@ updates:
     schedule:
       interval: daily
   - package-ecosystem: docker
-    directory: /
+    directory: /infra
     schedule:
       interval: daily
 

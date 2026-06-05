@@ -31,9 +31,9 @@ set -euo pipefail
 - Execute commands sequentially
 - Use comments for section separation
 
-### POSIX-Compatible
+### Portable and Safe
 
-- Prefer POSIX-compliant syntax over bash-specific features
+- Prefer simple, widely-supported Bash syntax; avoid obscure shell features
 - Use `$(command)` for command substitution, not backticks
 - Use `[[ ]]` for tests, not `[ ]`
 
@@ -76,6 +76,6 @@ scripts/
 | Aspect       | Pattern                                     |
 | ------------ | ------------------------------------------- |
 | **Header**   | `#!/usr/bin/env bash` + `set -euo pipefail` |
-| **Style**    | Linear, POSIX-compatible, no colors         |
+| **Style**    | Linear, portable Bash, no colors            |
 | **Progress** | Minimal plain-text status output            |
 | **Location** | `scripts/` directory                        |

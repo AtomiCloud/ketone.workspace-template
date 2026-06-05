@@ -8,6 +8,9 @@ dist
 .git
 .gitignore
 
+### AtomiCloud
+.kloop/
+
 ### Dev
 .env
 .envrc
