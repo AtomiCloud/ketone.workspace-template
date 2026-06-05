@@ -5,7 +5,7 @@ project: https://github.com/AtomiCloud/ketone.workspace-template
 source: https://github.com/AtomiCloud/ketone.workspace-template
 email: ernest@atomi.cloud
 tags: ["atomi","workspace"]
-readme: cyan/README.MD
+readme: README.MD
 templates:
 - template: atomi/nix
   answers:
