@@ -15,14 +15,14 @@ export async function standardPrompts(i: IInquirer): Promise<{
     await i.text('Service', 'atomi/service', 'LPSM Service Tree Service')
   ).toLowerCase();
   const llm = await i.confirm(
-    'Enable LLM Support',
+    'Enable LLM Support (y/n)',
     'atomi/llm',
     'Add CLAUDE.md and Claude skills',
   );
-  const docker = await i.confirm('Enable Docker', 'atomi/docker', 'Enable Docker Integration');
-  const helm = await i.confirm('Enable Helm', 'atomi/helm', 'Enable Helm Chart Integration');
+  const docker = await i.confirm('Enable Docker (y/n)', 'atomi/docker', 'Enable Docker Integration');
+  const helm = await i.confirm('Enable Helm (y/n)', 'atomi/helm', 'Enable Helm Chart Integration');
   const secret = await i.confirm(
-    'Enable Secret Management',
+    'Enable Secret Management (y/n)',
     'atomi/secret',
     'Enable Secret Management',
   );
