@@ -1,0 +1,28 @@
+name: CI
+on:
+  push: null
+jobs:
+  precommit:
+    name: Pre-Commit
+    uses: ./.github/workflows/⚡reusable-precommit.yaml
+    secrets: inherit
+    with:
+      atomi_platform: test-platform
+      atomi_service: test-service
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Build Docker Image
+        run: bash scripts/ci/docker-build.sh
+  helm-lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Lint Helm Chart
+        run: bash scripts/ci/helm-lint.sh
+

@@ -1,0 +1,14 @@
+version: '3'
+tasks:
+  build:
+    desc: 'Build the Docker image'
+    cmds:
+      - bash scripts/ci/docker-build.sh
+  push:
+    desc: 'Push the Docker image'
+    cmds:
+      - bash scripts/ci/docker-push.sh
+  lint:
+    desc: 'Lint the Dockerfile'
+    cmds:
+      - hadolint infra/Dockerfile
