@@ -3,7 +3,7 @@ tasks:
   lint:
     desc: 'Lint the Helm chart'
     cmds:
-      - bash scripts/ci/helm-lint.sh
+      - ./scripts/ci/helm-lint.sh
   docs:
     desc: 'Generate Helm chart documentation'
     cmds:
@@ -11,8 +11,8 @@ tasks:
   build:
     desc: 'CI: package & push the Helm chart(s), versioned per commit'
     cmds:
-      - bash scripts/ci/ci-helm.sh
+      - ./scripts/ci/ci-helm.sh
   release:
     desc: 'CD: repackage & push the Helm chart(s) at the release version'
     cmds:
-      - bash scripts/ci/cd-helm.sh
+      - ./scripts/ci/cd-helm.sh

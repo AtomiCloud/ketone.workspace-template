@@ -11,7 +11,7 @@ This document describes the conventions for Taskfile usage in the workspace temp
 
 This project uses the `pls` task runner (the `task` binary, aliased as `pls`) with specific conventions for organizing tasks.
 
-Taskfiles should delegate to shell scripts or real commands. Avoid echo statements for progress feedback — the task runner automatically displays the task being executed and its commands. Shell scripts should have echo statements for progress. Prefer delegating to a script (e.g. `bash scripts/ci/setup.sh`) over placeholder `echo` commands so tasks remain composable when layers are merged.
+Taskfiles should delegate to shell scripts or real commands. Avoid echo statements for progress feedback — the task runner automatically displays the task being executed and its commands. Shell scripts should have echo statements for progress. Prefer delegating to a script (e.g. `./scripts/ci/setup.sh`) over placeholder `echo` commands so tasks remain composable when layers are merged.
 
 ## Core Principle: Balance Simplicity vs Complexity
 

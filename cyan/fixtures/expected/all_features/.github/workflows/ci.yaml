@@ -44,7 +44,7 @@ jobs:
           CI_DOCKER_CONTEXT: ${{ matrix.image.context }}
           CI_DOCKERFILE: ${{ matrix.image.dockerfile }}
           CI_DOCKER_PLATFORM: ${{ matrix.image.platform }}
-        run: bash scripts/ci/ci-docker.sh
+        run: ./scripts/ci/ci-docker.sh
   helm-lint:
     name: Helm Lint
     runs-on:

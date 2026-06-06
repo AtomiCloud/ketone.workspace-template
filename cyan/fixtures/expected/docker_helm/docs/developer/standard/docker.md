@@ -9,7 +9,7 @@ matrix — there is no cap on the number of images built per push.
 ## CI — build & push (every commit)
 
 ```bash
-pls docker:build   # bash scripts/ci/ci-docker.sh
+pls docker:build   # ./scripts/ci/ci-docker.sh
 ```
 
 Builds and pushes the image, tagged `<sha6>-<branch>`, `<branch>`, and (on the default
@@ -18,7 +18,7 @@ branch) `latest`. The buildx builder provides the cache, so rebuilds are fast.
 ## CD — re-tag to release (release tag)
 
 ```bash
-pls docker:release   # bash scripts/ci/cd-docker.sh <version>
+pls docker:release   # ./scripts/ci/cd-docker.sh <version>
 ```
 
 Re-tags the already-built commit image to the release version with `buildx imagetools`

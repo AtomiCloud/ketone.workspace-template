@@ -4,7 +4,7 @@ tasks:
   setup:
     desc: 'Setup the repository'
     cmds:
-      - bash scripts/ci/setup.sh
+      - ./scripts/ci/setup.sh
   lint:
     desc: 'Lints the whole code-base'
     cmds:
