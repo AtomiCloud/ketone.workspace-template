@@ -26,7 +26,8 @@ echo "${DOCKER_PASSWORD}" | docker login "${DOMAIN}" -u "${DOCKER_USER}" --passw
 
 IMAGE_ID="$(echo "${DOMAIN}/${GITHUB_REPO_REF}/${CI_DOCKER_IMAGE}" | tr '[:upper:]' '[:lower:]')"
 SHA="$(echo "${GITHUB_SHA}" | head -c 6)"
-BRANCH="$(echo "${GITHUB_BRANCH}" | sed 's#[/_.]#-#g')"
+BRANCH="${GITHUB_BRANCH//[._]/-}"
+BRANCH="${BRANCH//\//-}"
 IMAGE_VERSION="${SHA}-${BRANCH}"
 
 # Conditional tags via substitution: latest on the default branch, semver on release.
