@@ -1,22 +1,6 @@
 [general]
-ignore_merge_commits = true
-ignore_fixup_commits = true
-ignore_squash_commits = true
-
-[rule title-case]
-regex = ^[^A-Z].*
-enable = false
-
-[rule subject-not-empty]
-regex = ^.+$
-enabled = true
-
-[rule B6]
-ignore_body = true
-enabled = false
-
-[contrib]
-rules = CT1
+contrib=CT1
+ignore=B6
 
 [contrib-title-conventional-commits]
-types = amend, build, chore, ci, config, dep, docs, feat, fix, perf, refactor, style, test
+types = amend,build,ci,config,dep,docs,feat,fix,perf,refactor,style,test
