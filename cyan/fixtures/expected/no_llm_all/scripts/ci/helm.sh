@@ -16,10 +16,11 @@ set -euo pipefail
 
 chart_path="${1:-}"
 version="${2:-}"
-[[ -n "${chart_path}" ]] || { echo "❌ chart path (\$1) not set"; exit 1; }
+[[ -n "${chart_path}" ]] || { echo "❌ chart path (first argument) not set"; exit 1; }
 
 SHA="$(echo "${GITHUB_SHA}" | head -c 6)"
-BRANCH="$(echo "${GITHUB_BRANCH}" | sed 's#[/_.]#-#g')"
+BRANCH="${GITHUB_BRANCH//[._]/-}"
+BRANCH="${BRANCH//\//-}"
 COMMIT_VERSION="${SHA}-${BRANCH}"
 
 # Substitution picks release vs per-commit version.
