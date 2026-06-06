@@ -9,10 +9,8 @@ jobs:
       - nscloud-cache-size-50gb
       - nscloud-cache-tag-atomi-nix-store-cache
     steps:
-      - uses: actions/checkout@v6
       - uses: AtomiCloud/actions.setup-nix@v2
         with:
-          checkout: false
           auth-bot-app-id: ${{ vars.AUTH_BOT_APP_ID }}
           auth-bot-secret-key: ${{ secrets.AUTH_BOT_SECRET_KEY }}
       - uses: AtomiCloud/actions.cache-npm@v1

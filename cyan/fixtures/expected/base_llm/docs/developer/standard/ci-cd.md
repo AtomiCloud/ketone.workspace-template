@@ -92,8 +92,7 @@ Setup Nix -> Setup Caches -> nix develop -c ./scripts/ci/script.sh
 ### Example Execution
 
 ```yaml
-- uses: actions/checkout@v6
-- uses: AtomiCloud/actions.setup-nix@v2
+- uses: AtomiCloud/actions.setup-nix@v2 # checks out the repo too
 - run: nix develop .#ci -c ./scripts/ci/script.sh
 ```
 
@@ -141,8 +140,7 @@ jobs:
       - nscloud-cache-size-50gb
       - nscloud-cache-tag-atomi-nix-store-cache
     steps:
-      - uses: actions/checkout@v6
-      - uses: AtomiCloud/actions.setup-nix@v2
+      - uses: AtomiCloud/actions.setup-nix@v2 # checks out the repo too
       - run: nix develop .#ci -c ./scripts/ci/pre-commit.sh
 ```
 
