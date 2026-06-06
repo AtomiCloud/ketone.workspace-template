@@ -2,27 +2,24 @@
 
 Docker conventions for containerized builds and deployments.
 
-The image is built from `infra/Dockerfile`. CI/CD run on Namespace (nscloud) runners with a
-cached buildx builder for fast builds. Multiple images are supported via the workflow build
-matrix — there is no cap on the number of images built per push.
+Images are built from `infra/Dockerfile`. Both CI (every commit) and CD (release tag)
+publish through the `⚡reusable-docker.yaml` workflow, which uses
+`AtomiCloud/actions.setup-docker` and runs `./scripts/ci/docker.sh [version]`. Publish more
+images by adding caller jobs (one per `image_name`) — there is no cap.
 
 ## CI — build & push (every commit)
 
 ```bash
-pls docker:build   # ./scripts/ci/ci-docker.sh
+pls docker:build   # ./scripts/ci/docker.sh
 ```
 
-Builds and pushes the image, tagged `<sha6>-<branch>`, `<branch>`, and (on the default
-branch) `latest`. The buildx builder provides the cache, so rebuilds are fast.
+Pushes `<sha6>-<branch>`, `<branch>`, and (on `main`) `latest`. The build is cached.
 
-## CD — re-tag to release (release tag)
+## CD — release tag
 
-```bash
-pls docker:release   # ./scripts/ci/cd-docker.sh <version>
-```
-
-Re-tags the already-built commit image to the release version with `buildx imagetools`
-(manifest-level, multi-arch safe) — no rebuild.
+On a `v*.*.*` tag the same script runs with the version arg
+(`./scripts/ci/docker.sh <version>`), adding the semver tag. Because the build is cached,
+this is effectively a re-tag rather than a fresh build.
 
 ## Linting
 

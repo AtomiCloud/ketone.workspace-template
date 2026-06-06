@@ -47,23 +47,26 @@ Runs when a new version tag is pushed. Handles deployment operations.
 
 ### Artifact Publishing Model (Docker & Helm)
 
-Docker images and Helm charts are published with two triggers:
+Docker images and Helm charts publish through reusable workflows on two triggers:
 
 | Trigger          | When                      | What happens                                                       |
 | ---------------- | ------------------------- | ------------------------------------------------------------------ |
-| **CI** (commit)  | Every push                | **Rebuild** both image and chart, cached, tagged `<sha6>-<branch>` |
-| **CD** (release) | `v*.*.*` tag (sem-release) | **Republish** — re-tag the commit image and repackage the chart at the release version (no rebuild) |
+| **CI** (commit)  | Every push                | Build & push both image and chart, cached, tagged `<sha6>-<branch>` |
+| **CD** (release) | `v*.*.*` tag (sem-release) | Re-run the same script with the semver — image gets the version tag (cached, so effectively a re-tag), chart is packaged at the version |
 
 Key properties:
 
-- CI builds are cached (Namespace buildx for Docker; Nix store for Helm) and run on every
-  commit, so every commit has an image and a matching chart.
-- CD does **not** rebuild — Docker images are re-tagged with `buildx imagetools` and Helm
-  charts are repackaged at the release semver with `appVersion` pointing at the commit image.
-- There is **no cap** on the number of images (workflow matrix) or charts (`find Chart.yaml`)
-  published per push.
-- Docker runs on Namespace (nscloud) runners for fast builds; Helm runs under `nix develop
-  .#helm` so `helm`/`yq` are always available.
+- The logic lives in `./scripts/ci/docker.sh [version]` and
+  `./scripts/ci/helm.sh <chart_path> [version]`. An empty version = per-commit CI; a version
+  arg = release. The reusable workflows (`⚡reusable-docker.yaml`, `⚡reusable-helm.yaml`)
+  pass the version (`${{ github.ref_name }}` on CD).
+- Setup uses the shared AtomiCloud actions — `AtomiCloud/actions.setup-docker` for Docker and
+  `AtomiCloud/actions.setup-nix` for Helm (Helm runs in `nix develop .#ci`). Do **not** call
+  the underlying nscloud/buildx actions directly.
+- All Nix jobs (pre-commit, Helm, release) share the same Nix store cache via
+  `nscloud-cache-tag-atomi-nix-store-cache`.
+- There is **no cap** on the number of images or charts — add a caller job per `image_name`
+  / `chart_path`.
 
 ## The Execution Pattern
 

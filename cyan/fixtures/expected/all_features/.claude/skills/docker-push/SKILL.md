@@ -9,12 +9,11 @@ Reference: [docs/developer/standard/docker.md](../../../docs/developer/standard/
 
 ## Key Points
 
-- **CI (per commit)**: `pls docker:build` or `./scripts/ci/ci-docker.sh` — builds and
-  pushes the image with a cached buildx builder, tagged `<sha6>-<branch>`, `<branch>`, and
-  (on the default branch) `latest`.
-- **CD (release tag)**: `pls docker:release` or `./scripts/ci/cd-docker.sh <version>` —
-  re-tags the existing commit image to the release version via `buildx imagetools` (no rebuild).
-- Lint the Dockerfile with `pls docker:lint`.
-- The image is built from `infra/Dockerfile`. Multiple images are supported via the workflow
-  build matrix — there is no cap on the number of images per push.
-- CI/CD run on Namespace (nscloud) runners for fast, cached builds.
+- Both CI (per commit) and CD (release tag) publish via the `⚡reusable-docker.yaml` workflow,
+  which uses `AtomiCloud/actions.setup-docker` and runs `./scripts/ci/docker.sh [version]`.
+- `./scripts/ci/docker.sh` with **no arg** = per-commit build: pushes `<sha6>-<branch>`,
+  `<branch>`, and (on `main`) `latest`. With a **version arg** (release) it also pushes that
+  semver tag. The build is cached, so the release build is effectively a re-tag.
+- Local: `pls docker:build` (build & push) / `pls docker:lint`.
+- The image is built from `infra/Dockerfile`. Publish more images by adding caller jobs that
+  `uses: ./.github/workflows/⚡reusable-docker.yaml` (one per `image_name`) — no cap.

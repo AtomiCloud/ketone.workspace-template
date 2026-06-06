@@ -9,13 +9,13 @@ Reference: [docs/developer/standard/helm.md](../../../docs/developer/standard/he
 
 ## Key Points
 
-- Lint with `pls helm:lint` or `nix develop .#helm -c ./scripts/ci/helm-lint.sh`.
-- Generate docs with `pls helm:docs`.
-- **CI (per commit)**: `pls helm:build` or `nix develop .#helm -c ./scripts/ci/ci-helm.sh` —
-  packages and pushes every chart to the OCI registry, versioned `v0.0.0-<sha6>-<branch>`.
-- **CD (release tag)**: `pls helm:release` or
-  `nix develop .#helm -c ./scripts/ci/cd-helm.sh <version>` — repackages every chart at the
-  release semver, with `appVersion` pointing at the commit image.
-- Helm scripts run under Nix (`.#helm` shell) so `helm`/`yq` are always available.
-- The root chart lives in `infra/root_chart/`. All `Chart.yaml` files are published — there is
-  no cap on the number of charts per push.
+- Both CI (per commit) and CD (release tag) publish via the `⚡reusable-helm.yaml` workflow,
+  which uses `AtomiCloud/actions.setup-nix` and runs
+  `nix develop .#ci -c ./scripts/ci/helm.sh <chart_path> [version]`.
+- `./scripts/ci/helm.sh <chart_path>` with **no version** = per-commit publish
+  (`v0.0.0-<sha6>-<branch>`). With a **version arg** (release) it packages at that semver.
+  Both set `appVersion` from the same commit/version tag.
+- Local: `pls helm:build`, `pls helm:lint`, `pls helm:docs`.
+- Helm linting in CI runs through the pre-commit hook (not a separate job).
+- The root chart lives in `infra/root_chart/`. Publish more charts by adding caller jobs
+  (one per `chart_path`) — no cap.

@@ -2,9 +2,10 @@
 
 Helm conventions for Kubernetes chart packaging and deployment.
 
-Helm CI/CD run under Nix (the `.#helm` dev shell provides `helm` and `yq`) on Namespace
-(nscloud) runners. All `Chart.yaml` files are published — there is no cap on the number of
-charts per push.
+Both CI (every commit) and CD (release tag) publish through the `⚡reusable-helm.yaml`
+workflow, which uses `AtomiCloud/actions.setup-nix` and runs
+`nix develop .#ci -c ./scripts/ci/helm.sh <chart_path> [version]`. Publish more charts by
+adding caller jobs (one per `chart_path`) — there is no cap.
 
 ## Structure
 
@@ -20,6 +21,8 @@ The root chart lives in `infra/root_chart/`:
 pls helm:lint
 ```
 
+In CI, Helm linting runs through the pre-commit hook (not a separate job).
+
 ## Docs
 
 ```bash
@@ -29,19 +32,15 @@ pls helm:docs
 ## CI — package & push (every commit)
 
 ```bash
-pls helm:build   # nix develop .#helm -c ./scripts/ci/ci-helm.sh
+pls helm:build   # ./scripts/ci/helm.sh ./infra/root_chart
 ```
 
-Packages and pushes every chart to the OCI registry, versioned `v0.0.0-<sha6>-<branch>`,
-with `appVersion` set to the commit image version.
+Publishes `v0.0.0-<sha6>-<branch>`, with `appVersion` set to the commit version.
 
-## CD — repackage at release (release tag)
+## CD — release tag
 
-```bash
-pls helm:release   # nix develop .#helm -c ./scripts/ci/cd-helm.sh <version>
-```
-
-Repackages every chart at the release semver, with `appVersion` pointing at the commit image.
+On a `v*.*.*` tag the same script runs with the version arg
+(`./scripts/ci/helm.sh ./infra/root_chart <version>`), packaging the chart at that semver.
 
 ## Out of Scope
 

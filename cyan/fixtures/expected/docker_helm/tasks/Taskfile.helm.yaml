@@ -3,16 +3,12 @@ tasks:
   lint:
     desc: 'Lint the Helm chart'
     cmds:
-      - ./scripts/ci/helm-lint.sh
+      - helm lint infra/root_chart
   docs:
     desc: 'Generate Helm chart documentation'
     cmds:
       - helm-docs --chart-search-root infra/root_chart
   build:
-    desc: 'CI: package & push the Helm chart(s), versioned per commit'
+    desc: 'Package & push the Helm chart'
     cmds:
-      - ./scripts/ci/ci-helm.sh
-  release:
-    desc: 'CD: repackage & push the Helm chart(s) at the release version'
-    cmds:
-      - ./scripts/ci/cd-helm.sh
+      - ./scripts/ci/helm.sh ./infra/root_chart

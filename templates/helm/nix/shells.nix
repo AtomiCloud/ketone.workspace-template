@@ -5,8 +5,4 @@ with env;
     buildInputs = system ++ main ++ lint ++ dev;
     inherit shellHook;
   };
-  helm = pkgs.mkShell {
-    buildInputs = system ++ lint;
-    inherit shellHook;
-  };
 }

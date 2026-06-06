@@ -142,70 +142,51 @@ Result: when `secret` is enabled, the merged `nix/env.nix` lists `infisical` und
 `nix develop` (default shell) exposes `infisical`. Verified by the regenerated `secret_only`
 and `all_features` fixtures and a `grep -q 'infisical' nix/env.nix` validate.
 
-#### FR4 — Docker CI (per commit): cached build + push, multi-tag, multi-image-capable
+#### FR4 — Docker publishing: one `docker.sh` via `⚡reusable-docker.yaml`
 
-- `templates/docker/scripts/ci/docker.sh` (replaces `docker-build.sh`):
-  - Validate env: `DOMAIN`, `GITHUB_REPO_REF`, `GITHUB_SHA`, `GITHUB_BRANCH`, `DOCKER_USER`,
-    `DOCKER_PASSWORD`, `LATEST_BRANCH`, plus per-image `CI_DOCKER_IMAGE`, `CI_DOCKER_CONTEXT`,
-    `CI_DOCKERFILE`, `CI_DOCKER_PLATFORM` (defaults for the single scaffold image).
-  - `docker login`, derive `IMAGE_VERSION="<sha6>-<slug(branch)>"`, build refs
-    `commit` / `branch` / `latest`, then `docker buildx build --push` with all applicable
-    tags. The Namespace builder supplies the cache (fast rebuilds).
-  - Default image params point at `infra/Dockerfile` for `let__platform__/let__service__`,
-    but the design is **list-driven** (workflow matrix) so N images build per push with no cap.
-- `templates/docker/Taskfile.yaml` (`docker:build`, `docker:push`, `docker:lint`) stays;
-  `docker:build` may call `docker.sh` for local reproducibility.
+- `templates/docker/scripts/ci/docker.sh` (single script; `$1` = optional semver version):
+  - Validate env (`DOMAIN`, `GITHUB_REPO_REF`, `GITHUB_SHA`, `GITHUB_BRANCH`, `DOCKER_USER`,
+    `DOCKER_PASSWORD`, `LATEST_BRANCH`, `CI_DOCKER_IMAGE`/`CONTEXT`/`DOCKERFILE`/`PLATFORM`).
+  - `docker login`, derive `IMAGE_VERSION="<sha6>-<branch>"`, then `docker buildx build --push`
+    with `commit` + `branch` tags, `latest` (on `LATEST_BRANCH`), and the `semver` tag when a
+    version arg is given. Build is cached, so the release run is effectively a re-tag.
+  - Mirrors `AtomiCloud/sulfone.zinc` `scripts/ci/docker.sh` (VE4).
+- `templates/docker/.github/workflows/⚡reusable-docker.yaml` (copied per-folder; **not**
+  merged): `workflow_call` with inputs `atomi_platform`, `atomi_service`, `image_name` (req),
+  `dockerfile`/`context`/`platform` (defaulted), `version` (opt). Runs on `ubuntu-22.04`, uses
+  `AtomiCloud/actions.setup-docker@v1`, runs `./scripts/ci/docker.sh ${{ inputs.version }}`.
 
-#### FR5 — Docker CD (on release tag): retag commit image → semver, no rebuild
+#### FR5 — Helm publishing: one `helm.sh` via `⚡reusable-helm.yaml`
 
-- `templates/docker/scripts/ci/docker-release.sh` (replaces `docker-push.sh`):
-  - Validate env (registry creds + `GITHUB_REF_NAME`/release tag + commit ref inputs).
-  - Re-tag the already-pushed commit image to the semver **without rebuilding** using
-    `docker buildx imagetools create -t <image>:<semver> <image>:<commit>` (manifest-level,
-    multi-arch safe). Repeat for every image (no cap).
+- `templates/helm/scripts/ci/helm.sh` (single script; `$1` = `chart_path`, `$2` = optional
+  semver version): sets `appVersion` on all `Chart.yaml`, `helm registry login`,
+  `helm dependency build`, `helm package`, `helm push`. No version ⇒ `v0.0.0-<sha6>-<branch>`;
+  version ⇒ that semver (repackage at release). Mirrors `sulfone.zinc` `scripts/ci/helm.sh`.
+- `templates/helm/.github/workflows/⚡reusable-helm.yaml` (copied per-folder): `workflow_call`
+  with inputs `atomi_platform`, `atomi_service`, `chart_path` (req), `version` (opt). Uses
+  `AtomiCloud/actions.setup-nix@v2`, runs
+  `nix develop .#ci -c ./scripts/ci/helm.sh "${{ inputs.chart_path }}" "${{ inputs.version }}"`.
+- **No `.#helm` shell** — Helm runs in `.#ci`, which already exposes `helm`/`yq`/`helm-docs`
+  when the Helm layer is enabled (VE1). Helm linting in CI runs via the pre-commit hook
+  (`a-helm-lint`), so there is no separate lint job/script.
 
-#### FR6 — Helm CI (per commit): package + push at commit version, via Nix
+#### FR6 — Caller workflows (`ci.yaml` / `cd.yaml`) `uses:` the reusables
 
-- `templates/helm/scripts/ci/helm.sh` (replaces `helm-lint.sh` usage in CI build context):
-  - Run under `nix develop .#helm` (helm/yq present; VE1/VE2).
-  - Derive `IMAGE_VERSION="<sha6>-<slug(branch)>"`; for **all** `Chart.yaml` (`find`), set
-    `appVersion`; `helm registry login`; `helm dependency build`; `helm package … --version
-    v0.0.0-<IMAGE_VERSION> --app-version <IMAGE_VERSION> -d ./uploads`; `helm push` each `.tgz`.
-  - `helm-lint.sh` is retained for the lint job (`pls helm:lint`).
+- **Docker** `ci.yaml` adds a `docker` job (on `push`) → `⚡reusable-docker.yaml` with
+  `image_name`/`dockerfile`; `cd.yaml` adds a `docker` job (on `tags: v*.*.*`) with the same
+  plus `version: ${{ github.ref_name }}`.
+- **Helm** `ci.yaml` adds a `helm` job → `⚡reusable-helm.yaml` with `chart_path`; `cd.yaml`
+  adds a `helm` job with the same plus `version: ${{ github.ref_name }}`.
+- Each `uses:` references the org actions only **indirectly** (through the reusable workflow) —
+  no direct `namespacelabs/*` usage anywhere.
+- Publish more images/charts by adding caller jobs (one per `image_name` / `chart_path`) — no cap.
 
-#### FR7 — Helm CD (on release tag): repackage at semver, via Nix
+#### FR7 — Shared Nix store cache (do not change base workflows)
 
-- `templates/helm/scripts/ci/helm-release.sh` (replaces `helm-publish.sh`):
-  - Run under `nix develop .#helm`.
-  - Take the release semver (`$1` / `GITHUB_REF_NAME`); set `appVersion` to the corresponding
-    commit `IMAGE_VERSION`; `helm package … --version <semver> --app-version <commit-ver>`;
-    `helm push` each `.tgz`. Multi-chart, no cap. (Chosen approach: **repackage at semver**.)
-
-#### FR8 — `.#helm` Nix shell
-
-- `templates/helm/nix/shells.nix` adds a `helm` shell: `helm = pkgs.mkShell { buildInputs =
-  system ++ lint; inherit shellHook; };` (composes `infrautils` + `infralint` + base `atomiutils`/lint;
-  VE1/VE2). The `default` shell is unchanged.
-- No new Docker Nix shell: Docker CI/CD run with the Namespace host Docker + buildx (FR4/FR5);
-  `skopeo` remains available in the Docker `default` shell for local use.
-
-#### FR9 — Workflows: thin Nix/nscloud runners, two triggers
-
-- **Base** (`⚡reusable-precommit.yaml`, `⚡reusable-release.yaml`, `ci.yaml`, `release.yaml`,
-  `cd.yaml`) unchanged except as required by FR2 (pre-commit script).
-- **Docker**:
-  - `ci.yaml` adds a `docker-ci` job (on `push`) running on a Namespace runner with the
-    Namespace buildx builder, invoking `docker.sh` (matrix-capable for multi-image).
-  - `cd.yaml` adds a `docker-cd` job (on `tags: v*.*.*`) running `docker-release.sh` (retag).
-- **Helm**:
-  - `ci.yaml` adds `helm-lint` + `helm-ci` jobs (on `push`) on a Namespace runner using
-    `nix develop .#helm -c ./scripts/ci/{helm-lint,helm}.sh`.
-  - `cd.yaml` adds a `helm-cd` job (on `tags: v*.*.*`) running
-    `nix develop .#helm -c ./scripts/ci/helm-release.sh "${GITHUB_REF_NAME}"`.
-- Cache tags follow the existing LPSM namespacing convention
-  (`let__platform__-let__service__-*`) per `ci-cd.md`.
-- Registry/credential env (`DOMAIN`, `GITHUB_REPO_REF`, `DOCKER_USER`, `DOCKER_PASSWORD`,
-  `LATEST_BRANCH`, `GITHUB_SHA`, `GITHUB_BRANCH`) wired from GitHub `vars`/`secrets`.
+- All Nix jobs (pre-commit, Helm, release) share one cache via
+  `nscloud-cache-tag-atomi-nix-store-cache`. The base `⚡reusable-precommit.yaml` /
+  `⚡reusable-release.yaml` already use this tag and are **unchanged**; the new
+  `⚡reusable-helm.yaml` uses the same tag so the Helm job shares the pre-commit cache.
 
 #### FR10 — Skills & docs reflect the new scripts
 
@@ -242,32 +223,37 @@ CI(build)/CD(republish) split:
   merged `setup` (base+secret fixture) is `[setup.sh, secrets.sh]`.
 - AC3: `secret`-enabled fixtures' merged `nix/env.nix` lists `infisical` under `dev`; merged
   `nix/shells.nix` parses and keeps the 4-arg signature.
-- AC4: Docker fixtures contain `docker.sh` (CI, cached multi-tag) + `docker-release.sh`
-  (CD retag); `ci.yaml` has a push-triggered docker job, `cd.yaml` a tag-triggered one.
-- AC5: Helm fixtures contain `helm.sh`/`helm-release.sh`; CI/CD jobs invoke
-  `nix develop .#helm -c …`; merged `shells.nix` contains a `helm` shell.
-- AC6: All scripts pass `bash -n` and `shellcheck`; all YAML parses.
+- AC4: Docker fixtures contain `scripts/ci/docker.sh` and `⚡reusable-docker.yaml`; merged
+  `ci.yaml`/`cd.yaml` reference `reusable-docker` (CD passes `version: ${{ github.ref_name }}`).
+- AC5: Helm fixtures contain `scripts/ci/helm.sh` and `⚡reusable-helm.yaml`; merged
+  `ci.yaml`/`cd.yaml` reference `reusable-helm`; no `.#helm` shell, no `helm-lint` job.
+- AC6: All scripts pass `bash -n`; all YAML parses; no direct `namespacelabs/*` usage.
 
 ### Verification
 - AC7: `cyanprint test template .` → **9/9 pass** with regenerated fixtures.
-- AC8: A real `cyanprint try template` of an all-features project generates `nix/shells.nix`
-  with `default` + `ci` + `helm` + `releaser` shells, and all `scripts/ci/*.sh` parse.
+- AC8: All Nix jobs use `nscloud-cache-tag-atomi-nix-store-cache`; the new `⚡reusable-helm.yaml`
+  uses `AtomiCloud/actions.setup-nix@v2` + `.#ci`; `⚡reusable-docker.yaml` uses
+  `AtomiCloud/actions.setup-docker@v1`.
 
 ## Out of Scope
 
 - The sibling `atomi/nix` (`ketone.nix-template`) flake — unchanged; this is template-side only.
-- Actual deployment (kubectl apply / ArgoCD) on CD — only image retag + chart republish.
+- Actual deployment (kubectl apply / ArgoCD) on CD — only image/chart publish.
 - Per-landscape Helm values files (already out of scope per `helm.md`).
 - Changing the base `release.yaml` semantic-release flow beyond the `pre-commit.sh` tidy.
-- Combining Docker + Helm into a single script (explicitly chosen: separate scripts).
+- Combining Docker + Helm into a single script (explicitly chosen: separate `docker.sh`/`helm.sh`).
 
 ## Open design notes (flagged for review)
 
-- **Setup hook install**: `setup.sh` installing pre-commit hooks is the chosen "meaningful"
-  replacement for the no-op; if the intent was purely to delete the placeholder and leave
-  base `setup` empty, that is a one-line change.
-- **Docker without Nix**: Docker CI/CD use host Docker + the Namespace builder (no `.#docker`
-  shell), matching "docker = nscloud fast build, helm = nix". If Docker scripts should also run
-  under Nix, add a `docker` shell (`system ++ dev`) and wrap the invocations.
-- **Namespace buildx action pin**: workflows reference the Namespace setup/buildx actions for
-  fast cached Docker builds; exact action versions to be confirmed against the org's pinned set.
+- **`setup.sh`**: a minimal extension point — pre-commit hooks are installed by the Nix
+  `shellHook`, not by `setup.sh`. `pre-commit.sh` still runs `./scripts/ci/setup.sh` first.
+- **Reusable workflows mirror `sulfone.zinc`**: `⚡reusable-docker.yaml` (uses
+  `AtomiCloud/actions.setup-docker@v1`, `ubuntu-22.04`) and `⚡reusable-helm.yaml` (uses
+  `AtomiCloud/actions.setup-nix@v2`, `.#ci`). No direct `namespacelabs/*` references.
+- **Shared cache**: all Nix jobs use `nscloud-cache-tag-atomi-nix-store-cache` (global, not
+  per-service); base pre-commit/release already use it and are unchanged.
+- **Base `cd.yaml` placeholder**: left as-is (out of scope); merged `cd.yaml` still carries the
+  base "Placeholder CD" job alongside the real docker/helm jobs.
+- **`GITHUB_REF_SLUG`**: the reusable Docker/Helm jobs reference `${{ env.GITHUB_REF_SLUG }}`
+  for the branch slug, matching `sulfone.zinc`; confirm `actions.setup-docker`/`setup-nix`
+  provide it in the target org.

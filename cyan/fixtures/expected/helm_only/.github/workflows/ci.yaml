@@ -9,44 +9,12 @@ jobs:
     with:
       atomi_platform: test-platform
       atomi_service: test-service
-  helm-lint:
-    name: Helm Lint
-    runs-on:
-      - nscloud-ubuntu-22.04-amd64-32x64-with-cache
-      - nscloud-cache-size-50gb
-      - nscloud-cache-tag-test-platform-test-service-nix-store-cache
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: Setup Nix
-        uses: AtomiCloud/actions.setup-nix@v2
-        with:
-          checkout: false
-      - name: Lint Helm chart
-        run: nix develop .#helm -c ./scripts/ci/helm-lint.sh
-  helm-ci:
-    name: Helm CI
-    permissions:
-      contents: read
-      packages: write
-    runs-on:
-      - nscloud-ubuntu-22.04-amd64-32x64-with-cache
-      - nscloud-cache-size-50gb
-      - nscloud-cache-tag-test-platform-test-service-nix-store-cache
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: Setup Nix
-        uses: AtomiCloud/actions.setup-nix@v2
-        with:
-          checkout: false
-      - name: Package & Push (per commit)
-        env:
-          DOMAIN: ghcr.io
-          GITHUB_REPO_REF: ${{ github.repository }}
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_BRANCH: ${{ github.ref_name }}
-          DOCKER_USER: ${{ github.actor }}
-          DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: nix develop .#helm -c ./scripts/ci/ci-helm.sh
+  helm:
+    name: Helm Chart
+    uses: ./.github/workflows/⚡reusable-helm.yaml
+    secrets: inherit
+    with:
+      atomi_platform: test-platform
+      atomi_service: test-service
+      chart_path: ./infra/root_chart
 
