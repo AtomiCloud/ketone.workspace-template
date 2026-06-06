@@ -5,22 +5,10 @@ tasks:
   setup:
     desc: Setup the repository
     cmds:
-      - echo "Completed"
+      - bash scripts/ci/setup.sh
       - ./scripts/local/secrets.sh
   lint:
     desc: Lints the whole code-base
     cmds:
       - pre-commit run --all-files
-  test:
-    desc: Run tests
-    cmds:
-      - echo "No tests configured"
-  build:
-    desc: Build the project
-    cmds:
-      - echo "No build configured"
-  clean:
-    desc: Clean build artifacts
-    cmds:
-      - echo "Nothing to clean"
 

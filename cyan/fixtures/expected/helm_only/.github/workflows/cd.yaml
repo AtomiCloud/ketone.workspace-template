@@ -11,12 +11,29 @@ jobs:
     steps:
       - name: Placeholder Step
         run: echo "Placeholder step ${{ github.ref_name }}"
-  helm-publish:
-    name: Helm Publish
-    runs-on: ubuntu-latest
+  helm-cd:
+    name: Helm CD
+    permissions:
+      contents: read
+      packages: write
+    runs-on:
+      - nscloud-ubuntu-22.04-amd64-32x64-with-cache
+      - nscloud-cache-size-50gb
+      - nscloud-cache-tag-test-platform-test-service-nix-store-cache
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - name: Publish Helm Chart
-        run: bash scripts/ci/helm-publish.sh
+      - name: Setup Nix
+        uses: AtomiCloud/actions.setup-nix@v2
+        with:
+          checkout: false
+      - name: Repackage at release version
+        env:
+          DOMAIN: ghcr.io
+          GITHUB_REPO_REF: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          DOCKER_USER: ${{ github.actor }}
+          DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          LATEST_BRANCH: main
+        run: nix develop .#helm -c ./scripts/ci/cd-helm.sh "${{ github.ref_name }}"
 

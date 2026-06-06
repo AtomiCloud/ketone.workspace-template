@@ -11,12 +11,33 @@ jobs:
     steps:
       - name: Placeholder Step
         run: echo "Placeholder step ${{ github.ref_name }}"
-  docker-push:
-    name: Docker Push
-    runs-on: ubuntu-latest
+  docker-cd:
+    name: Docker CD
+    permissions:
+      contents: read
+      packages: write
+    runs-on:
+      - nscloud-ubuntu-22.04-amd64-32x64-with-cache
+      - nscloud-cache-size-50gb
+    strategy:
+      matrix:
+        image:
+          - name: test-platform-test-service
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - name: Push Docker Image
-        run: bash scripts/ci/docker-push.sh
+      - name: Setup Namespace
+        uses: namespacelabs/nscloud-setup@v0
+      - name: Setup Namespace buildx
+        uses: namespacelabs/nscloud-setup-buildx-action@v0
+      - name: Re-tag commit image to release
+        env:
+          DOMAIN: ghcr.io
+          GITHUB_REPO_REF: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          DOCKER_USER: ${{ github.actor }}
+          DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          LATEST_BRANCH: main
+          CI_DOCKER_IMAGE: ${{ matrix.image.name }}
+        run: bash scripts/ci/cd-docker.sh "${{ github.ref_name }}"
 

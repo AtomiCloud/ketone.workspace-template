@@ -1,6 +1,5 @@
-{ pkgs, pkgs-2605, pkgs-unstable, atomi }:
+{ atomi, pkgs, pkgs-2605, pkgs-unstable }:
 let
-
   all = rec {
     atomipkgs = (
       with atomi;
@@ -9,26 +8,34 @@ let
           atomiutils
           pls
           sg
-          ;
+        ;
       }
     );
-    nix-unstable = (with pkgs-unstable; { });
+
     nix-2605 = (
       with pkgs-2605;
       {
         inherit
-          git
-          infisical
-          treefmt
-          gitlint
-          shellcheck
           actionlint
+          git
+          gitlint
           go-task
+          infisical
           pre-commit
-          ;
+          shellcheck
+          treefmt
+        ;
+      }
+    );
+
+    nix-unstable = (
+      with pkgs-unstable;
+      {
       }
     );
   };
 in
 with all;
-nix-2605 // nix-unstable // atomipkgs
+atomipkgs //
+nix-2605 //
+nix-unstable

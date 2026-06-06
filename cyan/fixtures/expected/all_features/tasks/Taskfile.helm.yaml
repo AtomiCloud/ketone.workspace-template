@@ -8,7 +8,11 @@ tasks:
     desc: 'Generate Helm chart documentation'
     cmds:
       - helm-docs --chart-search-root infra/root_chart
-  push:
-    desc: 'Publish the Helm chart'
+  build:
+    desc: 'CI: package & push the Helm chart(s), versioned per commit'
     cmds:
-      - bash scripts/ci/helm-publish.sh
+      - bash scripts/ci/ci-helm.sh
+  release:
+    desc: 'CD: repackage & push the Helm chart(s) at the release version'
+    cmds:
+      - bash scripts/ci/cd-helm.sh

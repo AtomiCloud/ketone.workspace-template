@@ -14,3 +14,5 @@ Reference: [docs/developer/standard/infisical.md](../../../docs/developer/standa
 - The bare form `infisical run --env=dev` does NOT propagate secrets to the parent shell
 - Scan for hardcoded secrets with `infisical scan`
 - Fetch secrets with `pls secret:fetch`
+- `infisical` is on the dev shell `PATH` (added via `nix/env.nix` when the secret layer is
+  enabled), so it is available inside `nix develop` / `direnv` without extra installation

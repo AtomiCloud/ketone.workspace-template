@@ -9,12 +9,40 @@ jobs:
     with:
       atomi_platform: test-platform
       atomi_service: test-service
-  docker-build:
-    name: Docker Build
-    runs-on: ubuntu-latest
+  docker-ci:
+    name: Docker CI
+    permissions:
+      contents: read
+      packages: write
+    runs-on:
+      - nscloud-ubuntu-22.04-amd64-32x64-with-cache
+      - nscloud-cache-size-50gb
+    strategy:
+      matrix:
+        image:
+          - name: test-platform-test-service
+            context: .
+            dockerfile: infra/Dockerfile
+            platform: linux/amd64,linux/arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - name: Build Docker Image
-        run: bash scripts/ci/docker-build.sh
+      - name: Setup Namespace
+        uses: namespacelabs/nscloud-setup@v0
+      - name: Setup Namespace buildx
+        uses: namespacelabs/nscloud-setup-buildx-action@v0
+      - name: Build & Push (cached)
+        env:
+          DOMAIN: ghcr.io
+          GITHUB_REPO_REF: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_BRANCH: ${{ github.ref_name }}
+          DOCKER_USER: ${{ github.actor }}
+          DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          LATEST_BRANCH: main
+          CI_DOCKER_IMAGE: ${{ matrix.image.name }}
+          CI_DOCKER_CONTEXT: ${{ matrix.image.context }}
+          CI_DOCKERFILE: ${{ matrix.image.dockerfile }}
+          CI_DOCKER_PLATFORM: ${{ matrix.image.platform }}
+        run: bash scripts/ci/ci-docker.sh
 

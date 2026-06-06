@@ -45,6 +45,26 @@ Runs only after successful CI on main branch. Handles:
 
 Runs when a new version tag is pushed. Handles deployment operations.
 
+### Artifact Publishing Model (Docker & Helm)
+
+Docker images and Helm charts are published with two triggers:
+
+| Trigger          | When                      | What happens                                                       |
+| ---------------- | ------------------------- | ------------------------------------------------------------------ |
+| **CI** (commit)  | Every push                | **Rebuild** both image and chart, cached, tagged `<sha6>-<branch>` |
+| **CD** (release) | `v*.*.*` tag (sem-release) | **Republish** — re-tag the commit image and repackage the chart at the release version (no rebuild) |
+
+Key properties:
+
+- CI builds are cached (Namespace buildx for Docker; Nix store for Helm) and run on every
+  commit, so every commit has an image and a matching chart.
+- CD does **not** rebuild — Docker images are re-tagged with `buildx imagetools` and Helm
+  charts are repackaged at the release semver with `appVersion` pointing at the commit image.
+- There is **no cap** on the number of images (workflow matrix) or charts (`find Chart.yaml`)
+  published per push.
+- Docker runs on Namespace (nscloud) runners for fast builds; Helm runs under `nix develop
+  .#helm` so `helm`/`yq` are always available.
+
 ## The Execution Pattern
 
 ```

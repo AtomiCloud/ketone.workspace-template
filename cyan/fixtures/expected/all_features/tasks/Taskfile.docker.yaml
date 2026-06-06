@@ -1,13 +1,13 @@
 version: '3'
 tasks:
   build:
-    desc: 'Build the Docker image'
+    desc: 'CI: build & push the Docker image(s), cached, tagged per commit'
     cmds:
-      - bash scripts/ci/docker-build.sh
-  push:
-    desc: 'Push the Docker image'
+      - bash scripts/ci/ci-docker.sh
+  release:
+    desc: 'CD: re-tag the commit image(s) to the release version'
     cmds:
-      - bash scripts/ci/docker-push.sh
+      - bash scripts/ci/cd-docker.sh
   lint:
     desc: 'Lint the Dockerfile'
     cmds:

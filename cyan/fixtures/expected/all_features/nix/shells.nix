@@ -11,6 +11,11 @@ with env;
     inherit shellHook;
   };
 
+  helm = pkgs.mkShell {
+    buildInputs = lint ++ system;
+    inherit shellHook;
+  };
+
   releaser = pkgs.mkShell {
     buildInputs = lint ++ main ++ releaser ++ system;
     inherit shellHook;
