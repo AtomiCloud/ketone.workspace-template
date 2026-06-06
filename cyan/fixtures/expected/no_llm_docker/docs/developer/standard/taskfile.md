@@ -11,19 +11,25 @@ This document describes the conventions for Taskfile usage in the workspace temp
 
 This project uses the `pls` task runner (the `task` binary, aliased as `pls`) with specific conventions for organizing tasks.
 
-Taskfiles should delegate to shell scripts or real commands. Avoid echo statements for progress feedback — the task runner automatically displays the task being executed and its commands. Shell scripts should have echo statements for progress. Prefer delegating to a script (e.g. `./scripts/ci/setup.sh`) over placeholder `echo` commands so tasks remain composable when layers are merged.
+Taskfiles should delegate to short inline one-liners or real commands. Avoid echo statements for progress feedback — the task runner automatically displays the task being executed and its commands. Shell scripts should have echo statements for progress.
+
+**Taskfiles must NOT call CI scripts.** `scripts/ci/*` (e.g. `docker.sh`, `helm.sh`,
+`pre-commit.sh`) are run by the CI/CD workflows, not by tasks. Local tasks use inline
+one-liners — `docker build …`, `helm template …` — and may expose `{{.CLI_ARGS}}` so users pass
+extra flags (e.g. `pls docker:build -- -t my:tag`).
 
 ## Core Principle: Balance Simplicity vs Complexity
 
 - **Simple (1-2 lines)** → inline in Taskfile
-- **Complex (3+ lines, conditionals)** → shell script
+- **Complex (3+ lines, conditionals)** → local helper script (never a CI script)
 
 ## Key Rules
 
 1. Use `pls` alias (task binary)
-2. Avoid echo in Taskfile (task runner shows output); stub commands are the exception
+2. Avoid echo in Taskfile (task runner shows output)
 3. Shell scripts DO have echo (for progress)
 4. Sub-tasks in `tasks/` directory
+5. Never call `scripts/ci/*` from a task — those belong to CI/CD workflows
 
 ## Main Taskfile.yaml Structure
 

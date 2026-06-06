@@ -115,6 +115,7 @@ tests:
       - find . -name '*.sh' -exec bash -n {} +
       - grep -q '^tasks:' Taskfile.yaml
       - grep -q 'reusable-docker' .github/workflows/ci.yaml
+      - grep -q 'infrautils' nix/env.nix
       - test -f .claude/skills/docker-push/SKILL.md
       - grep -q '^  docker:' Taskfile.yaml
       - test "$(find .claude/skills -name SKILL.md | wc -l | tr -d ' ')" = "8"

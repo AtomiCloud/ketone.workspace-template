@@ -1,14 +1,16 @@
 version: '3'
+vars:
+  CHART: infra/root_chart
 tasks:
-  lint:
-    desc: 'Lint the Helm chart'
+  deps:
+    desc: 'Build chart dependencies'
     cmds:
-      - helm lint infra/root_chart
-  docs:
-    desc: 'Generate Helm chart documentation'
+      - helm dependency build {{.CHART}}
+  template:
+    desc: 'Render the chart templates (extra args via --)'
     cmds:
-      - helm-docs --chart-search-root infra/root_chart
-  build:
-    desc: 'Package & push the Helm chart'
+      - helm template {{.CHART}} {{.CLI_ARGS}}
+  debug:
+    desc: 'Render the chart templates with --debug'
     cmds:
-      - ./scripts/ci/helm.sh ./infra/root_chart
+      - helm template {{.CHART}} --debug {{.CLI_ARGS}}

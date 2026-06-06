@@ -1,10 +1,21 @@
 version: '3'
+vars:
+  IMAGE: test-platform-test-service:local
 tasks:
   build:
-    desc: 'Build & push the Docker image (cached, tagged per commit)'
+    desc: 'Build the image locally (optional tag suffix via --, e.g. -- 1 -> :local-1)'
     cmds:
-      - ./scripts/ci/docker.sh
-  lint:
-    desc: 'Lint the Dockerfile'
+      - docker build -f infra/Dockerfile -t {{.IMAGE}}{{if .CLI_ARGS}}-{{.CLI_ARGS}}{{end}} .
+  run:
+    desc: 'Run the built image (optional tag suffix via --)'
     cmds:
-      - hadolint infra/Dockerfile
+      - docker run --rm {{.IMAGE}}{{if .CLI_ARGS}}-{{.CLI_ARGS}}{{end}}
+  dev:
+    desc: 'Build then run the image (optional tag suffix via --)'
+    cmds:
+      - task: build
+      - task: run
+  clean:
+    desc: 'Remove the locally built image (optional tag suffix via --)'
+    cmds:
+      - docker image rm {{.IMAGE}}{{if .CLI_ARGS}}-{{.CLI_ARGS}}{{end}} || true

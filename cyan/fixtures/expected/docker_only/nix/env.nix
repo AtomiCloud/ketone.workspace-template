@@ -11,6 +11,7 @@ with packages;
     actionlint
     gitlint
     go-task
+    infralint
     pre-commit
     sg
     shellcheck
@@ -26,5 +27,6 @@ with packages;
 
   system = [
     atomiutils
+    infrautils
   ];
 }

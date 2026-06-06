@@ -112,21 +112,19 @@ labels:
 - `{service}.git` - Service repositories
 - `{platform}.git` - Platform monorepos (if applicable)
 
-### Cache Namespacing
+### Nix Store Cache
+
+Nix jobs use a single shared store cache — **not** per-service — to save cache space:
 
 ```yaml
-nscloud-cache-tag-let__platform__-let__service__-nix-store-cache
+nscloud-cache-tag-atomi-nix-store-cache
 ```
 
-Example: `nscloud-cache-tag-sulfoxide-hydrogen-nix-store-cache`
+### Platform / Service usage
 
-### CI/CD Inputs
-
-<!-- prettier-ignore -->
-```yaml
-atomi_platform: let__platform__
-atomi_service: let__service__
-```
+The platform and service identify the service in the LPSM tree and appear in published
+artifact names, e.g. the Docker image name `let__platform__-let__service__`. They are **not**
+passed as reusable-workflow inputs (the shared cache makes that unnecessary).
 
 ## Trigger Words
 

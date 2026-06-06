@@ -6,6 +6,3 @@ jobs:
     name: Pre-Commit
     uses: ./.github/workflows/⚡reusable-precommit.yaml
     secrets: inherit
-    with:
-      atomi_platform: test-platform
-      atomi_service: test-service

@@ -6,16 +6,11 @@ jobs:
     name: Pre-Commit
     uses: ./.github/workflows/⚡reusable-precommit.yaml
     secrets: inherit
-    with:
-      atomi_platform: test-platform
-      atomi_service: test-service
   docker:
     name: Docker Image
     uses: ./.github/workflows/⚡reusable-docker.yaml
     secrets: inherit
     with:
-      atomi_platform: test-platform
-      atomi_service: test-service
       image_name: test-platform-test-service
       dockerfile: ./infra/Dockerfile
   helm:
@@ -23,7 +18,5 @@ jobs:
     uses: ./.github/workflows/⚡reusable-helm.yaml
     secrets: inherit
     with:
-      atomi_platform: test-platform
-      atomi_service: test-service
       chart_path: ./infra/root_chart
 

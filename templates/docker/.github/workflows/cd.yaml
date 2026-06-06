@@ -9,8 +9,6 @@ jobs:
     uses: ./.github/workflows/⚡reusable-docker.yaml
     secrets: inherit
     with:
-      atomi_platform: let__platform__
-      atomi_service: let__service__
       image_name: let__platform__-let__service__
       dockerfile: ./infra/Dockerfile
       version: ${{ github.ref_name }}

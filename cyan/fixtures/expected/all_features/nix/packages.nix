@@ -22,7 +22,6 @@ let
           git
           gitlint
           go-task
-          hadolint
           infisical
           pre-commit
           shellcheck

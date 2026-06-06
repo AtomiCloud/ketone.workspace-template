@@ -31,22 +31,27 @@ set -euo pipefail
 - Execute commands sequentially
 - Use comments for section separation
 
+### Prefer Substitution over Flow Control
+
+- Do **not** use flow control (if/else, loops, functions) for simplification or abstraction
+- Prefer parameter/command substitution over `if`/`else` — e.g.
+  `HELM_VERSION="${version:-v0.0.0-${commit}}"` instead of an `if` block, and
+  `arg="$([[ cond ]] && echo "--flag" || echo "")"` for a conditional flag
+- Use flow control **only when necessary** (e.g. iterating an unknown number of files)
+
 ### Portable and Safe
 
 - Prefer simple, widely-supported Bash syntax; avoid obscure shell features
 - Use `$(command)` for command substitution, not backticks
 - Use `[[ ]]` for tests, not `[ ]`
 
-### No Coloring
+### Output
 
-- Keep output simple and readable
-- Avoid ANSI color codes
-
-### Status Output
-
-- Keep status output plain and minimal
-- Use simple `echo` statements only when they improve clarity
-- Prefer messages like `echo "Completed"` over decorative output
+- No ANSI color codes, but **prefix every `echo` with a suitable emoji** (🔐 login, 📝 info,
+  🔨/📦 build, 📤 push, ✅ success, ❌ failure, …)
+- Progress/transition echos are **encouraged** to show what the script is doing — as long as
+  they don't clog the script
+- Do **not** emit no-op placeholders like `echo "Completed"`
 
 ## Template
 
@@ -54,9 +59,12 @@ set -euo pipefail
 #!/usr/bin/env bash
 set -euo pipefail
 
+[[ -n "${SOME_VAR:-}" ]] || { echo "❌ 'SOME_VAR' env var not set"; exit 1; }
+
+echo "🔨 Doing the thing..."
 # commands here
 
-echo "Completed"
+echo "✅ Done"
 ```
 
 ## File Location
@@ -75,7 +83,7 @@ scripts/
 
 | Aspect       | Pattern                                     |
 | ------------ | ------------------------------------------- |
-| **Header**   | `#!/usr/bin/env bash` + `set -euo pipefail` |
-| **Style**    | Linear, portable Bash, no colors            |
-| **Progress** | Minimal plain-text status output            |
-| **Location** | `scripts/` directory                        |
+| **Header**   | `#!/usr/bin/env bash` + `set -euo pipefail`       |
+| **Style**    | Linear, portable Bash; substitution over flow control |
+| **Progress** | Emoji-prefixed progress echos (no ANSI colors)    |
+| **Location** | `scripts/` directory                              |

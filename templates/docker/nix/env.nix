@@ -2,6 +2,7 @@
 with packages;
 {
   system = [
+    infrautils
   ];
 
   dev = [
@@ -12,6 +13,7 @@ with packages;
   ];
 
   lint = [
+    infralint
   ];
 
   releaser = [

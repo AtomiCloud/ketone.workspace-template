@@ -61,12 +61,20 @@ Key properties:
   arg = release. The reusable workflows (`⚡reusable-docker.yaml`, `⚡reusable-helm.yaml`)
   pass the version (`${{ github.ref_name }}` on CD).
 - Setup uses the shared AtomiCloud actions — `AtomiCloud/actions.setup-docker` for Docker and
-  `AtomiCloud/actions.setup-nix` for Helm (Helm runs in `nix develop .#ci`). Do **not** call
+  `AtomiCloud/actions.setup-nix` for Helm (Helm runs in `nix develop .#cd`). Do **not** call
   the underlying nscloud/buildx actions directly.
 - All Nix jobs (pre-commit, Helm, release) share the same Nix store cache via
   `nscloud-cache-tag-atomi-nix-store-cache`.
 - There is **no cap** on the number of images or charts — add a caller job per `image_name`
   / `chart_path`.
+
+### Dev Shells
+
+| Shell        | Used by                                   |
+| ------------ | ----------------------------------------- |
+| `.#ci`       | CI checks (pre-commit)                    |
+| `.#cd`       | CD / artifact publishing (Helm)           |
+| `.#releaser` | Semantic release                          |
 
 ## The Execution Pattern
 
@@ -102,15 +110,20 @@ Setup Nix -> Setup Caches -> nix develop -c ./scripts/ci/script.sh
 **Caller workflow is responsible for:**
 
 - Defining the trigger
-- Wiring inputs like `atomi_platform` and `atomi_service`
+- Wiring only the inputs the reusable workflow actually needs
 - Choosing which reusable workflow to invoke
 
 **Reusable workflow is responsible for:**
 
-- Checkout (`actions/checkout@v6`)
-- Setup Nix (`AtomiCloud/actions.setup-nix@v2`)
-- Any workflow-specific cache setup
+- Setup (`AtomiCloud/actions.setup-nix@v2` or `AtomiCloud/actions.setup-docker@v1`)
 - Running the shell script from `scripts/ci/`
+
+### Inputs: only when required
+
+Reusable workflows declare an input **only if they use it**. Cache keys no longer depend on
+platform/service, so `atomi_platform` / `atomi_service` are **not** required inputs — pre-commit
+and release take no inputs, `⚡reusable-docker.yaml` takes `image_name`/`dockerfile`/…, and
+`⚡reusable-helm.yaml` takes `chart_path`/`version`.
 
 ### Example: Reusable Workflow Structure
 
@@ -120,17 +133,13 @@ name: Reusable Pre-Commit
 
 on:
   workflow_call:
-    inputs:
-      atomi_platform:
-        required: true
-        type: string
-      atomi_service:
-        required: true
-        type: string
 
 jobs:
   precommit:
-    runs-on: nscloud-ubuntu-22.04-amd64-32x64-with-cache
+    runs-on:
+      - nscloud-ubuntu-22.04-amd64-32x64-with-cache
+      - nscloud-cache-size-50gb
+      - nscloud-cache-tag-atomi-nix-store-cache
     steps:
       - uses: actions/checkout@v6
       - uses: AtomiCloud/actions.setup-nix@v2
@@ -149,9 +158,6 @@ jobs:
   precommit:
     uses: ./.github/workflows/⚡reusable-precommit.yaml
     secrets: inherit
-    with:
-      atomi_platform: test-platform
-      atomi_service: test-service
 ```
 
 ## Infrastructure and Caching
@@ -160,26 +166,14 @@ jobs:
 
 Runners with Nix store caching for persistent build artifacts.
 
-### LPSM-Based Cache Namespacing
+### Shared Nix Store Cache
 
-Cache keys MUST use LPSM naming: `test-platform-test-service-*`
+All Nix jobs use a single shared cache tag — **not** per-service — so the whole org reuses one
+warm store and saves cache space:
 
 ```yaml
-nscloud-cache-tag-test-platform-test-service-nix-store-cache
+nscloud-cache-tag-atomi-nix-store-cache
 ```
-
-This ensures:
-
-- Caches are isolated per service
-- No cache conflicts between services
-- Predictable cache key patterns
-
-### Required Inputs
-
-All reusable workflows MUST accept:
-
-- `atomi_platform` - Platform name for cache namespacing
-- `atomi_service` - Service name for cache namespacing
 
 ## Local Reproducibility
 
@@ -222,5 +216,5 @@ scripts/
 | **Workflow types**        | CI (every commit), Release (main merge), CD (tag push) |
 | **Execution**             | Nix -> Caches -> shell script                          |
 | **Reusable workflows**    | Named with `⚡`, reusable workflow handles execution   |
-| **Cache namespacing**     | `test-platform-test-service-nix-store-cache`       |
+| **Cache tag (shared)**    | `atomi-nix-store-cache` (one shared store, not per-service) |
 | **Local reproducibility** | `nix develop .#ci -c ./scripts/ci/script.sh`           |

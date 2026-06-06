@@ -2,11 +2,6 @@
 
 Helm conventions for Kubernetes chart packaging and deployment.
 
-Both CI (every commit) and CD (release tag) publish through the `⚡reusable-helm.yaml`
-workflow, which uses `AtomiCloud/actions.setup-nix` and runs
-`nix develop .#ci -c ./scripts/ci/helm.sh <chart_path> [version]`. Publish more charts by
-adding caller jobs (one per `chart_path`) — there is no cap.
-
 ## Structure
 
 The root chart lives in `infra/root_chart/`:
@@ -15,32 +10,57 @@ The root chart lives in `infra/root_chart/`:
 - `values.yaml` — default values
 - `templates/` — Kubernetes manifest templates
 
-## Linting
+## Local development
 
-```bash
-pls helm:lint
-```
+Local work uses Taskfile one-liners (these never call the CI scripts):
+
+| Command             | What it does                                                |
+| ------------------- | ---------------------------------------------------------- |
+| `pls helm:template` | Render the chart (pass extra `helm template` args via `--`) |
+| `pls helm:debug`    | Render with `--debug`                                      |
+| `pls helm:deps`     | Build chart dependencies                                   |
+
+Chart **lint** and **docs** are not separate tasks — they run as pre-commit hooks (`pls lint`):
+`helm lint` (from `infrautils`) and `helm-docs` (from `infralint`).
+
+## CI/CD release structure
+
+Publishing is driven by the `⚡reusable-helm.yaml` reusable workflow, called from `ci.yaml`
+(every commit) and `cd.yaml` (release tag):
+
+1. The reusable workflow uses `AtomiCloud/actions.setup-nix` and runs inside `nix develop .#cd`,
+   so `helm`/`yq` come from the Nix store. The store is restored from the shared
+   `nscloud-cache-tag-atomi-nix-store-cache` (one cache for all Nix jobs — no per-service keys),
+   which is why Helm needs Nix while Docker does not.
+2. It runs `./scripts/ci/helm.sh <chart_path> [version]`:
+   - **CI** (no version) → publishes `v0.0.0-<sha6>-<branch>`, with `appVersion` set to the
+     commit version.
+   - **CD** (version = the git tag) → publishes that release semver.
+3. Charts are pushed (OCI) to `${DOMAIN}/${GITHUB_REPO_REF}` (defaults to
+   `ghcr.io/<owner>/<repo>`).
 
 In CI, Helm linting runs through the pre-commit hook (not a separate job).
 
-## Docs
+### Adding more charts
 
-```bash
-pls helm:docs
+Each chart is one caller job — there is **no cap**. Add a job to both `ci.yaml` and `cd.yaml`:
+
+```yaml
+jobs:
+  worker-chart:
+    uses: ./.github/workflows/⚡reusable-helm.yaml
+    secrets: inherit
+    with:
+      chart_path: ./infra/worker_chart
+      version: ${{ github.ref_name }} # cd.yaml only
 ```
 
-## CI — package & push (every commit)
+### Configuration (`⚡reusable-helm.yaml` inputs)
 
-```bash
-pls helm:build   # ./scripts/ci/helm.sh ./infra/root_chart
-```
-
-Publishes `v0.0.0-<sha6>-<branch>`, with `appVersion` set to the commit version.
-
-## CD — release tag
-
-On a `v*.*.*` tag the same script runs with the version arg
-(`./scripts/ci/helm.sh ./infra/root_chart <version>`), packaging the chart at that semver.
+| Input        | Required | Default | Purpose                    |
+| ------------ | -------- | ------- | -------------------------- |
+| `chart_path` | yes      | —       | chart directory to publish |
+| `version`    | no       | —       | release semver (set on CD) |
 
 ## Out of Scope
 

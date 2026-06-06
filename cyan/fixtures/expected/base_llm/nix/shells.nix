@@ -9,6 +9,10 @@ with env;
     buildInputs = system ++ main ++ lint;
     inherit shellHook;
   };
+  cd = pkgs.mkShell {
+    buildInputs = system ++ main;
+    inherit shellHook;
+  };
   releaser = pkgs.mkShell {
     buildInputs = system ++ main ++ lint ++ releaser;
     inherit shellHook;

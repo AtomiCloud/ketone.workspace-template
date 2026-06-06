@@ -34,16 +34,22 @@ is shell-parsed and YAML-parsed.
 
 ### VE1 — Nix-registry bundle contents (which package provides which binary)
 
-**Checked**: `AtomiCloud/nix-registry@v2` `binWrapper/{atomiutils,infrautils,infralint}.nix`.
+**Checked**: `AtomiCloud/nix-registry@v2` `binWrapper/{atomiutils,infrautils,infralint}.nix`
+— specifically the binaries `cp`'d into each bundle's `$out/bin` (VE12).
 
-**CONFIRMED**:
-- `atomiutils` → `jq`, `yq-go` (provides `yq`) + general CLI utils.
-- `infrautils` → `kubernetes-helm` (`helm`), `kubectl`, `docker`, `skopeo`.
-- `infralint` → `helm-docs`, `helmlint`.
+**CONFIRMED** (by exposed `/bin`, not just `buildInputs`):
+- `atomiutils` → `jq`, `yq-go` (`yq`) + general CLI utils.
+- `infrautils` → `helm` (kubernetes-helm), `kubectl`, `k3d`, `kubectx`, `docker`, `tilt`,
+  `opentofu`, gardenio, mirrord. **`skopeo` is in `buildInputs` but NOT `cp`'d → not exposed.**
+- `infralint` → `hadolint`, `helm-docs`, `terraform-docs`, `tfsec`, `tflint`, `helmlint`.
 
-Implication: a shell composed of `system ++ lint` in a **helm-enabled** project resolves to
-`atomiutils + infrautils + <base lint> + infralint`, i.e. it has `helm`, `yq`, `helm-docs`,
-`skopeo`, `docker`, `kubectl`. This is the toolset the Helm CI/CD scripts need.
+Implication:
+- Helm hooks: `helm lint` uses `${packages.infrautils}/bin/helm`; `helm-docs` uses
+  `${packages.infralint}/bin/helm-docs` (the two were swapped before this change).
+- `hadolint` is available via `infralint`; `skopeo` must be added explicitly (from `pkgs-2605`)
+  because no bundle exposes it.
+- `.#cd` = `system ++ main` resolves to `atomiutils + infrautils` when Helm is enabled, giving
+  `helm` + `yq` — the toolset `helm.sh` needs.
 
 ### VE2 — `atomi/nix` `shells.nix` merge semantics (union of names, union of buildInputs)
 
@@ -150,25 +156,40 @@ and `all_features` fixtures and a `grep -q 'infisical' nix/env.nix` validate.
   - `docker login`, derive `IMAGE_VERSION="<sha6>-<branch>"`, then `docker buildx build --push`
     with `commit` + `branch` tags, `latest` (on `LATEST_BRANCH`), and the `semver` tag when a
     version arg is given. Build is cached, so the release run is effectively a re-tag.
-  - Mirrors `AtomiCloud/sulfone.zinc` `scripts/ci/docker.sh` (VE4).
+  - Mirrors `AtomiCloud/sulfone.zinc` `scripts/ci/docker.sh` (VE4). `set -euo pipefail` at top;
+    guard checks `[[ -n "${VAR:-}" ]] || { echo "❌ …"; exit 1; }`; conditional tags via
+    substitution (no `if`/`else`, no `onExit` function); emoji-prefixed progress echos.
 - `templates/docker/.github/workflows/⚡reusable-docker.yaml` (copied per-folder; **not**
-  merged): `workflow_call` with inputs `atomi_platform`, `atomi_service`, `image_name` (req),
-  `dockerfile`/`context`/`platform` (defaulted), `version` (opt). Runs on `ubuntu-22.04`, uses
-  `AtomiCloud/actions.setup-docker@v1`, runs `./scripts/ci/docker.sh ${{ inputs.version }}`.
+  merged): `workflow_call` with inputs `image_name` (req), `dockerfile`/`context`/`platform`
+  (defaulted), `version` (opt) — **no** `atomi_platform`/`atomi_service` (unused). Runs on
+  `ubuntu-22.04`, uses `AtomiCloud/actions.setup-docker@v1`, runs
+  `./scripts/ci/docker.sh ${{ inputs.version }}`.
+- `templates/docker/nix/{packages,env}.nix` provide the atomi bundles **`infrautils`**
+  (exposes `helm`/`kubectl`/`docker`/`tilt`/…) and **`infralint`** (exposes
+  `hadolint`/`helm-docs`/`tflint`/…), plus **`skopeo`** from `pkgs-2605` — `skopeo` is in
+  infrautils' `buildInputs` but not copied to its `/bin`, so it must be added explicitly (VE12).
+  `hadolint` is now available via `infralint` but no Dockerfile-lint hook / `docker:lint` task is
+  configured.
 
 #### FR5 — Helm publishing: one `helm.sh` via `⚡reusable-helm.yaml`
 
 - `templates/helm/scripts/ci/helm.sh` (single script; `$1` = `chart_path`, `$2` = optional
   semver version): sets `appVersion` on all `Chart.yaml`, `helm registry login`,
-  `helm dependency build`, `helm package`, `helm push`. No version ⇒ `v0.0.0-<sha6>-<branch>`;
-  version ⇒ that semver (repackage at release). Mirrors `sulfone.zinc` `scripts/ci/helm.sh`.
+  `helm dependency build`, `helm package`, `helm push`. Version chosen by substitution
+  (`HELM_VERSION="${version:-v0.0.0-${commit}}"`). Mirrors `sulfone.zinc` `scripts/ci/helm.sh`.
 - `templates/helm/.github/workflows/⚡reusable-helm.yaml` (copied per-folder): `workflow_call`
-  with inputs `atomi_platform`, `atomi_service`, `chart_path` (req), `version` (opt). Uses
+  with inputs `chart_path` (req), `version` (opt) — **no** `atomi_platform`/`atomi_service`. Uses
   `AtomiCloud/actions.setup-nix@v2`, runs
-  `nix develop .#ci -c ./scripts/ci/helm.sh "${{ inputs.chart_path }}" "${{ inputs.version }}"`.
-- **No `.#helm` shell** — Helm runs in `.#ci`, which already exposes `helm`/`yq`/`helm-docs`
-  when the Helm layer is enabled (VE1). Helm linting in CI runs via the pre-commit hook
-  (`a-helm-lint`), so there is no separate lint job/script.
+  `nix develop .#cd -c ./scripts/ci/helm.sh "${{ inputs.chart_path }}" "${{ inputs.version }}"`.
+- **No `.#helm` shell** — Helm publishing runs in the new `.#cd` shell (FR8). Helm linting in CI
+  runs via the pre-commit hook (`a-helm-lint`), so there is no separate lint job/script.
+
+#### FR8 — Dev shells: `ci` for CI, `cd` for CD
+
+- `templates/base/nix/shells.nix` defines `default`, `ci` (`system ++ main ++ lint`), **`cd`
+  (`system ++ main`)**, and `releaser`. `.#ci` runs CI checks (pre-commit); `.#cd` runs CD/
+  publishing (Helm — `helm`/`yq` come from `infrautils`/`atomiutils` in `system`); `.#releaser`
+  runs semantic-release. All keep the strict 4-arg signature (VE2).
 
 #### FR6 — Caller workflows (`ci.yaml` / `cd.yaml`) `uses:` the reusables
 
@@ -178,15 +199,25 @@ and `all_features` fixtures and a `grep -q 'infisical' nix/env.nix` validate.
 - **Helm** `ci.yaml` adds a `helm` job → `⚡reusable-helm.yaml` with `chart_path`; `cd.yaml`
   adds a `helm` job with the same plus `version: ${{ github.ref_name }}`.
 - Each `uses:` references the org actions only **indirectly** (through the reusable workflow) —
-  no direct `namespacelabs/*` usage anywhere.
+  no direct `namespacelabs/*` usage anywhere. Callers pass only the inputs the reusable needs
+  (no `atomi_platform`/`atomi_service`).
 - Publish more images/charts by adding caller jobs (one per `image_name` / `chart_path`) — no cap.
 
-#### FR7 — Shared Nix store cache (do not change base workflows)
+#### FR7 — Shared Nix store cache; reusable inputs only when required
 
 - All Nix jobs (pre-commit, Helm, release) share one cache via
-  `nscloud-cache-tag-atomi-nix-store-cache`. The base `⚡reusable-precommit.yaml` /
-  `⚡reusable-release.yaml` already use this tag and are **unchanged**; the new
-  `⚡reusable-helm.yaml` uses the same tag so the Helm job shares the pre-commit cache.
+  `nscloud-cache-tag-atomi-nix-store-cache` (global, **not** per-service — saves cache space).
+- `atomi_platform`/`atomi_service` inputs are removed from **all** reusable workflows and their
+  callers (they were only used for per-service cache keys). `⚡reusable-precommit.yaml` /
+  `⚡reusable-release.yaml` now take no inputs; their cache tag was already `atomi-nix-store-cache`.
+
+#### FR8b — Taskfiles never call CI scripts
+
+- `templates/docker/tasks/Taskfile.docker.yaml`: `build` / `run` / `dev` / `clean` as inline
+  one-liners (`docker build|run|image rm`), with `{{.CLI_ARGS}}` so users pass flags/tags.
+- `templates/helm/tasks/Taskfile.helm.yaml`: `template` / `debug` / `lint` / `docs` / `deps` as
+  inline `helm …` one-liners.
+- Neither calls `scripts/ci/*` — those belong to the CI/CD workflows only.
 
 #### FR10 — Skills & docs reflect the new scripts
 

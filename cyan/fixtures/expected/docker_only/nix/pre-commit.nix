@@ -1,84 +1,78 @@
-{ formatter, packages, pre-commit-lib }:
+{ packages, formatter, pre-commit-lib }:
 pre-commit-lib.run {
   src = ./.;
 
+  # hooks
   hooks = {
-    a-enforce-exec = {
+    # formatter
+    treefmt = {
       enable = true;
-      entry = "${packages.atomiutils}/bin/chmod +x";
-      files = ".*sh$";
-      name = "Enforce Shell Script executable";
-      pass_filenames = true;
-      language = ''system'';
-    };
-
-    a-enforce-gitlint = {
-      enable = true;
-      description = "Enforce atomi_releaser conforms to gitlint";
-      entry = "${packages.sg}/bin/sg gitlint -c atomi_release.yaml";
-      files = "(atomi_release\\.yaml|\\.gitlint)";
-      name = "Enforce gitlint";
-      pass_filenames = false;
-      language = ''system'';
-    };
-
-    a-gitlint = {
-      enable = true;
-      description = "Lints git commit message";
-      entry = "${packages.gitlint}/bin/gitlint --staged --msg-filename";
-      name = "Gitlint";
-      pass_filenames = true;
-      stages = [
-        "commit-msg"
+      package = formatter;
+      excludes = [
+        ".*node_modules.*"
+        ".*(Changelog|README|CommitConventions).+(MD|md)"
+        ".*infra/root_chart.*"
       ];
-      language = ''system'';
     };
 
-    a-hadolint = {
-      enable = true;
-      description = "Lint Dockerfiles for best practices";
-      entry = "${packages.hadolint}/bin/hadolint";
-      files = "Dockerfile$";
-      name = "Hadolint";
-      pass_filenames = true;
-      language = ''system'';
-    };
+    # linters From https://github.com/cachix/pre-commit-hooks.nix
 
+    # custom precommits
     a-infisical = {
       enable = true;
+      name = "Secrets Scanning";
       description = "Scan for possible secrets";
       entry = "${packages.infisical}/bin/infisical scan . -v";
-      name = "Secrets Scanning";
-      pass_filenames = false;
       language = ''system'';
+      pass_filenames = false;
     };
 
     a-infisical-staged = {
       enable = true;
+      name = "Secrets Scanning (Staged files)";
       description = "Scan for possible secrets in staged files";
       entry = "${packages.infisical}/bin/infisical scan git-changes --staged -v";
-      name = "Secrets Scanning (Staged files)";
-      pass_filenames = false;
       language = ''system'';
+      pass_filenames = false;
+    };
+
+    a-gitlint = {
+      enable = true;
+      name = "Gitlint";
+      description = "Lints git commit message";
+      entry = "${packages.gitlint}/bin/gitlint --staged --msg-filename";
+      language = ''system'';
+      pass_filenames = true;
+      stages = [ "commit-msg" ];
+    };
+
+    a-enforce-gitlint = {
+      enable = true;
+      name = "Enforce gitlint";
+      description = "Enforce atomi_releaser conforms to gitlint";
+      entry = "${packages.sg}/bin/sg gitlint -c atomi_release.yaml";
+      files = "(atomi_release\\.yaml|\\.gitlint)";
+      language = ''system'';
+      pass_filenames = false;
     };
 
     a-shellcheck = {
       enable = true;
+      name = "Shell Check";
       entry = "${packages.shellcheck}/bin/shellcheck";
       files = ".*sh$";
-      name = "Shell Check";
-      pass_filenames = true;
       language = ''system'';
+      pass_filenames = true;
     };
 
-    treefmt = {
+    a-enforce-exec = {
       enable = true;
-      excludes = [
-        ".*(Changelog|README|CommitConventions).+(MD|md)"
-        ".*infra/root_chart.*"
-        ".*node_modules.*"
-      ];
-      package = formatter;
+      name = "Enforce Shell Script executable";
+      entry = "${packages.atomiutils}/bin/chmod +x";
+      files = ".*sh$";
+      language = ''system'';
+      pass_filenames = true;
     };
+
   };
 }

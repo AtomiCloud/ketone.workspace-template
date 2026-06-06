@@ -7,6 +7,4 @@ jobs:
     uses: ./.github/workflows/⚡reusable-helm.yaml
     secrets: inherit
     with:
-      atomi_platform: let__platform__
-      atomi_service: let__service__
       chart_path: ./infra/root_chart

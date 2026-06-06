@@ -2,11 +2,19 @@
 let
 
   all = rec {
+    atomipkgs = (
+      with atomi;
+      {
+        inherit
+          infrautils
+          infralint
+          ;
+      }
+    );
     nix-2605 = (
       with pkgs-2605;
       {
         inherit
-          hadolint
           skopeo
           ;
       }
@@ -14,4 +22,4 @@ let
   };
 in
 with all;
-nix-2605
+atomipkgs // nix-2605
