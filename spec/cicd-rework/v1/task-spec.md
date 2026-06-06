@@ -117,13 +117,15 @@ no change required beyond ensuring `infisical` is on `PATH` in the dev shell.
 #### FR2 — Composable `setup`, no no-op script
 
 - Delete the placeholder behavior `echo "Completed"`.
-- `scripts/ci/setup.sh` performs **real** repo setup: install pre-commit git hooks
-  (`pre-commit install --install-hooks` + `--hook-type commit-msg`). It must be idempotent
-  and safe to run in CI and locally.
+- `scripts/ci/setup.sh` is a **minimal extension point**: shebang + `set -euo pipefail` + a
+  comment. It does **not** install pre-commit hooks — the Nix dev shell's `shellHook`
+  (`checks.pre-commit-check.shellHook`) installs them automatically whenever the shell is
+  entered, including in CI via `nix develop .#ci -c …`. Layers/projects add real setup steps here.
 - `templates/base/Taskfile.yaml` `setup` runs `bash scripts/ci/setup.sh`.
 - `templates/secret/Taskfile.yaml` `setup` keeps contributing `./scripts/local/secrets.sh`;
   under concat merge the merged `setup` becomes `[setup.sh, secrets.sh]` (base before secret).
-- `scripts/ci/pre-commit.sh` no longer sources a no-op; it runs `pre-commit run --all-files -v`.
+- `scripts/ci/pre-commit.sh` still runs setup first, like before:
+  `./scripts/ci/setup.sh` then `pre-commit run --all-files -v`.
 
 #### FR3 — `secret` Nix dev env (infisical on PATH)
 
