@@ -16,6 +16,3 @@ jobs:
     if: github.event.workflow_run.conclusion == 'success'
     uses: ./.github/workflows/⚡reusable-release.yaml
     secrets: inherit
-    with:
-      atomi_platform: let__platform__
-      atomi_service: let__service__

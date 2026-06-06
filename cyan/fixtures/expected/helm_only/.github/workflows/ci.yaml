@@ -6,15 +6,10 @@ jobs:
     name: Pre-Commit
     uses: ./.github/workflows/⚡reusable-precommit.yaml
     secrets: inherit
+  helm:
+    name: Helm Chart
+    uses: ./.github/workflows/⚡reusable-helm.yaml
+    secrets: inherit
     with:
-      atomi_platform: test-platform
-      atomi_service: test-service
-  helm-lint:
-    name: Helm Lint
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: Lint Helm Chart
-        run: bash scripts/ci/helm-lint.sh
+      chart_path: ./infra/root_chart
 

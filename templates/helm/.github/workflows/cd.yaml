@@ -4,11 +4,10 @@ on:
     tags:
       - 'v*.*.*'
 jobs:
-  helm-publish:
-    name: Helm Publish
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: Publish Helm Chart
-        run: bash scripts/ci/helm-publish.sh
+  helm:
+    name: Helm Chart
+    uses: ./.github/workflows/⚡reusable-helm.yaml
+    secrets: inherit
+    with:
+      chart_path: ./infra/root_chart
+      version: ${{ github.ref_name }}

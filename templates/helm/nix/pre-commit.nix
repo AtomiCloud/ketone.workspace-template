@@ -7,7 +7,7 @@ pre-commit-lib.run {
       enable = true;
       name = "Helm Lint";
       description = "Lint Helm charts for best practices";
-      entry = "${packages.infralint}/bin/helm lint infra/root_chart";
+      entry = "${packages.infrautils}/bin/helm lint infra/root_chart";
       files = "infra/root_chart/.*";
       language = ''system'';
       pass_filenames = false;
@@ -17,7 +17,7 @@ pre-commit-lib.run {
       enable = true;
       name = "Helm Docs";
       description = "Generate Helm chart documentation";
-      entry = "${packages.infrautils}/bin/helm-docs --chart-search-root infra/root_chart";
+      entry = "${packages.infralint}/bin/helm-docs --chart-search-root infra/root_chart";
       files = "infra/root_chart/.*";
       language = ''system'';
       pass_filenames = false;

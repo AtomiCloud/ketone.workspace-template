@@ -1,13 +1,6 @@
 name: ⚡ Reusable Release
 on:
   workflow_call:
-    inputs:
-      atomi_platform:
-        required: true
-        type: string
-      atomi_service:
-        required: true
-        type: string
 jobs:
   release:
     name: Semantic Release

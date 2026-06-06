@@ -1,0 +1,56 @@
+name: ⚡ Reusable Docker
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        required: true
+        type: string
+      dockerfile:
+        required: false
+        type: string
+        default: 'Dockerfile'
+      context:
+        required: false
+        type: string
+        default: '.'
+      platform:
+        required: false
+        type: string
+        default: 'linux/arm64,linux/amd64'
+      version:
+        required: false
+        type: string
+jobs:
+  build:
+    name: Build Docker
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    runs-on:
+      - ubuntu-22.04
+    steps:
+      # Setup
+      - uses: AtomiCloud/actions.setup-docker@v1
+
+      # Action
+      - name: Build and Push Docker
+        run: ./scripts/ci/docker.sh ${{ inputs.version }}
+        env:
+          LATEST_BRANCH: main
+
+          # registry
+          DOMAIN: ghcr.io
+          DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          DOCKER_USER: ${{ github.actor }}
+
+          # downwards API
+          GITHUB_REPO_REF: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_BRANCH: ${{ env.GITHUB_REF_SLUG }}
+
+          # build config
+          CI_DOCKER_IMAGE: ${{ inputs.image_name }}
+          CI_DOCKER_CONTEXT: ${{ inputs.context }}
+          CI_DOCKERFILE: ${{ inputs.dockerfile }}
+          CI_DOCKER_PLATFORM: ${{ inputs.platform }}

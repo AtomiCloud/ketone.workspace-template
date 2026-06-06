@@ -12,20 +12,19 @@ jobs:
     steps:
       - name: Placeholder Step
         run: echo "Placeholder step ${{ github.ref_name }}"
-  docker-push:
-    name: Docker Push
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: Push Docker Image
-        run: bash scripts/ci/docker-push.sh
-  helm-publish:
-    name: Helm Publish
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: Publish Helm Chart
-        run: bash scripts/ci/helm-publish.sh
+  docker:
+    name: Docker Image
+    uses: ./.github/workflows/⚡reusable-docker.yaml
+    secrets: inherit
+    with:
+      image_name: test-platform-test-service
+      dockerfile: ./infra/Dockerfile
+      version: ${{ github.ref_name }}
+  helm:
+    name: Helm Chart
+    uses: ./.github/workflows/⚡reusable-helm.yaml
+    secrets: inherit
+    with:
+      chart_path: ./infra/root_chart
+      version: ${{ github.ref_name }}
 

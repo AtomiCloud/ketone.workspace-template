@@ -4,11 +4,11 @@ on:
     tags:
       - 'v*.*.*'
 jobs:
-  docker-push:
-    name: Docker Push
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: Push Docker Image
-        run: bash scripts/ci/docker-push.sh
+  docker:
+    name: Docker Image
+    uses: ./.github/workflows/⚡reusable-docker.yaml
+    secrets: inherit
+    with:
+      image_name: let__platform__-let__service__
+      dockerfile: ./infra/Dockerfile
+      version: ${{ github.ref_name }}

@@ -6,6 +6,8 @@ let
       {
         inherit
           atomiutils
+          infralint
+          infrautils
           pls
           sg
         ;
@@ -20,7 +22,6 @@ let
           git
           gitlint
           go-task
-          hadolint
           infisical
           pre-commit
           shellcheck

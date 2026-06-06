@@ -34,6 +34,7 @@ tests:
       - grep -q '^tasks:' Taskfile.yaml
       - test ! -f CLAUDE.md
       - test ! -d .claude
+      - "! grep -qE '^  (test|build|clean):' Taskfile.yaml"
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
       - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
@@ -113,7 +114,8 @@ tests:
     validate:
       - find . -name '*.sh' -exec bash -n {} +
       - grep -q '^tasks:' Taskfile.yaml
-      - grep -q 'docker-build' .github/workflows/ci.yaml
+      - grep -q 'reusable-docker' .github/workflows/ci.yaml
+      - grep -q 'infrautils' nix/env.nix
       - test -f .claude/skills/docker-push/SKILL.md
       - grep -q '^  docker:' Taskfile.yaml
       - test "$(find .claude/skills -name SKILL.md | wc -l | tr -d ' ')" = "8"
@@ -157,7 +159,7 @@ tests:
       - grep -q '^tasks:' Taskfile.yaml
       - test ! -f CLAUDE.md
       - test ! -d .claude
-      - grep -q 'docker-build' .github/workflows/ci.yaml
+      - grep -q 'reusable-docker' .github/workflows/ci.yaml
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
       - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
@@ -196,8 +198,9 @@ tests:
     validate:
       - find . -name '*.sh' -exec bash -n {} +
       - grep -q '^tasks:' Taskfile.yaml
-      - grep -q 'helm-lint' .github/workflows/ci.yaml
-      - grep -q 'helm-publish' .github/workflows/cd.yaml
+      - grep -q 'reusable-helm' .github/workflows/ci.yaml
+      - grep -q 'reusable-helm' .github/workflows/cd.yaml
+      - test -f scripts/ci/helm.sh
       - test -f .claude/skills/helm-push/SKILL.md
       - grep -q '^  helm:' Taskfile.yaml
       - grep -q 'infrautils' nix/env.nix
@@ -242,8 +245,8 @@ tests:
     validate:
       - find . -name '*.sh' -exec bash -n {} +
       - grep -q '^tasks:' Taskfile.yaml
-      - grep -q 'docker-build' .github/workflows/ci.yaml
-      - grep -q 'helm-lint' .github/workflows/ci.yaml
+      - grep -q 'reusable-docker' .github/workflows/ci.yaml
+      - grep -q 'reusable-helm' .github/workflows/ci.yaml
       - grep -q '^  docker:' Taskfile.yaml
       - grep -q '^  helm:' Taskfile.yaml
       - test -f .claude/skills/docker-push/SKILL.md
@@ -291,6 +294,7 @@ tests:
       - grep -q '^### Secrets' .gitignore
       - test -f .claude/skills/infisical/SKILL.md
       - grep -F 'infisical run --env=dev -- ' docs/developer/standard/infisical.md
+      - grep -q 'infisical' nix/env.nix
       - 'ruby -ryaml -e ''doc=YAML.safe_load(File.read("Taskfile.yaml")); cmds=doc["tasks"]["setup"]["cmds"]; exit(cmds.is_a?(Array) && cmds.include?("./scripts/local/secrets.sh") && cmds.size > 1 ? 0 : 1)'''
       - test "$(find .claude/skills -name SKILL.md | wc -l | tr -d ' ')" = "8"
       - '! grep -rxq '':'' nix/*.nix'
@@ -335,10 +339,10 @@ tests:
       - grep -q '^  helm:' Taskfile.yaml
       - grep -q '^  secret:' Taskfile.yaml
       - grep -q 'precommit' .github/workflows/ci.yaml
-      - grep -q 'docker-build' .github/workflows/ci.yaml
-      - grep -q 'helm-lint' .github/workflows/ci.yaml
-      - grep -q 'docker-push' .github/workflows/cd.yaml
-      - grep -q 'helm-publish' .github/workflows/cd.yaml
+      - grep -q 'reusable-docker' .github/workflows/ci.yaml
+      - grep -q 'reusable-helm' .github/workflows/ci.yaml
+      - grep -q 'reusable-docker' .github/workflows/cd.yaml
+      - grep -q 'reusable-helm' .github/workflows/cd.yaml
       - grep -q '^### Secrets' .gitignore
       - test "$(grep -c '^### ' .gitignore)" -ge 6
       - grep -q '^# Docker' CLAUDE.md
@@ -387,7 +391,7 @@ tests:
       - test ! -f CLAUDE.md
       - test ! -d .claude
       - test -f scripts/local/secrets.sh
-      - grep -q 'docker-build' .github/workflows/ci.yaml
+      - grep -q 'reusable-docker' .github/workflows/ci.yaml
       - grep -q '^### Secrets' .gitignore
       - test -f infra/root_chart/Chart.yaml
       - '! grep -rxq '':'' nix/*.nix'

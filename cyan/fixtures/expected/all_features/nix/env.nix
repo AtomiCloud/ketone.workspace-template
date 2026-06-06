@@ -3,6 +3,7 @@ with packages;
 {
   dev = [
     git
+    infisical
     pls
     skopeo
   ];

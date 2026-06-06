@@ -1,29 +1,30 @@
 { pkgs, packages }:
 with packages;
 {
-  system = [
-    atomiutils
+  dev = [
+    git
+    infisical
+    pls
   ];
 
-  dev = [
-    pls
-    git
+  lint = [
+    actionlint
+    gitlint
+    go-task
+    pre-commit
+    sg
+    shellcheck
+    treefmt
   ];
 
   main = [
   ];
 
-  lint = [
-    pre-commit
-    treefmt
-    gitlint
-    shellcheck
-    sg
-    actionlint
-    go-task
-  ];
-
   releaser = [
     sg
+  ];
+
+  system = [
+    atomiutils
   ];
 }
