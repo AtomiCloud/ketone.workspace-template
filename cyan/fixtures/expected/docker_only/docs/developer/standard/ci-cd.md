@@ -136,7 +136,7 @@ on:
 jobs:
   precommit:
     runs-on:
-      - nscloud-ubuntu-22.04-amd64-32x64-with-cache
+      - nscloud-ubuntu-22.04-amd64-4x8-with-cache
       - nscloud-cache-size-50gb
       - nscloud-cache-tag-atomi-nix-store-cache
     steps:
