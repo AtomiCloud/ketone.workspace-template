@@ -35,7 +35,6 @@ result-*
 *.tfvars
 .env
 .env.*
-.infisical.json
 
 ### Windows
 #### source: 1dcf99b7-867e-40aa-b378-bf6d569d51ea
