@@ -21,7 +21,7 @@ jobs:
       - nscloud-cache-tag-atomi-nix-store-cache
     steps:
       # Setup
-      - uses: AtomiCloud/actions.setup-nix@v2
+      - uses: AtomiCloud/actions.setup-nix@v3
 
       # Action
       - name: Build and Push Helm

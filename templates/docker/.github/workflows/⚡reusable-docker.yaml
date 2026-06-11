@@ -31,7 +31,7 @@ jobs:
       - ubuntu-22.04
     steps:
       # Setup
-      - uses: AtomiCloud/actions.setup-docker@v1
+      - uses: AtomiCloud/actions.setup-docker@v2
 
       # Action
       - name: Build and Push Docker
