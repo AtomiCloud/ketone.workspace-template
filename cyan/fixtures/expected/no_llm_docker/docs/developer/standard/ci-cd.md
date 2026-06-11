@@ -92,7 +92,7 @@ Setup Nix -> Setup Caches -> nix develop -c ./scripts/ci/script.sh
 ### Example Execution
 
 ```yaml
-- uses: AtomiCloud/actions.setup-nix@v2 # checks out the repo too
+- uses: AtomiCloud/actions.setup-nix@v3 # checks out the repo too
 - run: nix develop .#ci -c ./scripts/ci/script.sh
 ```
 
@@ -114,7 +114,7 @@ Setup Nix -> Setup Caches -> nix develop -c ./scripts/ci/script.sh
 
 **Reusable workflow is responsible for:**
 
-- Setup (`AtomiCloud/actions.setup-nix@v2` or `AtomiCloud/actions.setup-docker@v1`)
+- Setup (`AtomiCloud/actions.setup-nix@v3` or `AtomiCloud/actions.setup-docker@v2`)
 - Running the shell script from `scripts/ci/`
 
 ### Inputs: only when required
@@ -140,7 +140,7 @@ jobs:
       - nscloud-cache-size-50gb
       - nscloud-cache-tag-atomi-nix-store-cache
     steps:
-      - uses: AtomiCloud/actions.setup-nix@v2 # checks out the repo too
+      - uses: AtomiCloud/actions.setup-nix@v3 # checks out the repo too
       - run: nix develop .#ci -c ./scripts/ci/pre-commit.sh
 ```
 
