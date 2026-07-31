@@ -26,7 +26,6 @@ jobs:
     env:
       EXPECTED_STORE_PATH: /nix/store/lpk86xcf9p6v22js8xnvlz7qkcjyhgj3-ratchet-workspace-g17-ubuntu-26.04-amd64
       GC_ROOT: /nix/var/nix/gcroots/ratchet-workspace-g17-ubuntu-26.04-amd64
-      RUN_ATTEMPT: ${{ github.run_attempt }}
     steps:
       - name: Record runner identity
         run: |
@@ -35,21 +34,13 @@ jobs:
       - uses: AtomiCloud/actions.setup-nix@v3
         with:
           checkout: 'false'
-      - name: Prove cold or warm cache state
+      - name: Prove warm cache restoration
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${RUN_ATTEMPT}" = 1 ]; then
-            test ! -e "${EXPECTED_STORE_PATH}"
-            printf 'cache_state=cold store_path=absent attempt=1\n'
-          else
-            test -L "${GC_ROOT}"
-            test "$(readlink -f "${GC_ROOT}")" = "${EXPECTED_STORE_PATH}"
-            test -f "${EXPECTED_STORE_PATH}"
-            grep -Fx 'workspace-g17 ubuntu-26.04 cache proof' "${EXPECTED_STORE_PATH}"
-            printf 'cache_state=warm restored_path=%s attempt=%s\n' \
-              "${EXPECTED_STORE_PATH}" "${RUN_ATTEMPT}"
-          fi
+          test -f "${EXPECTED_STORE_PATH}"
+          grep -Fx 'workspace-g17 ubuntu-26.04 cache proof' "${EXPECTED_STORE_PATH}"
+          printf 'cache_state=warm restored_path=%s\n' "${EXPECTED_STORE_PATH}"
       - name: Populate and root exact OS cache
         shell: bash
         run: |
