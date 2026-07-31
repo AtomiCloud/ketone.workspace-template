@@ -31,6 +31,9 @@ jobs:
         run: |
           printf 'runner_os=%s\n' "${RUNNER_OS}"
           uname -a
+      - uses: AtomiCloud/actions.setup-nix@v3
+        with:
+          checkout: 'false'
       - name: Prove cold or warm cache state
         shell: bash
         run: |
@@ -46,9 +49,6 @@ jobs:
             printf 'cache_state=warm marker=present attempt=%s path=%s\n' \
               "${RUN_ATTEMPT}" "${cached_path}"
           fi
-      - uses: AtomiCloud/actions.setup-nix@v3
-        with:
-          checkout: 'false'
       - name: Populate exact OS cache
         shell: bash
         run: |
