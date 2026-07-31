@@ -63,8 +63,8 @@ Key properties:
 - Setup uses the shared AtomiCloud actions — `AtomiCloud/actions.setup-docker` for Docker and
   `AtomiCloud/actions.setup-nix` for Helm (Helm runs in `nix develop .#cd`). Do **not** call
   the underlying nscloud/buildx actions directly.
-- All Nix jobs (pre-commit, Helm, release) share the same Nix store cache via
-  `nscloud-cache-tag-atomi-nix-store-cache`.
+- All Nix jobs (pre-commit, Helm, release) share the same OS-scoped Nix store cache via
+  `nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64`.
 - There is **no cap** on the number of images or charts — add a caller job per `image_name`
   / `chart_path`.
 
@@ -136,9 +136,9 @@ on:
 jobs:
   precommit:
     runs-on:
-      - nscloud-ubuntu-22.04-amd64-4x8-with-cache
+      - nscloud-ubuntu-26.04-amd64-16x32
       - nscloud-cache-size-50gb
-      - nscloud-cache-tag-atomi-nix-store-cache
+      - nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64
     steps:
       - uses: AtomiCloud/actions.setup-nix@v3 # checks out the repo too
       - run: nix develop .#ci -c ./scripts/ci/pre-commit.sh
@@ -164,14 +164,49 @@ jobs:
 
 Runners with Nix store caching for persistent build artifacts.
 
+### Runner Venues
+
+Every job picks exactly one venue. There is one **primary** and one **fallback** per venue kind:
+
+| Venue      | Primary                            | Fallback                           |
+| ---------- | ---------------------------------- | ---------------------------------- |
+| GitHub     | `ubuntu-26.04`                     | `ubuntu-24.04`                     |
+| Namespace  | `nscloud-ubuntu-26.04-amd64-16x32` | `nscloud-ubuntu-24.04-amd64-16x32` |
+
+Rules:
+
+- **Never mix primary and fallback labels** in the same `runs-on`. A Namespace job carries
+  exactly one venue label and exactly one cache tag; `nscloud-cache-size-50gb` is metadata and
+  is not a venue label.
+- The fallback exists for venue outages only. A job that runs on a fallback venue MUST record a
+  non-empty `S31_RUNNER_FALLBACK_REASON` at job-level `env` saying why:
+
+  ```yaml
+  jobs:
+    precommit:
+      runs-on:
+        - nscloud-ubuntu-24.04-amd64-16x32
+        - nscloud-cache-size-50gb
+        - nscloud-cache-tag-atomi-nix-store-cache-ubuntu-24.04-amd64
+      env:
+        S31_RUNNER_FALLBACK_REASON: '26.04 image unavailable in region (INC-1234)'
+  ```
+
+- Primary jobs MUST NOT carry a stale `S31_RUNNER_FALLBACK_REASON`. Remove it in the same commit
+  that moves a job back to the primary venue.
+
 ### Shared Nix Store Cache
 
-All Nix jobs use a single shared cache tag — **not** per-service — so the whole org reuses one
-warm store and saves cache space:
+All Nix jobs use a single shared, **OS-scoped** cache tag — **not** per-service — so the whole
+org reuses one warm store and saves cache space:
 
 ```yaml
-nscloud-cache-tag-atomi-nix-store-cache
+nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64
 ```
+
+The `-ubuntu-<version>-<arch>` suffix binds the store to the OS that produced it. Switching OS
+versions rotates the tag (26.04 ↔ 24.04 use different tags), so the first run on the new OS is a
+**cold build** by design — no alias, no carry-over, and no cross-OS store reuse.
 
 ## Local Reproducibility
 

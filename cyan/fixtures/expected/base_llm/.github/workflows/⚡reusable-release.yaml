@@ -5,9 +5,9 @@ jobs:
   release:
     name: Semantic Release
     runs-on:
-      - nscloud-ubuntu-22.04-amd64-4x8-with-cache
+      - nscloud-ubuntu-26.04-amd64-16x32
       - nscloud-cache-size-50gb
-      - nscloud-cache-tag-atomi-nix-store-cache
+      - nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64
     steps:
       - uses: AtomiCloud/actions.setup-nix@v3
         with:

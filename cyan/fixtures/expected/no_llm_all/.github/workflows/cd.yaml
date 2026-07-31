@@ -8,7 +8,7 @@ on:
 jobs:
   placeholder:
     name: Placeholder CD
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Placeholder Step
         run: echo "Placeholder step ${{ github.ref_name }}"
