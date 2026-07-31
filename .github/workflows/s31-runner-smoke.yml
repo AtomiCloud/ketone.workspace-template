@@ -23,8 +23,40 @@ jobs:
       - nscloud-cache-size-50gb
       - nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64
     timeout-minutes: 8
+    env:
+      CACHE_MARKER: /nix/ratchet-workspace-g17-ubuntu-26.04-amd64
+      RUN_ATTEMPT: ${{ github.run_attempt }}
     steps:
       - name: Record runner identity
         run: |
           printf 'runner_os=%s\n' "${RUNNER_OS}"
           uname -a
+      - name: Prove cold or warm cache state
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${RUN_ATTEMPT}" = 1 ]; then
+            test ! -e "${CACHE_MARKER}"
+            printf 'cache_state=cold marker=absent attempt=1\n'
+          else
+            test -f "${CACHE_MARKER}"
+            cached_path=$(<"${CACHE_MARKER}")
+            test -f "${cached_path}"
+            grep -Fx 'workspace-g17 ubuntu-26.04 cache proof' "${cached_path}"
+            printf 'cache_state=warm marker=present attempt=%s path=%s\n' \
+              "${RUN_ATTEMPT}" "${cached_path}"
+          fi
+      - uses: AtomiCloud/actions.setup-nix@v3
+        with:
+          checkout: 'false'
+      - name: Populate exact OS cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_file=/tmp/ratchet-workspace-g17-ubuntu-26.04-amd64
+          printf 'workspace-g17 ubuntu-26.04 cache proof\n' > "${proof_file}"
+          proof_path=$(nix store add-file "${proof_file}")
+          printf '%s\n' "${proof_path}" | sudo tee "${CACHE_MARKER}"
+          test -f "${proof_path}"
+          grep -Fx 'workspace-g17 ubuntu-26.04 cache proof' "${proof_path}"
+          printf 'cache_populated=true path=%s\n' "${proof_path}"
