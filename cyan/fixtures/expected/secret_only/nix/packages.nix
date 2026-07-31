@@ -17,6 +17,7 @@ let
       {
         inherit
           actionlint
+          check-jsonschema
           git
           gitlint
           go-task

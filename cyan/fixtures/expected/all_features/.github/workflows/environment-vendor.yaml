@@ -1,0 +1,85 @@
+name: Environment vendor action
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha: { description: 'Full protected-main commit', required: true, type: string }
+      action_id: { description: 'Exact declared vendor action ID', required: true, type: string }
+
+permissions: {}
+
+jobs:
+  authorize-vendor:
+    name: Authorize vendor action
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      artifact_digest: ${{ steps.guard.outputs.artifact_digest }}
+      artifact_image_ref: ${{ steps.guard.outputs.artifact_image_ref }}
+      artifact_producer_workflow_ref: ${{ steps.guard.outputs.artifact_producer_workflow_ref }}
+      garden_lock_digest: ${{ steps.guard.outputs.garden_lock_digest }}
+      base_workflow_ref: ${{ steps.guard.outputs.base_workflow_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, ref: '${{ inputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ACTION_ID: ${{ inputs.action_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          test "${#SOURCE_SHA}" -eq 40
+          test "$GITHUB_REPOSITORY_OWNER" = AtomiCloud
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" --jq .permission)
+          [[ "$permission" == write || "$permission" == admin ]]
+
+          [[ "$WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/"* ]]
+          test "$WORKFLOW_SHA" = "$SOURCE_SHA"
+          base_workflow_ref="${WORKFLOW_REF%@*}@$SOURCE_SHA"
+
+          # Every declaration this lane consumes is schema-validated, and the
+          # runner pin, vendor action and artifact subject are proven, before
+          # any disposable self-hosted runner can be selected.
+          DIENE_VENDOR_MANIFEST=.diene/ci/vendors.v1.yaml DIENE_ACTION_ID="$ACTION_ID" \
+            nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-prerequisites
+
+          # The subject is a same-run output of the repository's own producer,
+          # bound to this workflow, run and attempt. A checked-in declaration
+          # cannot satisfy it.
+          subject="$RUNNER_TEMP/artifact.v1.json"
+          ./.diene/ci/artifact-producer.sh --source-sha "$SOURCE_SHA" --output "$subject"
+          DIENE_BASE_WORKFLOW_REF="$base_workflow_ref" GITHUB_SHA="$SOURCE_SHA" \
+            nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-subject "$subject"
+
+          lock=$(sha256sum .diene/ci/environment-lock.v1.json | cut -d' ' -f1)
+          {
+            printf 'garden_lock_digest=sha256:%s\nbase_workflow_ref=%s\n' "$lock" "$base_workflow_ref"
+            nix develop .#ci -c jq -r '
+              "artifact_digest=" + .artifact.digest,
+              "artifact_image_ref=" + .artifact.imageRef,
+              "artifact_producer_workflow_ref=" + .artifact.producer.workflowRef
+            ' "$subject"
+          } >>"$GITHUB_OUTPUT"
+
+  environment-ditto-vendor:
+    needs: authorize-vendor
+    permissions: { contents: read }
+    uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
+    secrets: inherit
+    with:
+      lane: ditto-vendor
+      repository_id: ${{ fromJSON(github.repository_id) }}
+      repository_key: ${{ github.repository }}
+      source_sha: ${{ inputs.source_sha }}
+      base_workflow_ref: ${{ needs.authorize-vendor.outputs.base_workflow_ref }}
+      garden_lock_digest: ${{ needs.authorize-vendor.outputs.garden_lock_digest }}
+      artifact_digest: ${{ needs.authorize-vendor.outputs.artifact_digest }}
+      artifact_image_ref: ${{ needs.authorize-vendor.outputs.artifact_image_ref }}
+      artifact_producer_workflow_ref: ${{ needs.authorize-vendor.outputs.artifact_producer_workflow_ref }}
+      vendor_manifest: .diene/ci/vendors.v1.yaml
+      action_id: ${{ inputs.action_id }}

@@ -25,6 +25,7 @@ let
           actionlint
           go-task
           pre-commit
+          check-jsonschema
           ;
       }
     );

@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.atomi.cloud/diene/diene-journeys-v1.schema.json",
+  "title": "Diene CI journey declarations v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "journeys"],
+  "properties": {
+    "apiVersion": { "const": "diene.atomi.cloud/ci-journeys/v1" },
+    "journeys": { "type": "array", "items": { "$ref": "#/$defs/journey" } }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "pack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "digest"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "type": "string", "minLength": 1, "not": { "pattern": "[\\r\\n]" } }
+    },
+    "applicability": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["lane", "profile", "buildMode"],
+          "properties": { "lane": { "const": "ditto-build-local" }, "profile": { "const": "ditto" }, "buildMode": { "const": "build-local" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["lane", "profile", "buildMode"],
+          "properties": { "lane": { "const": "ditto-target-pull" }, "profile": { "const": "ditto" }, "buildMode": { "const": "target-pull" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["lane", "profile", "buildMode"],
+          "properties": { "lane": { "const": "absol" }, "profile": { "const": "absol" }, "buildMode": { "const": "build-local" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["lane", "profile", "buildMode", "fixtureId"],
+          "properties": {
+            "lane": { "const": "fleet-independence" }, "profile": { "const": "ditto" },
+            "buildMode": { "const": "build-local" }, "fixtureId": { "const": "bootstrap-fleet-independence-v1" }
+          }
+        }
+      ]
+    },
+    "journey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "componentClass", "appliesTo", "required", "fixturePack", "setup", "probe", "cleanup", "workingDirectory", "timeoutSeconds", "poll", "readinessLeaves", "assertions", "safeReportFields"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,127}$" },
+        "componentClass": { "type": "string", "pattern": "^K([1-9]|1[0-4])$" },
+        "appliesTo": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/applicability" } },
+        "required": { "type": "boolean" },
+        "fixturePack": { "$ref": "#/$defs/pack" },
+        "personaPack": { "$ref": "#/$defs/pack" },
+        "setup": { "$ref": "#/$defs/argv" },
+        "probe": { "$ref": "#/$defs/argv" },
+        "cleanup": { "$ref": "#/$defs/argv" },
+        "workingDirectory": { "type": "string", "pattern": "^(\\.|[A-Za-z0-9_.-]+)(/[A-Za-z0-9_.-]+)*$" },
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "poll": {
+          "type": "object", "additionalProperties": false, "required": ["intervalSeconds", "attempts"],
+          "properties": { "intervalSeconds": { "type": "integer", "minimum": 1, "maximum": 60 }, "attempts": { "type": "integer", "minimum": 1, "maximum": 120 } }
+        },
+        "readinessLeaves": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "diene-readiness-v1.schema.json#/$defs/leafId" }
+        },
+        "assertions": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "safeReportFields": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$" } }
+      },
+      "allOf": [
+        {
+          "description": "An independence journey's fixture ID must agree with its fixture pack; a disagreeing pair is schema-invalid rather than implicitly applicable.",
+          "if": {
+            "properties": { "appliesTo": { "contains": { "properties": { "lane": { "const": "fleet-independence" } }, "required": ["lane"] } } },
+            "required": ["appliesTo"]
+          },
+          "then": { "properties": { "fixturePack": { "properties": { "id": { "const": "bootstrap-fleet-independence-v1" } } } } }
+        },
+        {
+          "description": "Only the independence tuple may name a fixture; every other lane's pack must not borrow the independence fixture identity.",
+          "if": {
+            "properties": { "appliesTo": { "items": { "not": { "properties": { "lane": { "const": "fleet-independence" } }, "required": ["lane"] } } } },
+            "required": ["appliesTo"]
+          },
+          "then": { "properties": { "fixturePack": { "properties": { "id": { "not": { "const": "bootstrap-fleet-independence-v1" } } } } } }
+        }
+      ]
+    }
+  }
+}
