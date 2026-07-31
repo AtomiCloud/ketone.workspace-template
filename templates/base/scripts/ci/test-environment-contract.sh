@@ -2,6 +2,8 @@
 # Fully local proof of the diene-ci-k3d/v1 compatibility contract. The fake
 # Namespace CLI implements only the measured nsc v0.0.532 lifecycle surface;
 # every other verb or argument is a test failure by construction.
+# Test scenarios deliberately reuse environment names in isolated subshells.
+# shellcheck disable=SC2030,SC2031
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -120,6 +122,7 @@ printf '%q ' "$@" >>"${FAKE_BROKER_LOG:-/dev/null}"
 printf '\n' >>"${FAKE_BROKER_LOG:-/dev/null}"
 command=${1:-}
 shift || true
+[[ $command != "${FAKE_BROKER_FAIL_COMMAND:-}" ]] || exit 69
 case $command in
   issue)
     output=
@@ -553,6 +556,7 @@ prepare_run() {
   unset DIENE_SEED_IDENTITY DIENE_VENDOR_CREDENTIAL DIENE_NSC_MACHINE_TYPE GITHUB_WORKSPACE
   unset DIENE_PRE_SIT_NEGATIVE_CANARY DIENE_PRE_SIT_FIXTURE_ROOT
   unset FAKE_L7_COMPLETE FAKE_PROBE_FAIL_SCOPE FAKE_L7_LOG FAKE_PROBE_LOG FAKE_BROKER_LOG
+  unset FAKE_TABLE_FAIL_REGEX FAKE_RESOLVER_IPV4 FAKE_BROKER_FAIL_COMMAND
   if [[ $lane == ditto-target-pull ]]; then
     export DIENE_ARTIFACT_PROVENANCE_REF="oci://ghcr.io/atomicloud/example/provenance/$SOURCE_SHA"
     export DIENE_ARTIFACT_ATTESTATION_DIGEST=$ATTESTATION_DIGEST
@@ -1108,5 +1112,383 @@ jq -e --arg cluster "$parallel_id_b" --arg run 6102 \
   ! -e $parallel_nsc_b/instances/$parallel_id_b/live ]] ||
   fail 'a parallel exact instance survived cleanup'
 ok 'parallel tuples have distinct IDs, receipts, reports, roots, and exact cleanup selectors'
+
+printf '== interim iptables-nft host/pod enforcement ==\n'
+
+policy_tools=$scratch/policy-tools
+policy_state=$scratch/policy-tables
+install -d -m 0700 "$policy_tools" "$policy_state"
+
+cat >"$policy_tools/iptables4" <<'TABLE'
+#!/usr/bin/env bash
+set -euo pipefail
+family=4
+[[ $(basename -- "$0") != *6 ]] || family=6
+state=${FAKE_TABLE_STATE:?}/$family
+install -d -m 0700 "$state"
+printf '%q ' "$@" >>"${FAKE_TABLE_LOG:?}"
+printf '\n' >>"${FAKE_TABLE_LOG:?}"
+signature="$family $*"
+if [[ -n ${FAKE_TABLE_FAIL_REGEX:-} && $signature =~ ${FAKE_TABLE_FAIL_REGEX} ]]; then exit 88; fi
+if [[ ${1:-} == --version ]]; then
+  printf 'iptables v1.8.13 (nf_tables)\n'
+  exit 0
+fi
+if [[ ${1:-} == -w && ${2:-} == 5 ]]; then shift 2; fi
+operation=${1:-}
+shift || true
+case $operation in
+  -N)
+    chain=${1:?}
+    [[ ! -e $state/chain-$chain ]] || exit 1
+    : >"$state/chain-$chain"
+    ;;
+  -A)
+    chain=${1:?}
+    shift
+    [[ -f $state/chain-$chain ]] || exit 1
+    printf -- '-A %s' "$chain" >>"$state/chain-$chain"
+    printf ' %q' "$@" >>"$state/chain-$chain"
+    printf '\n' >>"$state/chain-$chain"
+    ;;
+  -I)
+    base=${1:?}
+    position=${2:?}
+    jump=${3:?}
+    chain=${4:?}
+    [[ $position == 1 && $jump == -j && ($base == OUTPUT || $base == FORWARD) ]] || exit 1
+    printf -- '-A %s -j %s\n' "$base" "$chain" >>"$state/hooks-$base"
+    ;;
+  -D)
+    base=${1:?}
+    jump=${2:?}
+    chain=${3:?}
+    [[ $jump == -j && ($base == OUTPUT || $base == FORWARD) ]] || exit 1
+    hooks=$state/hooks-$base
+    [[ -f $hooks ]] || exit 1
+    awk -v expected="-A $base -j $chain" '$0 != expected' "$hooks" >"$hooks.tmp"
+    mv "$hooks.tmp" "$hooks"
+    ;;
+  -F)
+    chain=${1:?}
+    [[ -f $state/chain-$chain ]] || exit 1
+    : >"$state/chain-$chain"
+    ;;
+  -X)
+    chain=${1:?}
+    [[ -f $state/chain-$chain ]] || exit 1
+    rm -f -- "$state/chain-$chain"
+    ;;
+  -S)
+    selected=${1:-}
+    if [[ $selected == OUTPUT || $selected == FORWARD ]]; then
+      [[ ! -f $state/hooks-$selected ]] || sed -n '1,200p' "$state/hooks-$selected"
+      exit 0
+    fi
+    [[ -n $selected && -f $state/chain-$selected ]] || exit 1
+    sed -n '1,240p' "$state/chain-$selected"
+    ;;
+  *) exit 127 ;;
+esac
+TABLE
+cp "$policy_tools/iptables4" "$policy_tools/iptables6"
+chmod 0755 "$policy_tools/iptables4" "$policy_tools/iptables6"
+
+cat >"$policy_tools/ip" <<'IP'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  '-o -4 route show')
+    printf '%s\n' '10.0.0.0/30 dev eth0 proto kernel' '10.142.0.0/16 dev cni0' 'default via 10.0.0.1 dev eth0'
+    ;;
+  '-o -6 route show')
+    printf '%s\n' 'fd00:142::/64 dev cni0' 'fe80::/64 dev eth0' 'default via fe80::1 dev eth0'
+    ;;
+  *) exit 127 ;;
+esac
+IP
+
+cat >"$policy_tools/kubectl" <<'KUBECTL'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%q ' "$@" >>"${FAKE_KUBECTL_LOG:?}"
+printf '\n' >>"${FAKE_KUBECTL_LOG:?}"
+case "$*" in
+  'get nodes -o json')
+    jq -n '{items:[{spec:{podCIDR:"10.142.0.0/16",podCIDRs:["10.142.0.0/16","fd00:142::/64"]},
+      status:{conditions:[{type:"Ready",status:"True"}],capacity:{cpu:"16",memory:"32Gi"}}}]}'
+    ;;
+  'get ingress -A -o json' | 'get gateway -A -o json') printf '%s\n' '{"items":[]}' ;;
+  'get service -A -o json')
+    printf '%s\n' '{"items":[{"metadata":{"name":"kgateway"},"spec":{"type":"ClusterIP","externalIPs":[]}}]}'
+    ;;
+  *) exit 127 ;;
+esac
+KUBECTL
+
+cat >"$policy_tools/resolver" <<'RESOLVER'
+#!/usr/bin/env bash
+set -euo pipefail
+family=${1:?}
+dns=${2:?}
+[[ $dns == api.example.test || $dns == vendor.example.test || $dns == ghcr.io ]] || exit 1
+case $family in
+  ipv4) printf '%s\n' "${FAKE_RESOLVER_IPV4:-203.0.113.8}" ;;
+  ipv6) printf '%s\n' '2001:db8::8' ;;
+  *) exit 127 ;;
+esac
+RESOLVER
+chmod 0755 "$policy_tools/ip" "$policy_tools/kubectl" "$policy_tools/resolver"
+
+policy_table_log=$scratch/policy-table.log
+policy_kubectl_log=$scratch/policy-kubectl.log
+policy_l7_log=$scratch/policy-l7.log
+policy_probe_log=$scratch/policy-probe.log
+: >"$policy_table_log"
+: >"$policy_kubectl_log"
+: >"$policy_l7_log"
+: >"$policy_probe_log"
+
+prepare_run 7001
+policy_evidence=$scratch/policy-evidence
+install -d -m 0700 "$policy_evidence"
+jq -n '{network:{serviceCidrs:["10.143.0.0/16"]}}' >"$policy_evidence/preflight.json"
+(
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_validate_inputs
+  export DIENE_NSC_CLUSTER_ID=cluster-policy-7001
+  export DIENE_PREFLIGHT_EVIDENCE="$policy_evidence/preflight.json"
+  export DIENE_KUBECTL_BIN="$policy_tools/kubectl"
+  export DIENE_IPTABLES_BIN="$policy_tools/iptables4"
+  export DIENE_IP6TABLES_BIN="$policy_tools/iptables6"
+  export DIENE_EGRESS_RESOLVER_BIN="$policy_tools/resolver"
+  export FAKE_TABLE_STATE="$policy_state" FAKE_TABLE_LOG="$policy_table_log"
+  export FAKE_KUBECTL_LOG="$policy_kubectl_log" FAKE_L7_LOG="$policy_l7_log"
+  export FAKE_PROBE_LOG="$policy_probe_log" SSH_CONNECTION='192.0.2.10 4242 10.0.0.2 22'
+  export PATH="$policy_tools:$PATH"
+  diene_prepare_egress_contract "$policy_evidence/contract.json"
+  diene_resolve_egress_contract "$policy_evidence/contract.json" "$policy_evidence/resolved.json"
+  diene_preflow_start
+  diene_apply_interim_policy "$policy_evidence/resolved.json" "$policy_evidence/policy.json" \
+    "$policy_evidence/l7.json"
+  diene_verify_hostile_egress "$policy_evidence/hostile-probes.json"
+  diene_verify_endpoint_law "$policy_evidence/endpoint.json"
+  diene_remove_interim_policy
+) >"$scratch/policy.out" 2>"$scratch/policy.err" || {
+  sed -n '1,200p' "$scratch/policy.err" >&2
+  fail 'the measured interim policy happy path failed'
+}
+
+jq -e '.mode == "allowlist" and .profileId == "ditto-build-local-v1" and
+  .platformStatus == "platform per-instance policy pending (support ask #4)" and
+  (.entries | length) == 1 and .entries[0].dns == "api.example.test" and
+  .entries[0].sni == "api.example.test" and .entries[0].port == 443 and
+  .entries[0].methods == ["GET","POST"]' "$policy_evidence/contract.json" >/dev/null ||
+  fail 'connected egress contract lost the exact support stamp or DNS/SNI/port/method boundary'
+jq -e '.resolvedEntries[0].addresses.ipv4 == ["203.0.113.8"] and
+  .resolvedEntries[0].addresses.ipv6 == ["2001:db8::8"]' "$policy_evidence/resolved.json" >/dev/null ||
+  fail 'resolver output was not bound into the policy contract'
+jq -e '.mechanism == "interim-in-guest-iptables-nft" and .backend == "nf_tables" and
+  .platformStatus == "platform per-instance policy pending (support ask #4)" and
+  .outputChain != .forwardChain and .ipv6Armed == true and .podCidr == "10.142.0.0/16" and
+  .pod6Cidrs == ["fd00:142::/64"] and .serviceCidr == "10.143.0.0/16" and
+  .orchestrationException == "exact-ssh-4-tuple" and .applied == true' \
+  "$policy_evidence/policy.json" >/dev/null || fail 'policy transcript lacks host/FORWARD/IPv6/exact-SSH facts'
+jq -e '.outcome == "Pass" and .defaultDenied == true and .dnsBound == true and
+  .sniBound == true and .methodsBound == true' "$policy_evidence/l7.json" >/dev/null ||
+  fail 'L7 enforcer did not attest the full declaration boundary'
+jq -e 'length == 6 and
+  ([.[].id] | sort) == ["host-arbitrary-https-denial","host-metadata-denial",
+    "pod-arbitrary-https-denial","pod-dns-denial","pod-metadata-denial",
+    "preexisting-flow-transition-denial"] and all(.outcome == "Pass" and .required == true)' \
+  "$policy_evidence/hostile-probes.json" >/dev/null || fail 'host and actual-pod hostile proof is incomplete'
+jq -e '.outcome == "Pass" and .reasonCode == "LoopbackOnlyNoIngress" and
+  .namespaceEndpointUsed == false' "$policy_evidence/endpoint.json" >/dev/null ||
+  fail 'loopback/no-ingress endpoint law was not proved'
+grep -Fq -- '-I OUTPUT 1 -j' "$policy_table_log" || fail 'host OUTPUT policy was not hooked'
+grep -Fq -- '-I FORWARD 1 -j' "$policy_table_log" || fail 'pod FORWARD policy was not hooked'
+grep -Eq -- '-p tcp -s 10\.0\.0\.2 -d 192\.0\.2\.10 --sport 22 --dport 4242 -m conntrack --ctstate ESTABLISHED -j ACCEPT' \
+  "$policy_table_log" || fail 'SSH exception is not the narrow observed orchestration flow'
+grep -Eq -- '-A DIO_[0-9a-f]+ -p tcp -d 203\.0\.113\.8 --dport 443 -j ACCEPT' \
+  "$policy_table_log" || fail 'host L3/L4 allowlist did not bind the resolved IPv4 endpoint'
+grep -Eq -- '-A DIF_[0-9a-f]+ -s 10\.142\.0\.0/16 -p tcp -d 203\.0\.113\.8 --dport 443 -j ACCEPT' \
+  "$policy_table_log" || fail 'pod L3/L4 allowlist did not bind the resolved IPv4 endpoint'
+grep -Eq -- '-A DI6O_[0-9a-f]+ -p tcp -d 2001:db8::8 --dport 443 -j ACCEPT' \
+  "$policy_table_log" || fail 'host IPv6 allowlist did not bind the resolved endpoint'
+grep -Eq -- '-A DI6F_[0-9a-f]+ -s fd00:142::/64 -p tcp -d 2001:db8::8 --dport 443 -j ACCEPT' \
+  "$policy_table_log" || fail 'pod IPv6 allowlist did not bind the resolved endpoint'
+! grep -Fq -- 'ESTABLISHED,RELATED' "$policy_table_log" || fail 'a blanket established-flow exemption was installed'
+! grep -Eq -- '0\.0\.0\.0/0|::/0' "$policy_table_log" || fail 'an unrestricted L3 route was allowed'
+! grep -Fq -- '-d 10.0.0.0/30' "$policy_table_log" ||
+  fail 'an unrelated connected IPv4 LAN was accepted'
+! grep -Fq -- '-d fe80::/64' "$policy_table_log" ||
+  fail 'an unrelated connected IPv6 LAN was accepted'
+for scope in preexisting-open preexisting-transition host pod; do
+  grep -Fq -- "--scope $scope" "$policy_probe_log" || fail "hostile probe scope $scope was not exercised"
+done
+grep -Fq -- "--image $CANARY_IMAGE" "$policy_probe_log" || fail 'pod probe did not use the immutable canary image'
+grep -Fq -- 'apply --profile ditto-build-local-v1' "$policy_l7_log" || fail 'L7 policy did not arm'
+grep -Fq -- 'remove --profile ditto-build-local-v1' "$policy_l7_log" || fail 'L7 policy did not remove'
+output_chain=$(jq -r '.outputChain' "$policy_evidence/policy.json")
+forward_chain=$(jq -r '.forwardChain' "$policy_evidence/policy.json")
+output6_chain=$(jq -r '.output6Chain' "$policy_evidence/policy.json")
+forward6_chain=$(jq -r '.forward6Chain' "$policy_evidence/policy.json")
+for chain in "$output_chain" "$forward_chain" "$output6_chain" "$forward6_chain"; do
+  [[ ! -e $policy_state/4/chain-$chain && ! -e $policy_state/6/chain-$chain ]] ||
+    fail "receipt-scoped policy chain $chain survived removal"
+done
+for family in 4 6; do
+  for hook in OUTPUT FORWARD; do
+    [[ ! -s $policy_state/$family/hooks-$hook ]] || fail "IPv$family $hook hook survived removal"
+  done
+done
+if rg -n '(^|[[:space:]])nsc[[:space:]]+egress|egress[[:space:]]+policy[[:space:]]+(create|update)' \
+  "$template_root/scripts/ci" "$template_root/.github/workflows" >"$scratch/tenant-policy"; then
+  sed -n '1,120p' "$scratch/tenant-policy" >&2
+  fail 'active code mutates a tenant-wide Namespace egress policy'
+fi
+ok 'iptables-nft enforces exact host/pod IPv4+IPv6 rules, hostile probes, narrow SSH, and full removal'
+
+printf '== partial policy transactions roll back completely ==\n'
+
+assert_policy_state_absent() {
+  local state=${1:?state required} label=${2:?label required}
+  ! find "$state" -type f -name 'chain-*' -print -quit | grep -q . ||
+    fail "$label left a receipt-scoped chain"
+  while IFS= read -r hook; do
+    [[ ! -s $hook ]] || fail "$label left a receipt-scoped hook"
+  done < <(find "$state" -type f -name 'hooks-*' -print)
+}
+
+policy_failure_case() {
+  local run_id=${1:?run id required} label=${2:?label required} table_regex=${3-}
+  local l7_complete=${4:-true} expected=${5:-InterimPolicyUnavailable}
+  prepare_run "$run_id"
+  local state=$scratch/policy-failure-$label tables=$scratch/policy-failure-$label.log
+  local l7_log=$scratch/policy-failure-$label-l7.log evidence=$scratch/policy-failure-$label-evidence
+  install -d -m 0700 "$state" "$evidence"
+  : >"$tables"
+  : >"$l7_log"
+  jq -n '{network:{serviceCidrs:["10.143.0.0/16"]}}' >"$evidence/preflight.json"
+  if (
+    cd -- "$work"
+    # shellcheck source=/dev/null
+    source ./scripts/ci/environment-lib.sh
+    diene_validate_inputs
+    export DIENE_NSC_CLUSTER_ID="cluster-$label-$run_id"
+    export DIENE_PREFLIGHT_EVIDENCE="$evidence/preflight.json"
+    export DIENE_KUBECTL_BIN="$policy_tools/kubectl"
+    export DIENE_IPTABLES_BIN="$policy_tools/iptables4"
+    export DIENE_IP6TABLES_BIN="$policy_tools/iptables6"
+    export DIENE_EGRESS_RESOLVER_BIN="$policy_tools/resolver"
+    export FAKE_TABLE_STATE="$state" FAKE_TABLE_LOG="$tables"
+    export FAKE_TABLE_FAIL_REGEX="$table_regex" FAKE_KUBECTL_LOG="$policy_kubectl_log"
+    export FAKE_L7_LOG="$l7_log" FAKE_L7_COMPLETE="$l7_complete"
+    export SSH_CONNECTION='192.0.2.10 4242 10.0.0.2 22'
+    diene_prepare_egress_contract "$evidence/contract.json"
+    diene_resolve_egress_contract "$evidence/contract.json" "$evidence/resolved.json"
+    diene_apply_interim_policy "$evidence/resolved.json" "$evidence/policy.json" "$evidence/l7.json"
+  ) >"$scratch/policy-failure-$label.out" 2>"$scratch/policy-failure-$label.err"; then
+    fail "$label partial policy unexpectedly succeeded"
+  fi
+  grep -Fq -- "$expected" "$scratch/policy-failure-$label.err" || {
+    sed -n '1,200p' "$scratch/policy-failure-$label.err" >&2
+    fail "$label did not retain $expected"
+  }
+  assert_policy_state_absent "$state" "$label"
+  POLICY_FAILURE_TABLE_LOG=$tables
+  POLICY_FAILURE_L7_LOG=$l7_log
+  ok "$label failure proves complete receipt-scoped rollback"
+}
+
+policy_failure_case 7101 partial-ipv4 '^4 -w 5 -I FORWARD'
+grep -Fq -- '-D OUTPUT -j DIO_' "$POLICY_FAILURE_TABLE_LOG" ||
+  fail 'partial IPv4 rollback did not remove the first installed hook'
+
+policy_failure_case 7102 partial-ipv6 '^6 -w 5 -I FORWARD'
+grep -Fq -- '-D OUTPUT -j DI6O_' "$POLICY_FAILURE_TABLE_LOG" ||
+  fail 'partial IPv6 rollback did not remove the first IPv6 hook'
+grep -Fq -- '-D OUTPUT -j DIO_' "$POLICY_FAILURE_TABLE_LOG" ||
+  fail 'partial IPv6 rollback did not also remove the complete IPv4 transaction'
+
+policy_failure_case 7103 l7-attestation '' false ConnectedEgressInterfaceUnavailable
+grep -Fq -- 'apply --profile ditto-build-local-v1' "$POLICY_FAILURE_L7_LOG" ||
+  fail 'L7 failure injection never reached the apply boundary'
+grep -Fq -- 'remove --profile ditto-build-local-v1' "$POLICY_FAILURE_L7_LOG" ||
+  fail 'L7 failure rollback did not remove the attempted enforcer state'
+ok 'partial IPv4, partial IPv6, and L7 failures leave no receipt-scoped hook or chain'
+
+printf '== resolver, hostile probe, and vendor broker fail closed ==\n'
+
+prepare_run 7110
+if (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_validate_inputs
+  diene_prepare_egress_contract "$scratch/resolver-contract.json"
+  export DIENE_EGRESS_RESOLVER_BIN="$policy_tools/resolver" FAKE_RESOLVER_IPV4=not-an-ip
+  diene_resolve_egress_contract "$scratch/resolver-contract.json" "$scratch/resolver-invalid.json"
+) >"$scratch/resolver-invalid.out" 2>"$scratch/resolver-invalid.err"; then
+  fail 'an invalid resolver result was accepted'
+fi
+assert_contains "$scratch/resolver-invalid.err" ConnectedEgressInterfaceUnavailable
+ok 'invalid resolved addresses refuse before policy activation'
+
+prepare_run 7111
+probe_failure_log=$scratch/probe-failure.log
+: >"$probe_failure_log"
+if (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_validate_inputs
+  export DIENE_NSC_CLUSTER_ID=cluster-probe-7111 DIENE_PREFLOW_ADAPTER=true
+  export FAKE_PROBE_LOG="$probe_failure_log" FAKE_PROBE_FAIL_SCOPE=pod
+  diene_verify_hostile_egress "$scratch/probe-invalid.json"
+) >"$scratch/probe-invalid.out" 2>"$scratch/probe-invalid.err"; then
+  fail 'a failing actual-pod hostile probe was accepted'
+fi
+assert_contains "$scratch/probe-invalid.err" InterimPolicyUnavailable
+grep -Fq -- '--scope host' "$probe_failure_log" || fail 'host negative probe was skipped before pod failure'
+grep -Fq -- '--scope pod' "$probe_failure_log" || fail 'actual-pod failure injection was not exercised'
+[[ ! -e $scratch/probe-invalid.json ]] || fail 'a failing hostile probe emitted passing evidence'
+ok 'hostile actual-pod metadata/arbitrary-HTTPS/DNS proof is mandatory'
+
+prepare_run 7112 ditto-vendor
+vendor_contract=$scratch/vendor-contract.json
+(
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_validate_inputs
+  diene_prepare_egress_contract "$vendor_contract"
+) >"$scratch/vendor-contract.out" 2>"$scratch/vendor-contract.err" || {
+  sed -n '1,120p' "$scratch/vendor-contract.err" >&2
+  fail 'declared vendor broker/egress contract failed'
+}
+jq -e '.profileId == "ditto-vendor-v1" and .mode == "allowlist" and
+  .platformStatus == "platform per-instance policy pending (support ask #4)" and
+  .entries == [{dns:"vendor.example.test",sni:"vendor.example.test",port:443,
+    methods:["GET","POST","DELETE"]}]' "$vendor_contract" >/dev/null ||
+  fail 'vendor contract widened or changed its declared egress boundary'
+
+broker_log=$scratch/broker-failure.log
+: >"$broker_log"
+if (cd -- "$work" && FAKE_BROKER_LOG="$broker_log" FAKE_BROKER_FAIL_COMMAND=issue \
+  ./.diene/ci/vendor-broker issue --action demo-vendor --output "$scratch/vendor-secret" \
+    --evidence "$scratch/vendor-broker-evidence.json"); then
+  fail 'the fake broker failure injection unexpectedly issued a credential'
+fi
+[[ ! -e $scratch/vendor-secret ]] || fail 'failed broker issue left credential bytes'
+grep -Fq 'diene_die VendorBrokerInterfaceUnavailable' "$script_dir/environment-vendor-run.sh" ||
+  fail 'the vendor driver does not fail closed on broker issue'
+# The quoted shell expression is intentionally matched literally.
+# shellcheck disable=SC2016
+grep -Fq 'if ! "$broker" revoke' "$script_dir/environment-vendor-run.sh" ||
+  fail 'the vendor driver does not make broker revocation cleanup-blocking'
+ok 'vendor broker issue/revoke and exact vendor allowlist remain fail closed'
 
 printf '\nenvironment contract checkpoint: PASS (%d checks)\n' "$passed"

@@ -865,13 +865,75 @@ diene_preflow_finish() {
   wait "$DIENE_PREFLOW_PID" 2>/dev/null || true
 }
 
+diene_policy_exec() {
+  "$@" || diene_die InterimPolicyUnavailable "policy command failed: $1"
+}
+
+diene_policy_hook_present() {
+  local binary=${1:?binary required} base=${2:?base chain required} chain=${3:?receipt chain required}
+  "$binary" -w 5 -S "$base" 2>/dev/null | grep -Fqx -- "-A $base -j $chain"
+}
+
+# Idempotent exact cleanup for both complete policies and partially installed
+# transactions. Absence is checked for every known receipt-scoped hook/chain;
+# unrelated host rules are never flushed or rewritten.
+diene_remove_policy_artifacts() {
+  local iptables_bin=${1:?iptables required} ip6tables_bin=${2:?ip6tables required}
+  local out_chain=${3:?output chain required} forward_chain=${4:?forward chain required}
+  local out6_chain=${5:?IPv6 output chain required} forward6_chain=${6:?IPv6 forward chain required}
+  local remove_l7=${7:-false} failed=0 binary base chain out forward
+  for binary in "$iptables_bin" "$ip6tables_bin"; do
+    if [[ $binary != "$iptables_bin" ]] && ! command -v "$binary" >/dev/null 2>&1; then continue; fi
+    if [[ $binary == "$iptables_bin" ]]; then
+      out=$out_chain
+      forward=$forward_chain
+    else
+      out=$out6_chain
+      forward=$forward6_chain
+    fi
+    for base in OUTPUT FORWARD; do
+      chain=$out
+      [[ $base != FORWARD ]] || chain=$forward
+      if diene_policy_hook_present "$binary" "$base" "$chain"; then
+        "$binary" -w 5 -D "$base" -j "$chain" || failed=1
+      fi
+    done
+    for chain in "$out" "$forward"; do
+      if "$binary" -w 5 -S "$chain" >/dev/null 2>&1; then
+        "$binary" -w 5 -F "$chain" || failed=1
+        "$binary" -w 5 -X "$chain" || failed=1
+      fi
+    done
+  done
+  if [[ $remove_l7 == true ]]; then
+    "${DIENE_EGRESS_L7_ENFORCER_BIN:?}" remove --profile "$(diene_egress_profile "$DIENE_LANE")" \
+      --receipt "$(diene_receipt_id)" || failed=1
+  fi
+  for base in OUTPUT FORWARD; do
+    chain=$out_chain
+    [[ $base != FORWARD ]] || chain=$forward_chain
+    diene_policy_hook_present "$iptables_bin" "$base" "$chain" && failed=1
+  done
+  "$iptables_bin" -w 5 -S "$out_chain" >/dev/null 2>&1 && failed=1
+  "$iptables_bin" -w 5 -S "$forward_chain" >/dev/null 2>&1 && failed=1
+  if command -v "$ip6tables_bin" >/dev/null 2>&1; then
+    for base in OUTPUT FORWARD; do
+      chain=$out6_chain
+      [[ $base != FORWARD ]] || chain=$forward6_chain
+      diene_policy_hook_present "$ip6tables_bin" "$base" "$chain" && failed=1
+    done
+    "$ip6tables_bin" -w 5 -S "$out6_chain" >/dev/null 2>&1 && failed=1
+    "$ip6tables_bin" -w 5 -S "$forward6_chain" >/dev/null 2>&1 && failed=1
+  fi
+  ((failed == 0))
+}
+
 diene_apply_interim_policy() {
   local resolved=${1:?resolved egress contract required}
   local transcript=${2:?policy transcript required}
   local l7_evidence=${3:?L7 evidence path required}
   diene_require_trusted_runtime_context
   diene_require_safe_id cluster_id "${DIENE_NSC_CLUSTER_ID:-}"
-  diene_require_command ip
   diene_require_command jq
   diene_require_command "${DIENE_KUBECTL_BIN:-kubectl}"
   local iptables_bin=${DIENE_IPTABLES_BIN:-/sbin/iptables}
@@ -907,127 +969,132 @@ diene_apply_interim_policy() {
     $ssh_client_port =~ ^[1-9][0-9]{0,4}$ && $ssh_server_port =~ ^[1-9][0-9]{0,4}$ ]] ||
     diene_die InterimPolicyUnavailable 'the active orchestration SSH 4-tuple is unavailable or non-IPv4'
 
-  if ! "$iptables_bin" -w 5 -N "$out_chain" || ! "$iptables_bin" -w 5 -N "$forward_chain"; then
-    diene_die InterimPolicyUnavailable 'could not create receipt-scoped IPv4 OUTPUT/FORWARD chains'
-  fi
-  "$iptables_bin" -w 5 -A "$out_chain" -d 169.254.169.254/32 -j REJECT
-  "$iptables_bin" -w 5 -A "$out_chain" -p tcp -s "$ssh_server" -d "$ssh_client" \
-    --sport "$ssh_server_port" --dport "$ssh_client_port" -m conntrack --ctstate ESTABLISHED -j ACCEPT
-  "$iptables_bin" -w 5 -A "$out_chain" -o lo -j ACCEPT
-
-  local route
-  while IFS= read -r route; do
-    [[ -n $route && $route != default && $route != *:* ]] || continue
-    "$iptables_bin" -w 5 -A "$out_chain" -d "$route" -j ACCEPT
-    "$iptables_bin" -w 5 -A "$forward_chain" -s "$pod_cidr" -d "$route" -j ACCEPT
-  done < <(ip -o -4 route show | awk '$1 != "default" {print $1}' | sort -u)
-  for route in "$pod_cidr" "$service_cidr"; do
-    "$iptables_bin" -w 5 -A "$out_chain" -d "$route" -j ACCEPT
-    "$iptables_bin" -w 5 -A "$forward_chain" -s "$pod_cidr" -d "$route" -j ACCEPT
-  done
-  "$iptables_bin" -w 5 -A "$forward_chain" -s "$pod_cidr" -d 169.254.169.254/32 -j REJECT
-
-  local entry address port
-  while IFS= read -r entry; do
-    port=$(jq -r '.port' <<<"$entry")
-    while IFS= read -r address; do
-      [[ -n $address ]] || continue
-      "$iptables_bin" -w 5 -A "$out_chain" -p tcp -d "$address" --dport "$port" -j ACCEPT
-      "$iptables_bin" -w 5 -A "$forward_chain" -s "$pod_cidr" -p tcp -d "$address" --dport "$port" -j ACCEPT
-    done < <(jq -r '.addresses.ipv4[]' <<<"$entry")
-  done < <(jq -c '.resolvedEntries[]' "$resolved")
-  "$iptables_bin" -w 5 -A "$out_chain" -j REJECT
-  "$iptables_bin" -w 5 -A "$forward_chain" -s "$pod_cidr" -j REJECT
-  "$iptables_bin" -w 5 -A "$forward_chain" -j RETURN
-  if ! "$iptables_bin" -w 5 -I OUTPUT 1 -j "$out_chain" ||
-    ! "$iptables_bin" -w 5 -I FORWARD 1 -j "$forward_chain"; then
-    diene_die InterimPolicyUnavailable 'could not hook receipt-scoped IPv4 OUTPUT/FORWARD chains'
-  fi
-
-  local ipv6_armed=false ipv6_disabled=0
+  local ipv6_disabled=0 policy_mode l7_attempted=$l7_evidence.attempted transaction_rc=0
   [[ ! -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] || read -r ipv6_disabled </proc/sys/net/ipv6/conf/all/disable_ipv6
-  if [[ $ipv6_disabled != 1 ]]; then
-    diene_require_command "$ip6tables_bin"
-    "$ip6tables_bin" --version | grep -Fq nf_tables ||
-      diene_die InterimPolicyUnavailable 'ip6tables is not using the measured nf_tables backend'
-    if ! "$ip6tables_bin" -w 5 -N "$out6_chain" || ! "$ip6tables_bin" -w 5 -N "$forward6_chain"; then
-      diene_die InterimPolicyUnavailable 'could not create receipt-scoped IPv6 OUTPUT/FORWARD chains'
-    fi
-    "$ip6tables_bin" -w 5 -A "$out6_chain" -o lo -j ACCEPT
-    while IFS= read -r route; do
-      [[ -n $route && $route != default ]] || continue
-      "$ip6tables_bin" -w 5 -A "$out6_chain" -d "$route" -j ACCEPT
-    done < <(ip -o -6 route show | awk '$1 != "default" {print $1}' | sort -u)
+  policy_mode=$(diene_policy_mode "$DIENE_LANE")
+  rm -f -- "$l7_attempted"
+  (
+    diene_policy_exec "$iptables_bin" -w 5 -N "$out_chain"
+    diene_policy_exec "$iptables_bin" -w 5 -N "$forward_chain"
+    diene_policy_exec "$iptables_bin" -w 5 -A "$out_chain" -d 169.254.169.254/32 -j REJECT
+    diene_policy_exec "$iptables_bin" -w 5 -A "$out_chain" -p tcp -s "$ssh_server" -d "$ssh_client" \
+      --sport "$ssh_server_port" --dport "$ssh_client_port" -m conntrack --ctstate ESTABLISHED -j ACCEPT
+    diene_policy_exec "$iptables_bin" -w 5 -A "$out_chain" -o lo -j ACCEPT
+
+    local internal entry address port pod6_cidr
+    for internal in "$pod_cidr" "$service_cidr"; do
+      diene_policy_exec "$iptables_bin" -w 5 -A "$out_chain" -d "$internal" -j ACCEPT
+      diene_policy_exec "$iptables_bin" -w 5 -A "$forward_chain" -s "$pod_cidr" -d "$internal" -j ACCEPT
+    done
+    diene_policy_exec "$iptables_bin" -w 5 -A "$forward_chain" -s "$pod_cidr" \
+      -d 169.254.169.254/32 -j REJECT
     while IFS= read -r entry; do
       port=$(jq -r '.port' <<<"$entry")
       while IFS= read -r address; do
         [[ -n $address ]] || continue
-        "$ip6tables_bin" -w 5 -A "$out6_chain" -p tcp -d "$address" --dport "$port" -j ACCEPT
-        while IFS= read -r pod6_cidr; do
-          [[ -n $pod6_cidr ]] || continue
-          "$ip6tables_bin" -w 5 -A "$forward6_chain" -s "$pod6_cidr" \
-            -p tcp -d "$address" --dport "$port" -j ACCEPT
-        done < <(jq -r '.[]' <<<"$pod6_cidrs")
-      done < <(jq -r '.addresses.ipv6[]' <<<"$entry")
+        diene_policy_exec "$iptables_bin" -w 5 -A "$out_chain" -p tcp -d "$address" --dport "$port" -j ACCEPT
+        diene_policy_exec "$iptables_bin" -w 5 -A "$forward_chain" -s "$pod_cidr" \
+          -p tcp -d "$address" --dport "$port" -j ACCEPT
+      done < <(jq -r '.addresses.ipv4[]' <<<"$entry")
     done < <(jq -c '.resolvedEntries[]' "$resolved")
-    "$ip6tables_bin" -w 5 -A "$out6_chain" -j REJECT
-    local pod6_cidr
-    while IFS= read -r pod6_cidr; do
-      [[ -n $pod6_cidr ]] || continue
-      while IFS= read -r route; do
-        [[ -n $route && $route != default ]] || continue
-        "$ip6tables_bin" -w 5 -A "$forward6_chain" -s "$pod6_cidr" -d "$route" -j ACCEPT
-      done < <(ip -o -6 route show | awk '$1 != "default" {print $1}' | sort -u)
-      "$ip6tables_bin" -w 5 -A "$forward6_chain" -s "$pod6_cidr" -j REJECT
-    done < <(jq -r '.[]' <<<"$pod6_cidrs")
-    # No observed IPv6 pod CIDR means no IPv6 pod traffic is claimed. Return
-    # unrelated forwarded traffic instead of installing a host-wide reject.
-    "$ip6tables_bin" -w 5 -A "$forward6_chain" -j RETURN
-    if ! "$ip6tables_bin" -w 5 -I OUTPUT 1 -j "$out6_chain" ||
-      ! "$ip6tables_bin" -w 5 -I FORWARD 1 -j "$forward6_chain"; then
-      diene_die InterimPolicyUnavailable 'could not hook receipt-scoped IPv6 OUTPUT/FORWARD chains'
+    diene_policy_exec "$iptables_bin" -w 5 -A "$out_chain" -j REJECT
+    diene_policy_exec "$iptables_bin" -w 5 -A "$forward_chain" -s "$pod_cidr" -j REJECT
+    diene_policy_exec "$iptables_bin" -w 5 -A "$forward_chain" -j RETURN
+    diene_policy_exec "$iptables_bin" -w 5 -I OUTPUT 1 -j "$out_chain"
+    diene_policy_exec "$iptables_bin" -w 5 -I FORWARD 1 -j "$forward_chain"
+
+    local ipv6_armed=false
+    if [[ $ipv6_disabled != 1 ]]; then
+      diene_require_command "$ip6tables_bin"
+      "$ip6tables_bin" --version | grep -Fq nf_tables ||
+        diene_die InterimPolicyUnavailable 'ip6tables is not using the measured nf_tables backend'
+      diene_policy_exec "$ip6tables_bin" -w 5 -N "$out6_chain"
+      diene_policy_exec "$ip6tables_bin" -w 5 -N "$forward6_chain"
+      diene_policy_exec "$ip6tables_bin" -w 5 -A "$out6_chain" -o lo -j ACCEPT
+      while IFS= read -r pod6_cidr; do
+        [[ -n $pod6_cidr ]] || continue
+        diene_policy_exec "$ip6tables_bin" -w 5 -A "$out6_chain" -d "$pod6_cidr" -j ACCEPT
+        diene_policy_exec "$ip6tables_bin" -w 5 -A "$forward6_chain" -s "$pod6_cidr" -d "$pod6_cidr" -j ACCEPT
+      done < <(jq -r '.[]' <<<"$pod6_cidrs")
+      while IFS= read -r entry; do
+        port=$(jq -r '.port' <<<"$entry")
+        while IFS= read -r address; do
+          [[ -n $address ]] || continue
+          diene_policy_exec "$ip6tables_bin" -w 5 -A "$out6_chain" -p tcp -d "$address" --dport "$port" -j ACCEPT
+          while IFS= read -r pod6_cidr; do
+            [[ -n $pod6_cidr ]] || continue
+            diene_policy_exec "$ip6tables_bin" -w 5 -A "$forward6_chain" -s "$pod6_cidr" \
+              -p tcp -d "$address" --dport "$port" -j ACCEPT
+          done < <(jq -r '.[]' <<<"$pod6_cidrs")
+        done < <(jq -r '.addresses.ipv6[]' <<<"$entry")
+      done < <(jq -c '.resolvedEntries[]' "$resolved")
+      diene_policy_exec "$ip6tables_bin" -w 5 -A "$out6_chain" -j REJECT
+      while IFS= read -r pod6_cidr; do
+        [[ -n $pod6_cidr ]] || continue
+        diene_policy_exec "$ip6tables_bin" -w 5 -A "$forward6_chain" -s "$pod6_cidr" -j REJECT
+      done < <(jq -r '.[]' <<<"$pod6_cidrs")
+      diene_policy_exec "$ip6tables_bin" -w 5 -A "$forward6_chain" -j RETURN
+      diene_policy_exec "$ip6tables_bin" -w 5 -I OUTPUT 1 -j "$out6_chain"
+      diene_policy_exec "$ip6tables_bin" -w 5 -I FORWARD 1 -j "$forward6_chain"
+      ipv6_armed=true
     fi
-    ipv6_armed=true
-  fi
 
-  diene_l7_enforcer_apply "$resolved" "$l7_evidence"
-  local rules_file
-  rules_file=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-iptables.XXXXXX")
-  {
-    "$iptables_bin" -w 5 -S "$out_chain"
-    "$iptables_bin" -w 5 -S "$forward_chain"
-    [[ $ipv6_armed != true ]] || "$ip6tables_bin" -w 5 -S "$out6_chain"
-    [[ $ipv6_armed != true ]] || "$ip6tables_bin" -w 5 -S "$forward6_chain"
-  } >"$rules_file"
-  # A broad ESTABLISHED/RELATED exemption would grandfather every hostile
-  # socket opened during checkout/setup. The only stateful accept is the
-  # exact observed SSH 4-tuple above.
-  if grep -F -- '--ctstate ESTABLISHED,RELATED' "$rules_file" >/dev/null; then
+    [[ $policy_mode != allowlist ]] || : >"$l7_attempted"
+    diene_l7_enforcer_apply "$resolved" "$l7_evidence"
+    local rules_file rules_digest
+    rules_file=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-iptables.XXXXXX") ||
+      diene_die InterimPolicyUnavailable 'could not allocate rules transcript'
+    {
+      diene_policy_exec "$iptables_bin" -w 5 -S "$out_chain"
+      diene_policy_exec "$iptables_bin" -w 5 -S "$forward_chain"
+      [[ $ipv6_armed != true ]] || diene_policy_exec "$ip6tables_bin" -w 5 -S "$out6_chain"
+      [[ $ipv6_armed != true ]] || diene_policy_exec "$ip6tables_bin" -w 5 -S "$forward6_chain"
+    } >"$rules_file" || diene_die InterimPolicyUnavailable 'could not capture the exact ruleset'
+    if grep -F -- '--ctstate ESTABLISHED,RELATED' "$rules_file" >/dev/null; then
+      rm -f -- "$rules_file"
+      diene_die InterimPolicyUnavailable 'ruleset contains a blanket established-flow exemption'
+    fi
+    rules_digest=$(diene_file_digest "$rules_file") ||
+      diene_die InterimPolicyUnavailable 'rules transcript digest failed'
     rm -f -- "$rules_file"
-    diene_die InterimPolicyUnavailable 'ruleset contains a blanket established-flow exemption'
+    jq -n --arg outputChain "$out_chain" --arg forwardChain "$forward_chain" \
+      --arg output6Chain "$out6_chain" --arg forward6Chain "$forward6_chain" \
+      --arg mode "$policy_mode" --arg profile "$(diene_egress_profile "$DIENE_LANE")" \
+      --arg clusterId "$DIENE_NSC_CLUSTER_ID" --arg podCidr "$pod_cidr" \
+      --arg serviceCidr "$service_cidr" --arg rulesDigest "$rules_digest" \
+      --argjson ipv6Armed "$ipv6_armed" --argjson pod6Cidrs "$pod6_cidrs" '
+        {mechanism:"interim-in-guest-iptables-nft",backend:"nf_tables",
+         platformStatus:"platform per-instance policy pending (support ask #4)",
+         trustBoundary:"trusted-generated-content",outputChain:$outputChain,forwardChain:$forwardChain,
+         output6Chain:$output6Chain,forward6Chain:$forward6Chain,ipv6Armed:$ipv6Armed,
+         mode:$mode,profileId:$profile,clusterId:$clusterId,podCidr:$podCidr,pod6Cidrs:$pod6Cidrs,
+         serviceCidr:$serviceCidr,rulesDigest:$rulesDigest,applied:true,
+         orchestrationException:"exact-ssh-4-tuple"}' | diene_write_json "$transcript" ||
+      diene_die InterimPolicyUnavailable 'policy transcript finalization failed'
+  ) || transaction_rc=$?
+  if ((transaction_rc != 0)); then
+    local remove_l7=false
+    [[ ! -e $l7_attempted ]] || remove_l7=true
+    diene_remove_policy_artifacts "$iptables_bin" "$ip6tables_bin" "$out_chain" "$forward_chain" \
+      "$out6_chain" "$forward6_chain" "$remove_l7" ||
+      diene_die InterimPolicyRollbackFailed 'partial policy installation could not prove complete rollback'
+    rm -f -- "$l7_attempted"
+    diene_die InterimPolicyUnavailable 'partial policy installation was completely rolled back'
   fi
-  local rules_digest
-  rules_digest=$(diene_file_digest "$rules_file")
-  rm -f -- "$rules_file"
 
-  jq -n --arg outputChain "$out_chain" --arg forwardChain "$forward_chain" \
-    --arg output6Chain "$out6_chain" --arg forward6Chain "$forward6_chain" \
-    --arg mode "$(diene_policy_mode "$DIENE_LANE")" \
-    --arg profile "$(diene_egress_profile "$DIENE_LANE")" --arg clusterId "$DIENE_NSC_CLUSTER_ID" \
-    --arg podCidr "$pod_cidr" --arg serviceCidr "$service_cidr" --arg rulesDigest "$rules_digest" \
-    --argjson ipv6Armed "$ipv6_armed" --argjson pod6Cidrs "$pod6_cidrs" '
-      {mechanism:"interim-in-guest-iptables-nft",backend:"nf_tables",
-       platformStatus:"platform per-instance policy pending (support ask #4)",
-       trustBoundary:"trusted-generated-content",outputChain:$outputChain,forwardChain:$forwardChain,
-       output6Chain:$output6Chain,forward6Chain:$forward6Chain,ipv6Armed:$ipv6Armed,
-       mode:$mode,profileId:$profile,clusterId:$clusterId,podCidr:$podCidr,pod6Cidrs:$pod6Cidrs,
-       serviceCidr:$serviceCidr,rulesDigest:$rulesDigest,applied:true,
-       orchestrationException:"exact-ssh-4-tuple"}' | diene_write_json "$transcript"
+  local ipv6_armed=false
+  [[ $ipv6_disabled == 1 ]] || ipv6_armed=true
   DIENE_INTERIM_POLICY_OUTPUT_CHAIN=$out_chain
   DIENE_INTERIM_POLICY_FORWARD_CHAIN=$forward_chain
   DIENE_INTERIM_POLICY_OUTPUT6_CHAIN=$out6_chain
   DIENE_INTERIM_POLICY_FORWARD6_CHAIN=$forward6_chain
   DIENE_INTERIM_POLICY_IPV6_ARMED=$ipv6_armed
+  if [[ $policy_mode == allowlist ]]; then
+    DIENE_L7_EGRESS_ARMED=true
+    DIENE_L7_EGRESS_EVIDENCE=$l7_evidence
+    export DIENE_L7_EGRESS_ARMED DIENE_L7_EGRESS_EVIDENCE
+  fi
+  rm -f -- "$l7_attempted"
   export DIENE_INTERIM_POLICY_OUTPUT_CHAIN DIENE_INTERIM_POLICY_FORWARD_CHAIN \
     DIENE_INTERIM_POLICY_OUTPUT6_CHAIN DIENE_INTERIM_POLICY_FORWARD6_CHAIN \
     DIENE_INTERIM_POLICY_IPV6_ARMED
@@ -1035,37 +1102,17 @@ diene_apply_interim_policy() {
 
 diene_remove_interim_policy() {
   [[ -n ${DIENE_INTERIM_POLICY_OUTPUT_CHAIN:-} ]] || return 0
-  local iptables_bin=${DIENE_IPTABLES_BIN:-/sbin/iptables}
-  local ip6tables_bin=${DIENE_IP6TABLES_BIN:-/sbin/ip6tables}
-  local failed=0
-  "$iptables_bin" -w 5 -D OUTPUT -j "$DIENE_INTERIM_POLICY_OUTPUT_CHAIN" || failed=1
-  "$iptables_bin" -w 5 -D FORWARD -j "$DIENE_INTERIM_POLICY_FORWARD_CHAIN" || failed=1
-  "$iptables_bin" -w 5 -F "$DIENE_INTERIM_POLICY_OUTPUT_CHAIN" || failed=1
-  "$iptables_bin" -w 5 -F "$DIENE_INTERIM_POLICY_FORWARD_CHAIN" || failed=1
-  "$iptables_bin" -w 5 -X "$DIENE_INTERIM_POLICY_OUTPUT_CHAIN" || failed=1
-  "$iptables_bin" -w 5 -X "$DIENE_INTERIM_POLICY_FORWARD_CHAIN" || failed=1
-  if [[ ${DIENE_INTERIM_POLICY_IPV6_ARMED:-false} == true ]]; then
-    "$ip6tables_bin" -w 5 -D OUTPUT -j "$DIENE_INTERIM_POLICY_OUTPUT6_CHAIN" || failed=1
-    "$ip6tables_bin" -w 5 -D FORWARD -j "$DIENE_INTERIM_POLICY_FORWARD6_CHAIN" || failed=1
-    "$ip6tables_bin" -w 5 -F "$DIENE_INTERIM_POLICY_OUTPUT6_CHAIN" || failed=1
-    "$ip6tables_bin" -w 5 -F "$DIENE_INTERIM_POLICY_FORWARD6_CHAIN" || failed=1
-    "$ip6tables_bin" -w 5 -X "$DIENE_INTERIM_POLICY_OUTPUT6_CHAIN" || failed=1
-    "$ip6tables_bin" -w 5 -X "$DIENE_INTERIM_POLICY_FORWARD6_CHAIN" || failed=1
-    "$ip6tables_bin" -w 5 -S OUTPUT | grep -Fq -- "-j $DIENE_INTERIM_POLICY_OUTPUT6_CHAIN" && failed=1
-    "$ip6tables_bin" -w 5 -S FORWARD | grep -Fq -- "-j $DIENE_INTERIM_POLICY_FORWARD6_CHAIN" && failed=1
-    "$ip6tables_bin" -w 5 -S "$DIENE_INTERIM_POLICY_OUTPUT6_CHAIN" >/dev/null 2>&1 && failed=1
-    "$ip6tables_bin" -w 5 -S "$DIENE_INTERIM_POLICY_FORWARD6_CHAIN" >/dev/null 2>&1 && failed=1
-  fi
-  if [[ ${DIENE_L7_EGRESS_ARMED:-false} == true ]]; then
-    "$DIENE_EGRESS_L7_ENFORCER_BIN" remove --profile "$(diene_egress_profile "$DIENE_LANE")" \
-      --receipt "$(diene_receipt_id)" || failed=1
-    [[ -n ${DIENE_L7_EGRESS_EVIDENCE:-} ]] || failed=1
-  fi
-  "$iptables_bin" -w 5 -S OUTPUT | grep -Fq -- "-j $DIENE_INTERIM_POLICY_OUTPUT_CHAIN" && failed=1
-  "$iptables_bin" -w 5 -S FORWARD | grep -Fq -- "-j $DIENE_INTERIM_POLICY_FORWARD_CHAIN" && failed=1
-  "$iptables_bin" -w 5 -S "$DIENE_INTERIM_POLICY_OUTPUT_CHAIN" >/dev/null 2>&1 && failed=1
-  "$iptables_bin" -w 5 -S "$DIENE_INTERIM_POLICY_FORWARD_CHAIN" >/dev/null 2>&1 && failed=1
-  ((failed == 0))
+  local remove_l7=false
+  [[ ${DIENE_L7_EGRESS_ARMED:-false} != true ]] || remove_l7=true
+  diene_remove_policy_artifacts "${DIENE_IPTABLES_BIN:-/sbin/iptables}" \
+    "${DIENE_IP6TABLES_BIN:-/sbin/ip6tables}" "$DIENE_INTERIM_POLICY_OUTPUT_CHAIN" \
+    "$DIENE_INTERIM_POLICY_FORWARD_CHAIN" "$DIENE_INTERIM_POLICY_OUTPUT6_CHAIN" \
+    "$DIENE_INTERIM_POLICY_FORWARD6_CHAIN" "$remove_l7" || return 1
+  unset DIENE_INTERIM_POLICY_OUTPUT_CHAIN DIENE_INTERIM_POLICY_FORWARD_CHAIN
+  unset DIENE_INTERIM_POLICY_OUTPUT6_CHAIN DIENE_INTERIM_POLICY_FORWARD6_CHAIN
+  DIENE_INTERIM_POLICY_IPV6_ARMED=false
+  DIENE_L7_EGRESS_ARMED=false
+  export DIENE_INTERIM_POLICY_IPV6_ARMED DIENE_L7_EGRESS_ARMED
 }
 
 diene_verify_hostile_egress() {
