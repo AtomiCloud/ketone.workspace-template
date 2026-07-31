@@ -409,6 +409,69 @@ diene_host_policy_bin() {
   printf '%s\n' "${DIENE_HOST_POLICY_BIN:-/opt/diene/bin/diene-host-policy}"
 }
 
+# Applying the policy from inside the lane is necessary but not sufficient.
+# Three properties decide whether the posture is a boundary at all, and none of
+# them is observable from here — so each must be attested by the root-owned
+# runner in the isolation receipt, and a missing attestation refuses.
+#
+#   armedBeforeJob            enforcement was established by the root-owned
+#                             lifecycle BEFORE any lane process ran. Checkout,
+#                             setup and artifact download all precede this
+#                             script, so a flow opened in those steps would
+#                             otherwise outlive the policy.
+#   establishedFlowExemption  a blanket `ct state established,related accept`
+#                             admits any pre-opened flow for the table's
+#                             lifetime, which defeats lifetime denial. It must
+#                             be false; an exact control channel is not the
+#                             same thing as a blanket exemption.
+#   inputPathCovered          a forward-only chain does not see packets the job
+#                             addresses to the host veth or gateway, which are
+#                             delivered locally through `input`. A host-local
+#                             listener would sit outside both the allow entries
+#                             and the final drop.
+diene_require_enforcement_attestations() {
+  local isolation=${DIENE_ISOLATION_FILE:-}
+  [[ -n $isolation && -r $isolation ]] ||
+    diene_die HostEnforcementIncomplete \
+      'no isolation receipt; the enforcement posture cannot be attested'
+  jq -e '.enforcement.armedBeforeJob == true' "$isolation" >/dev/null ||
+    diene_die HostEnforcementIncomplete \
+      'the runner does not attest that enforcement was armed before the job began; a flow opened during checkout or setup would outlive the policy'
+  jq -e '.enforcement.establishedFlowExemption == false' "$isolation" >/dev/null ||
+    diene_die HostEnforcementIncomplete \
+      'the enforcement admits established/related flows wholesale; a blanket exemption is not an exact control channel and defeats lifetime denial'
+  jq -e '.enforcement.inputPathCovered == true' "$isolation" >/dev/null ||
+    diene_die HostEnforcementIncomplete \
+      'the runner does not attest a lease-scoped host input chain; a forward-only drop does not cover locally delivered packets'
+}
+
+# Evidence must be published, but for a hermetic lane the enforcing table
+# denies exactly the connections an in-job upload needs, and `release` is
+# deferred by contract so the table is still standing. Publication therefore
+# belongs to a root-owned post-runtime channel that validates and forwards the
+# staged evidence. Until the runner attests one, the lane refuses rather than
+# reporting an evidence readiness it cannot achieve on a real runner.
+diene_require_evidence_publication() {
+  local isolation=${DIENE_ISOLATION_FILE:-}
+  [[ -n $isolation && -r $isolation ]] ||
+    diene_die EvidencePublicationInterfaceUnavailable \
+      'no isolation receipt; the evidence publication channel cannot be established'
+  local channel
+  channel=$(jq -er '.evidencePublication.stagingDir | select(startswith("/"))' "$isolation") ||
+    diene_die EvidencePublicationInterfaceUnavailable \
+      'the runner attests no root-owned evidence publication channel; under a hermetic posture an in-job upload cannot open the connections it needs, and release is deferred by contract'
+  # The ratified sequencing is: stage evidence, prove runtime absence, release,
+  # then upload through a channel the job can never call. A job-callable upload
+  # or release would let checkout code run it early, before absence is proven.
+  jq -e '.evidencePublication.jobCallable == false' "$isolation" >/dev/null ||
+    diene_die EvidencePublicationInterfaceUnavailable \
+      'the evidence publication channel is job-callable; checkout code could invoke it before runtime absence is proven'
+  jq -e '.evidencePublication.releasesAfterAbsenceProof == true' "$isolation" >/dev/null ||
+    diene_die EvidencePublicationInterfaceUnavailable \
+      'the runner does not attest that release follows a proven runtime absence; releasing first would drop enforcement while the runtime may still be live'
+  printf '%s\n' "$channel"
+}
+
 diene_require_host_broker() {
   local bin
   bin=$(diene_host_policy_bin)

@@ -264,6 +264,13 @@ emit_report() {
 
   local report=${DIENE_CORE_REPORT:-$RUNNER_TEMP/diene-environment-report.v1.json}
   "$script_dir/environment-report.sh" --kind core --input "$raw" --output "$report"
+
+  # Hand the scanned report to the root-owned publication channel. The lane
+  # cannot upload it itself: the enforcing table is still standing, denies the
+  # connections an upload needs, and `release` is deferred by contract.
+  if [[ -n ${evidence_staging_dir:-} && -d ${evidence_staging_dir:-} ]]; then
+    install -m 0600 "$report" "$evidence_staging_dir/$(basename "$report")"
+  fi
 }
 
 finalize() {
@@ -330,9 +337,14 @@ if [[ $DIENE_LANE == absol ]]; then
   closure_verifier=$(diene_require_closure_verifier)
 fi
 diene_require_host_broker
-# The lease must authorize exactly the posture this lane requires, before any
+# The lease must authorize exactly the posture this lane requires, and the
+# runner must attest that the enforcement is actually a boundary, before any
 # document is generated or any mutation is attempted.
 diene_authorized_policy_mode "$policy_mode" >/dev/null
+diene_require_enforcement_attestations
+# Evidence has to be publishable before the lane is worth running: under a
+# hermetic posture an in-job upload cannot open the connections it needs.
+evidence_staging_dir=$(diene_require_evidence_publication)
 
 case $DIENE_LANE in
   absol)
