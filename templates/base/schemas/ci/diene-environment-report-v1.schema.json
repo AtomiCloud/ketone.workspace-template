@@ -167,7 +167,15 @@
             "properties": {
               "validated": { "const": true },
               "resumedLegs": { "const": 0 },
-              "finalCleanPass": { "const": true }
+              "finalCleanPass": { "const": true },
+              "checkpoints": {
+                "items": {
+                  "properties": {
+                    "outcome": { "const": "Pass" },
+                    "resumed": { "const": false }
+                  }
+                }
+              }
             }
           },
           "evidence": {

@@ -235,8 +235,17 @@ orchestrator_finalize_report() {
       "$(phase_digest lifecycle "${ORCH_FIRST_REASON:-NamespaceLifecycleFailed}" "$ORCH_CLUSTER_ID")" false
     diene_checkpoint_seal "$checkpoint" false
   else
-    if ! diene_checkpoint_validate "$checkpoint"; then
+    if ! (diene_checkpoint_validate "$checkpoint"); then
       orchestrator_fail "$DIENE_REASON_EXIT" CheckpointChainInvalid 'collected predecessor chain is invalid'
+    elif ! jq -e '
+      .validated == true and .resumedLegs == 0 and .finalCleanPass == true and
+      (.checkpoints | length) > 0 and
+      all(.checkpoints[]; .outcome == "Pass" and .resumed == false) and
+      .checkpoints[-1].id == "final-clean-pass" and
+      .checkpoints[-1].outcome == "Pass"
+    ' "$checkpoint" >/dev/null; then
+      orchestrator_fail "$DIENE_REASON_EXIT" FinalCleanPassRequired \
+        'collected evidence is not a final clean full pass with zero resumed or failed legs'
     fi
   fi
 
@@ -436,10 +445,12 @@ orchestrate() {
     git archive --format=tar --output="$ORCH_STATE/source.tar" "$GITHUB_SHA"
     chmod 0600 "$ORCH_STATE/source.tar"
   fi
-  tar -tf "$ORCH_STATE/source.tar" | grep -Fxq 'scripts/ci/environment-k3d-run.sh' ||
-    diene_die UntrustedSubject 'source archive does not carry the pinned driver'
-  tar -tf "$ORCH_STATE/source.tar" | grep -Fxq 'schemas/ci/diene-environment-report-v1.schema.json' ||
-    diene_die UntrustedSubject 'source archive does not carry the pinned report schemas'
+  # Materialize one complete listing. Piping the listing into an early-exit
+  # matcher is timing-sensitive under pipefail because the reader can close
+  # early and make tar report SIGPIPE/141 even when the member is present.
+  diene_require_archive_members "$ORCH_STATE/source.tar" \
+    scripts/ci/environment-k3d-run.sh \
+    schemas/ci/diene-environment-report-v1.schema.json
 
   local nsc_bin nsc_version source_digest subject_digest contract_digest create_started create_rc
   nsc_bin=$(diene_nsc_bin)
@@ -708,11 +719,16 @@ orchestrator_verify_lifecycle() {
       "platform per-instance policy pending (support ask #4)" and
     .checkpointChain.validated == true and .checkpointChain.finalCleanPass == true and
     .checkpointChain.resumedLegs == 0 and
+    all(.checkpointChain.checkpoints[]; .outcome == "Pass" and .resumed == false) and
     .checkpointChain.checkpoints[-1].id == "final-clean-pass"
   ' "$report" >/dev/null ||
     diene_die NamespaceLifecycleFailed 'terminal report is not a green exact-id lifecycle proof'
   diene_checkpoint_validate "$checkpoint"
-  jq -e '.validated == true and .finalCleanPass == true and .resumedLegs == 0' "$checkpoint" >/dev/null ||
+  jq -e '
+    .validated == true and .finalCleanPass == true and .resumedLegs == 0 and
+    all(.checkpoints[]; .outcome == "Pass" and .resumed == false) and
+    .checkpoints[-1].id == "final-clean-pass" and .checkpoints[-1].outcome == "Pass"
+  ' "$checkpoint" >/dev/null ||
     diene_die FinalCleanPassRequired 'terminal checkpoint chain is not a clean full pass'
   if [[ -f $extract/ci-receipt.json ]]; then
     diene_validate_receipt_owner "$extract/ci-receipt.json" "$cluster_id"
