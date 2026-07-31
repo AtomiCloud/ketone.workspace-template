@@ -18,7 +18,19 @@ let
       {
         inherit
           git
+          coreutils
+          curl
+          findutils
+          gawk
+          gnugrep
+          gnutar
           infisical
+          iproute2
+          iptables
+          jq
+          kubectl
+          netcat-openbsd
+          procps
           treefmt
           gitlint
           shellcheck
@@ -26,6 +38,7 @@ let
           go-task
           pre-commit
           check-jsonschema
+          yq-go
           ;
       }
     );

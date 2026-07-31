@@ -1,334 +1,274 @@
 # Environment CI
 
-The workspace template supplies permanent runner-local k3d lanes for the Diene
-environment contract. These lanes are not previews and never allocate ENTEI,
-vclusters, provider forks, public DNS, or public certificates.
+`environment-k3d` and `diene-ci-k3d/v1` are compatibility names. They do not
+select k3d. Every runtime invocation owns one anonymous, ephemeral Namespace
+instance and uses that instance's built-in, single-node k3s. The ordinary
+Actions runner only creates, transfers, invokes, collects, destroys, and proves
+absence.
 
-## Stable checks
+The runtime lanes are:
 
-`environment-profile-contract` runs without a cluster on every pull request
-and protected push. Runtime checks are:
+| Lane | Profile / build mode | Network contract | Report namespace |
+| --- | --- | --- | --- |
+| `ditto-build-local` | `ditto` / `build-local` | exact connected allowlist | core |
+| `ditto-target-pull` | `ditto` / `target-pull` | exact connected allowlist including the immutable registry | core |
+| `ditto-vendor` | `ditto` / `build-local` | the selected action's DNS/SNI/port/method declaration | vendor only |
+| `absol` | `absol` / `build-local` | hermetic denial | core |
+| `fleet-independence` | `ditto` / `build-local` | hermetic denial | core |
+
+Profile rendering remains runtime-free. Eevee and Castform are validated but
+not executed here. Namespace ingress, a generated hostname, and public DNS are
+never an application address or identity.
+
+## Stable workflow contract
+
+`.github/workflows/⚡reusable-environment-k3d.yaml` retains the
+`diene-ci-k3d/v1` call surface:
+
+- common immutable inputs are `lane`, numeric `repository_id`, canonical
+  `repository_key`, full `source_sha`, `garden_lock_digest`, and
+  `artifact_digest`;
+- core, Absol, and independence use only
+  `journey_manifest=.diene/ci/journeys.v1.yaml`;
+- vendor uses only `vendor_manifest=.diene/ci/vendors.v1.yaml` plus one
+  `action_id`;
+- target-pull additionally binds the producer's provenance reference and
+  attestation digest;
+- Absol additionally binds its closure digest, bundle reference, signature
+  bundle digest, and trust-root digest; and
+- outputs are `subject_digest`, opaque `receipt_id`, and exactly one of
+  `core_report_digest|vendor_report_digest`.
+
+The stable runtime job IDs are:
 
 - `environment-ditto-build-local`
 - `environment-ditto-target-pull`
-- `environment-ditto-vendor` (manual and separately approved only)
+- `environment-ditto-vendor`
 - `environment-absol`
 - `environment-fleet-independence`
-- controller-owned `environment-runner-lifecycle`
 
-Runtime success is insufficient by itself. Branch/release protection must also
-require `environment-runner-lifecycle`, which stays pending until the exact
-GitHub runner ID and DigitalOcean VM ID are absent. A failed or cancelled job
-never becomes green merely because cleanup later succeeds.
+`environment-profile-contract` remains the runtime-free gate.
+`environment-runner-lifecycle` is a workflow-owned terminal result. It is not
+a provider controller, runner lease, or GitHub App check. It has no Namespace
+credentials and accepts only the collected proof bound to the exact
+repository/source/run/attempt/lane/receipt/cluster tuple.
 
-## Repository declarations
+Top-level permissions are empty. The callers preserve their environment,
+permission, timeout, and `k3d-...` concurrency compatibility contracts. The
+runtime jobs use the primary
+`nscloud-ubuntu-26.04-amd64-16x32` Namespace orchestrator label. GitHub-hosted
+contract and lifecycle checks currently use the recorded `ubuntu-24.04`
+fallback because the `ubuntu-26.04` hosted label is unavailable in that venue.
+A fallback is evidence, never a silent label substitution.
 
-Participating repositories own only:
+## Protected admission before mutation
 
-```text
-.diene/ci/environment-lock.v1.json
-.diene/ci/journeys.v1.yaml
-.diene/ci/vendors.v1.yaml                 # optional
-.diene/ci/runner-pin.v1.json              # accepted controller + image pin
-.diene/ci/artifact-producer.sh            # the repository's own publisher
-.diene/ci/fixtures/<fixture-id>/manifest.yaml
-```
+Before `nsc create`, the caller and reusable workflow both prove:
 
-The `.yaml` contracts use the JSON-compatible YAML subset so the runner can
-validate them with the pinned `jq` already present in the image. Every one of
-them is validated against its real JSON Schema in `schemas/ci/` — with
-`check-jsonschema`, resolving cross-file `$ref`s from the local directory so
-validation stays offline — **before any `pls` invocation**. A shape check in
-`jq` is not schema validation and no longer stands in for one.
+- the repository owner is `AtomiCloud`;
+- `source_sha` is a full commit reachable from the protected default branch;
+- push/schedule refs are protected, dispatch actors have `write|admin`, and
+  Dependabot, pull requests, fork/head workflows, and substituted workflow
+  identities cannot enter the runtime path;
+- the same-run artifact subject binds the repository, workflow, source,
+  run/attempt, immutable digest, and mode-specific attestations;
+- lane selectors are neither missing nor crossed between core and vendor;
+- Absol's complete signed-closure tuple is present and well formed;
+- the production duration is exactly `2h`;
+- declared journey/vendor manifests and every present production fixture are
+  valid, Promotion/Freight objects are complete, duration spellings are
+  canonical, and the negative canary is inactive; and
+- no Namespace ingress/public endpoint, forbidden cache, seed, or vendor
+  capability is attached to a hermetic lane.
 
-Missing journey declarations disable the runtime caller without claiming
-coverage; a present invalid declaration is a blocking failure. A required
-missing pack is `Fail`; an optional missing pack is `Unavailable`; no
-declaration is `NotApplicable/NoDeclaration`. A fixture pack whose bytes drift
-from its declared `fixturePack.digest` is `FixturePackDigestMismatch`, not a
-silent execution.
+An absent journey declaration means explicit `NotApplicable/NoDeclaration`.
+Once a repository opts in, every other missing or invalid prerequisite is a
+refusal. It never silently removes a blocking runtime check.
 
-### The artifact subject is a same-run handoff
+The interim network path is restricted to trusted protected refs. If an
+untrusted context can reach it, the run refuses before `nsc create`; generated
+code and the enforcer are within the temporary trust boundary.
 
-`artifact-producer.sh` is the repository's own publisher. The `artifact-build`
-job runs it and validates that the record it emits binds **this** workflow ref,
-run ID and run attempt. A checked-in `artifact.v1.json` therefore cannot
-satisfy the handoff — it would go stale on the next commit — and a repository
-with no producer refuses `ArtifactProducerUnavailable`. CI never derives a
-digest from a source tree and never assembles a provenance string from run
-metadata: a source-tree hash is not an artifact, and a formatted string is not
-an attestation.
+## Exact Namespace lifecycle
 
-### Release boundary
+`scripts/ci/environment-k3d-run.sh` has separate authority modes:
 
-No workspace caller selects or queues a disposable self-hosted runner until the
-GitHub-hosted authorization path has accepted the controller/image pin, the
-`RunnerProvisionerReady` proof, and the producer. Those refusals happen in
-`authorize-runtime` and in the reusable workflow's `contract` job, both on
-`ubuntu-24.04`, so a missing prerequisite never costs a VM allocation.
+- `orchestrate` runs on the Actions runner and owns Namespace lifecycle;
+- `driver /run/diene-ci` runs as root on the Wolfi guest and owns Garden,
+  readiness, journeys, policy probes, and on-instance cleanup;
+- `cleanup` is called by an Actions `if: always()` step. It re-proves the
+  normal terminal state or recovers only an exact receipt-bound instance after
+  an interrupted primary step; and
+- `lifecycle <proof.tar>` performs unprivileged terminal proof validation.
 
-## Trust and subjects
+There is deliberately no seventh `environment-nsc-lifecycle.sh` entrypoint.
+The retained six scripts are the complete public script surface.
 
-The reusable workflow first validates selectors and immutable subjects on
-`ubuntu-24.04`; invalid calls never select a disposable runner.
-
-Its `workflow_call` surface is exactly the ratified `diene-ci-k3d/v1` set:
-`lane`, `repository_id`, `repository_key`, `source_sha`, `garden_lock_digest`,
-`artifact_digest`, `artifact_provenance_ref`, `artifact_attestation_digest`,
-`journey_manifest`, `vendor_manifest`, `action_id` and the four closure
-selectors. Nothing else is accepted, and a contract test asserts the input list
-has not drifted. In particular the image ref, the producer identity and the
-selected-package read identity are **not** inputs — they live inside the
-validated same-run subject document, so a caller cannot substitute a subject
-the producer never made — and the independence fixture is hard-coded rather
-than selected. The base workflow identity is derived inside the workflow from
-`github.workflow_ref` and `github.workflow_sha` and must equal the revision
-under test, so a substituted or stale workflow identity refuses.
-
-Runtime labels are the fixed four image labels plus one deterministic
-job label, and the runner lease must carry **that job's** label — a lease
-minted for a sibling lane of the same run is refused.
-
-The lease the job reads is the runner arm's job-visible projection:
-`/run/diene-runner-lease.v1.public.json`, exactly mode `0440`. The private
-lease is never job-readable, so any other mode refuses. The job identity holds
-`CAP_NET_ADMIN` and is explicitly denied `CAP_SYS_ADMIN`; the preflight proves
-both directions — `nft` must work, and `unshare --net` and `nsenter` must
-**fail**. Requiring `unshare` to succeed would demand `CAP_SYS_ADMIN` and
-contradict the isolation model, so a job that can create or enter a namespace
-is refused. Fork, Dependabot,
-unprotected, substituted, mutable, or stale tuples refuse before credentials,
-network policy, volume, or substrate mutation.
-
-Garden owns `diene-runtime/v1`. This node never writes that record: after
-`pls env up` it discovers the Garden-emitted file by the full immutable owner
-tuple (repository ID and key, allocation key, generation key, profile),
-validates it, and refuses `RuntimeEvidenceUnavailable` if there is no exact
-match.
-
-## Identity and isolation
-
-Each lane derives its own keys:
+The production sequence is:
 
 ```text
-allocationKey = r<repositoryId>-w<runId>-a<runAttempt>-l<lane>[-v<actionId>]
-generationKey = g<first 12 of sourceSha>
-receiptId     = <allocationKey>-<generationKey>
+validate protected trust, immutable subject, closure, declarations and fixtures
+  -> materialize the exact egress contract
+  -> nsc create --ephemeral --duration 2h --wait_kube_system
+       --cidfile <file> --output_json_to <file> --output json
+  -> require cidfile == create metadata .cluster_id
+  -> bind that exact cluster_id to the run/attempt receipt
+  -> nsc instance upload <id> <local> <remote> --mkdir
+  -> nsc ssh <id> -T <fixed-command>
+  -> run the copied driver against built-in k3s
+  -> nsc instance download <id> <remote> <local> --mkdir
+  -> verify digest and safely extract the fixed proof archive
+  -> nsc destroy --force <exact-id>
+  -> nsc list --all -o json and prove that exact .cluster_id is absent
+  -> leakage-scan, schema-validate, and seal the terminal proof
 ```
 
-Parallel lanes of one workflow run therefore never share a receipt, a runtime
-directory, or a cleanup selector. Each runtime job additionally carries its own
-run-scoped concurrency group
-(`k3d-<repositoryId>-<runId>-<runAttempt>-<lane>`, plus `-<actionId>` for the
-vendor lane) with `cancel-in-progress: false`, so unrelated runs are never
-serialised against each other.
+`nsc list` returning JSON `null` is normalized to `[]`. A successful destroy
+exit code without a positive exact-ID absence query is red. Prefix, name,
+profile, repository-wide, and label-wide destructive selection is forbidden.
+The two-hour TTL is a backstop, not successful cleanup.
 
-## Trigger matrix
+The primary EXIT/TERM/INT trap preserves the first failure while attempting
+collection, exact destroy, and absence. The later `cleanup` step may close an
+exact survivor debt but always returns red for that run; late success cannot
+rewrite failure green. A hard runner loss can still bypass Actions cleanup,
+which is why any post-TTL survivor is an incident and a fresh run is required.
 
-| Lane | Events |
-| --- | --- |
-| `environment-ditto-build-local` | protected push, authorized dispatch |
-| `environment-ditto-target-pull` | protected push, authorized dispatch |
-| `environment-absol` | protected push, or dispatch with `release_candidate` |
-| `environment-fleet-independence` | protected push, weekly schedule |
-| `environment-ditto-vendor` | explicit dispatch only |
+Only immutable files cross into `/run/diene-ci`, which is mode `0700`:
+source archive, driver inputs, artifact subject, egress contract, and the safe
+receipt projection. No `NSC_TOKEN`, GitHub token, SSH agent, destroy authority,
+vendor credential, kubeconfig body, or other capability is copied. Presence of
+an `nsc` executable in a shared Nix shell is not authority; the guest never
+invokes it.
 
-The weekly schedule reaches fleet independence and nothing else.
+## Guest posture and endpoint law
 
-## Lane semantics
+Preflight must prove all of the following before application mutation:
 
-- Ditto build-local and target-pull select the same vendor-free journeys and
-  both run under the `allowlist` posture: DNS and the default route are denied,
-  so an unlisted system is unreachable by literal IP and by alternate DNS
-  alike. Target-pull additionally requires `ArtifactPullReady` to be a
-  required, passing leaf and a read identity distinct from the publisher.
-- Vendor actions come only from `.diene/ci/vendors.v1.yaml`, currently only
-  the ratified K9 demo exception. They use `ci-ditto-vendor`, an exact declared
-  egress allowlist, a separate report namespace, and provider absence. The
-  `DIENE_VENDOR_CREDENTIAL` secret is scoped to the single execution step — not
-  to the job — so checkout and the post-job sweep never see it.
-- Absol establishes denial through the ratified
-  `pls closure preflight --denied-network` before any Docker volume or k3d
-  cluster exists, imports with `pls closure import`, and never releases denial:
-  it stays active through teardown.
-- Fleet independence is exactly Ditto/build-local with the hard-coded
-  `bootstrap-fleet-independence-v1` fixture, in the `ci-ditto` environment.
-  Environment secrets are only injected where a workflow references them, and
-  this lane references none, so it holds no seed-fetch identity.
+- UID 0 on Wolfi;
+- iptables 1.8.x on the `nf_tables` backend (the standalone `nft` program is
+  not required);
+- admitted k3s `v1.33.1+k3s1`, one Ready node, observed pod CIDR, admitted
+  `10.143.0.0/16` service CIDR, and recorded CPU/memory capacity;
+- exactly one default StorageClass named `local-path`; and
+- no Ingress, Gateway, LoadBalancer Service, external IP, wildcard/LAN/public
+  bind, or Namespace-generated application endpoint.
 
-## Readiness
+Garden continues to own `diene-runtime/v1`. Its strict consumption view and
+opaque `.substrate.kind == "k3d"` remain unchanged compatibility ABI; the CI
+receipt/report binds Namespace `cluster_id` separately. The driver calls only
+the pinned `pls env up|doctor|down` contracts and never stops platform k3s,
+creates nested k3d, uses a shared Docker volume, or runs
+`k3s ctr images export`.
 
-Readiness is consumed from the read-only `pls env doctor --profile <p> --json`
-and validated against `diene-readiness-v1.schema.json`, which requires all
-seventeen contract leaves with explicit outcomes. An empty or truncated leaf
-set refuses; it can no longer pass vacuously. `AllocationReady`,
-`CastformProdSafetyReady` and `CallbackReady` must be `NotRequired` on every
-local lane, and Absol and the independence fixture must report `SeedReady`
-`NotRequired`.
+Product routing is loopback-only and is verified after readiness. Public-edge
+or preview behavior remains outside this SIT.
 
-## Cleanup and evidence
+## Interim egress enforcement
 
-The egress posture, the receipt, and the EXIT/TERM/INT traps are all
-established **before** `pls env up`, so a run cancelled inside the substrate
-mutation still converges instead of orphaning a cluster. Cleanup executes the
-ratified `pls env down --profile <ditto|absol>` against the exact runtime file,
-then requests deferred cleanup of the egress posture.
-
-### The host-policy seam
-
-The egress interface is runner-owned and its ABI is exactly two verbs:
+Namespace CLI v0.0.532 has no supported per-instance egress-policy selector.
+Tenant/workspace-wide policy mutation is forbidden because concurrent jobs
+would race and lose exact-run ownership. The accepted interim is therefore
+receipt-scoped, in-guest iptables-nft enforcement and every report must state:
 
 ```text
-diene-host-policy apply   --receipt <id> --allow-file <diene-host-policy/v1>
-diene-host-policy release --receipt <id>
+platform per-instance policy pending (support ask #4)
 ```
 
-The lane generates the document; the runner enforces it in the host namespace.
-`mode` is the canonical wire enum `allowlist | closure-denied-network`, used
-unchanged end to end — emitted in the document, recorded on the receipt, and
-reported in the evidence.
+This is not final platform enforcement.
 
-**The lane does not choose its own posture.** `authorizedPolicyMode` is derived
-by the runner from the root lease's stable job identity and published in the
-isolation receipt; the conductor requires exact equality before it will even
-validate a document. The lane reads the authorized value and refuses when it
-disagrees with what the lane requires, naming both — rather than emitting a
-mode that would be rejected, or running under a posture it cannot work in.
+Every run:
 
-The first accepted policy binds `(lease, receipt)`: afterwards only a
-byte-identical replay is permitted, and a changed allow set is refused with the
-original left standing. A new posture needs a new receipt, so the lane applies
-exactly once per receipt.
+1. chooses its distinct logical profile before create;
+2. freezes declared DNS to literal addresses before policy activation;
+3. hooks receipt-scoped host `OUTPUT` and pod `FORWARD` chains;
+4. preserves only loopback/local cluster routes and the exact active SSH
+   return 4-tuple, never a blanket `ESTABLISHED,RELATED` exception;
+5. rejects metadata and undeclared egress, including a flow opened before the
+   policy transition;
+6. proves hostile metadata/arbitrary HTTPS probes on the host and in an actual
+   canary pod; and
+7. removes and verifies every IPv4/IPv6 hook, chain, and connected L7
+   enforcement receipt during cleanup.
 
-`release` is **deferred and non-destructive by contract**. It runs as the very
-principal the policy constrains, so if it deleted anything a lane could invoke
-it with its own known receipt at lane start and restore its own egress.
-Deletion belongs solely to the root-owned runner teardown transition. The lane
-records `PolicyReleaseRequested:Deferred` and never treats it as proof the
-enforcing table is gone.
+IPv6 forwarding is scoped only to observed IPv6 pod CIDRs. When none exists,
+the receipt chain returns unrelated forwarded traffic rather than installing a
+host-wide reject.
 
-Lane CIDRs are runner-owned too: they are read from the `0440` isolation
-receipt at `$DIENE_ISOLATION_FILE`, never copied into this template as
-constants and never re-derived from the runner's path layout. A duplicated
-constant is exactly how two arms drift apart.
+Connected Ditto lanes must receive an exact JSON allowlist and a checked-in,
+repository-relative executable enforcer capable of proving DNS, SNI, port,
+HTTP-method, and default-deny boundaries. These are safe deployment variables,
+not workflow-call inputs:
 
-**Lane CIDRs are local-only inputs, not egress permissions.** The Docker
-bridge/pool and the k3s pod/service ranges are validated as lane-local
-addresses; they must never become host-forward `accept` rules. A job holds
-`CAP_NET_ADMIN`, so it can delete the namespace-local route for a permitted
-range and route it through its veth instead — a host that accepted on
-destination CIDR alone would then forward it to the default egress, and any
-address overlapping an allowed internal range becomes reachable from a
-`closure-denied-network` lane. Authorising a CIDR is not the same as proving it
-is still the lease-local path it names. Host forwarding therefore admits only
-the exact root-authorized external literal endpoints, constrained to the real
-egress path; everything else is local by construction or denied.
+- `DIENE_CONNECTED_EGRESS_JSON`
+- `DIENE_EGRESS_CANARY_IMAGE` (immutable digest and preloaded)
+- `DIENE_EGRESS_L7_ENFORCER_BIN`
+- optional `DIENE_EGRESS_PROBE_BIN`
+- `DIENE_VENDOR_CREDENTIAL_BROKER_BIN` for vendor only
 
-Lifetime attestation is likewise not the lane's to claim. `apply` proves the
-metadata endpoint denied from outside the lane namespace at apply time, which
-the lane cannot defeat; that the posture held for the whole lane is evidence
-the root-owned teardown produces and the controller-owned
-`environment-runner-lifecycle` check carries.
+The enforcer, optional probe adapter, and vendor broker must be regular
+executable source files before create and are copied with the pinned commit.
+Missing or unprovable connected enforcement is
+`ConnectedEgressInterfaceUnavailable`; a missing vendor phase broker is
+`VendorBrokerInterfaceUnavailable`. The implementation does not pretend that
+metadata-only denial satisfies a connected lane.
 
-The post-job sweep is always parameterized by repository ID, run ID, run
-attempt, and opaque receipt ID — the exact four-selector interface, never
-widened. Missing, multiple, or mismatched receipts create visible
-`CleanupDebt`; no readable prefix, profile, namespace, or broad Docker label
-can select a victim. A receipt with no bound runtime file authorises **no**
-deletion. Sweeping is idempotent, so the `always()` post-job sweep never issues
-a second teardown. `pls env reset` is never automatic.
+The vendor broker issues its mode-0600 credential only after readiness, and
+revokes it before terminal reporting. Credential bytes never appear in the
+immutable driver input. Provider object IDs are safe evidence; absence or an
+exact durable debt record is mandatory. An optional declared action may report
+`Unavailable` without blocking only when `required=false`; required actions
+remain red.
 
-### Evidence is published by the runner, not by the job
+Absol and fleet-independence attach no shared cache and admit no external
+entry. Absol also verifies/imports the signed closure and exact-set equality
+under denial before application mutation. This interim is allowed only under
+the trusted-ref restriction above.
 
-Runtime lanes do **not** call `actions/upload-artifact`. The enforcing table is
-still standing when the runtime step ends — `release` is deferred by contract —
-and under a hermetic posture it denies exactly the connections an upload needs,
-so an in-job upload could never succeed on a real runner. The runner lifecycle
-owns the sequence: **stage → prove runtime absence → release → upload through a
-channel the job can never call.** A job-callable channel would let checkout code
-invoke it before absence was proven, so the lane refuses one.
+## Evidence and reports
 
-The lane writes into a **job-writable ingress**, never a sealed spool. Whatever
-it puts there is an untrusted candidate: the manifest it emits is
-`diene.atomi.cloud/ci-evidence-candidate/v1` carrying
-`trust: untrusted-job-candidate`. The sealed spool is root-only, lives outside
-what lease teardown removes, and is populated by the root-owned courier once it
-has validated the candidate set. A directory the job can write cannot be a
-sealed spool, so the lane refuses if the two are the same path.
+Core lanes emit `diene.atomi.cloud/ci-environment-report/v1`. Vendor emits
+`diene.atomi.cloud/ci-vendor-report/v1` in its separate action namespace. Both
+retain their stable result vocabulary and legacy fields while adding Namespace
+lifecycle facts.
 
-The gates split by what is locally provable:
+A green terminal report requires:
 
-| Property | Gated? | Why |
-| --- | --- | --- |
-| `sealedSpool` root-only, surviving teardown | **yes** | a local observation of modes, owners and location |
-| `channel.jobCallable == false` | **yes** | local; a job-callable channel could be invoked before absence is proven |
-| `releasesAfterAbsenceProof` | **yes** | local; releasing first drops enforcement while the runtime may still be live |
-| `retainsUntilAcknowledged` | **no** | vacuous when no acknowledgement can arrive |
-| `shipmentReady` | **no** | cannot be true until a courier endpoint exists |
+- exact cluster ID, Wolfi/k3s/node/capacity evidence;
+- create, transfer, SSH, collection, destroy, and absence phase receipts;
+- host and actual-pod hostile probes;
+- a valid immutable checkpoint predecessor chain ending in a non-resumed
+  `final-clean-pass`;
+- a collected proof bundle and complete segmented cold timings; and
+- a passing leakage scan over raw, base64, URL-encoded, JSON-escaped,
+  newline-normalized, and kubeconfig-embedded canaries.
 
-The last two are **recorded, not gated.** Gating on them would deadlock every
-real run against a flag that is honestly false today, so the report carries
-`evidence.shipment` as `Unavailable` with a stable reason instead — a green lane
-can never be misread as "evidence shipped". The transport is a release gate, not
-a lane obligation.
+Active failure reports may use `null` for instance facts that were never
+learned, but they stay red. Both or neither report digests, a core digest from
+vendor, or a vendor digest from core is `ReportNamespaceViolation`.
 
-The lane also refuses unless the runner attests that the enforcement is a
-boundary at all: `armedBeforeJob` (checkout and setup precede the lane, so a
-flow opened there would outlive a later policy), `establishedFlowExemption:
-false` (a blanket established/related accept admits any pre-opened flow for the
-table's lifetime), and `inputPathCovered` (a forward-only chain never sees
-packets delivered locally to the host veth or gateway). These are attestation
-checks, not proofs — the corresponding escape probes are privileged and live in
-the runner arm's suite.
+Candidate artifacts may contain only safe reports, transcripts, timings,
+checkpoints, and non-capability receipts. Runtime files, kubeconfig content,
+tokens, seed bytes, rendered Secrets, credentials, caches, and cleanup
+authority are never published.
 
-Reports are emitted for failing runs as well as passing ones and carry
-readiness, per-journey outcomes with timings and fixture digests, teardown
-transitions, finalizer debt, absence proof, leakage-scan and egress-canary
-results, and setup/substrate/readiness/journey/teardown timings. Core reports
-use `diene.atomi.cloud/ci-environment-report/v1`; vendor reports use
-`diene.atomi.cloud/ci-vendor-report/v1` and cannot carry core readiness or
-journey fields. Both are schema-validated before publication.
+## Local verification
 
-`DIENE_LEAK_CANARY` is **mandatory** for every runtime report. The lane
-generates a per-job tracer that lives only in process memory, and the scanner
-checks raw, base64, URL-encoded, JSON-escaped, newline-normalized and
-kubeconfig-embedded forms across the report, `$RUNNER_TEMP`, step outputs and
-the step summary. An absent canary, an absent search tool, or a positive
-finding all suppress the artifact and fail the lane. A lane whose evidence
-cannot be published is never green.
+`scripts/ci/test-environment-contract.sh` uses a local fake `nsc` implementing
+only the measured v0.0.532 surface. It covers exact identity/destroy/absence,
+pre-create refusals, SSH and collection loss, destroy failure, signals,
+parallel tuple isolation, report namespaces, policy probes/removal, leakage,
+checkpoint chains, and forbidden substrate strings.
 
-Local contract proof:
+Run the canonical gates from the generated repository's CI shell:
 
-```sh
+```bash
 ./scripts/ci/test-environment-contract.sh
+shellcheck scripts/ci/*.sh
+actionlint
+check-jsonschema --check-metaschema schemas/ci/*.schema.json
 ```
 
-It runs in `environment-contract-tests` on every CI run.
-
-## External dependencies still open
-
-These are refusals, not silent gaps. Each names a stable reason code and
-resolves the moment the upstream interface lands.
-
-**Every one of these is a hard refusal.** None is recorded as optional
-`Unavailable` coverage, and the report schema rejects a `Pass` report that
-tries to carry one, so a missing enforcement primitive cannot become green
-coverage.
-
-| Blocker | Reason code | Effect |
-| --- | --- | --- |
-| No runtime-free executable render | `ProfileRenderInterfaceUnavailable` | A repository that has declared an environment lock fails the profile gate. `DIENE_PROFILE_RENDER_BIN` makes it executable with no template change; repos without a lock stay `NotApplicable`/green. |
-| No runner host-policy client or isolation receipt | `HostPolicyInterfaceUnavailable` | Every runtime lane refuses. A job holds `CAP_NET_ADMIN`, so any nft table it installs in its own namespace is a cooperative setting it can flush — not a boundary. Enforcement lives in a root-owned host layer the job cannot mutate. |
-| No enforceable connected endpoint | `ConnectedEgressInterfaceUnavailable` | The connected Ditto lanes refuse. The enforcement layer denies DNS and admits only literal addresses, so a bare hostname such as `ghcr.io:443` could never be enforced; the template refuses rather than emitting one the conductor would reject, or worse, one it would accept as if enforced. The mechanism exists; the seed and registry literals are a deployment input nobody may synthesise. |
-| Enforcement not attested as a boundary | `HostEnforcementIncomplete` | Every runtime lane refuses unless the runner attests `armedBeforeJob`, `establishedFlowExemption: false` and `inputPathCovered`. |
-| No root-only sealed spool, or a release that precedes the absence proof | `EvidencePublicationInterfaceUnavailable` | Every runtime lane refuses. These are locally provable, so refusing on them is honest. Shipment is deliberately **not** in this table: it is recorded as `evidence.shipment: Unavailable` rather than gated, because it cannot be true until a courier endpoint exists and gating on it would deadlock every real run. |
-| No closure signature/certificate/Rekor verification or exact-set equality | `ClosureAttestationInterfaceUnavailable` | Absol refuses; both are mandatory results in the lane table. |
-| No real-pull / evict-repull / sibling-denial / pull-secret-ownership / credential-removal proof | `RequiredCoverageUnavailable` | target-pull refuses; all five are required results. |
-| No vendor egress proxy or credential broker | `VendorBrokerInterfaceUnavailable` | The vendor lane refuses. nft can express neither SNI nor HTTP methods, and a step-injected secret is live during preflight, substrate creation and readiness, so it is not phase-scoped in any meaningful sense. |
-| No captured stdout/stderr/argv/environ staging | `EvidenceLeakageInterfaceUnavailable` | The report refuses. Output streamed to the live GitHub log is already published and cannot be suppressed retroactively, so `leakageScan` is never claimed over a surface that was not actually captured. |
-| No finalizer-quiescence probe | `FinalizerQuiescenceInterfaceUnavailable` | The profile's 90-second window cannot be observed from here, so it is declared unavailable rather than simulated. |
-
-`pls env doctor --profile <p> --json` is the one upstream affordance this node
-assumes beyond the literal ratified signature: the ratified command is
-read-only, and machine-readable output is required to consume the readiness DAG
-at all.
+The shell includes the ordinary Unix/Kubernetes tools used by the driver. It
+does not package or invent `nsc`; the Namespace orchestrator image must provide
+the pinned CLI and the script records its semantic version.

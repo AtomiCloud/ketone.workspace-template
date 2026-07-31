@@ -14,9 +14,8 @@ permissions: {}
 jobs:
   # Everything decidable without a cluster happens on GitHub-hosted runners.
   # A repository that has not declared journeys, an immutable artifact subject,
-  # and an accepted runner controller/image pin never enables the runtime
-  # callers at all, so no disposable self-hosted runner is ever queued for an
-  # incomplete repository.
+  # and valid production fixtures never enables the runtime callers at all,
+  # so no Namespace instance is created for an incomplete repository.
   authorize-runtime:
     name: Authorize protected runtime
     runs-on: ubuntu-24.04
@@ -63,7 +62,7 @@ jobs:
 
           # Only an absent journey declaration disables the runtime callers,
           # and that claims no coverage. Every OTHER prerequisite — the Garden
-          # lock, the artifact producer, the accepted runner pin, the closure —
+          # lock, the artifact producer, production fixtures, and the closure —
           # is a refusal in the runtime-free jobs below, never a silent skip:
           # a repository that opted in must not go green with the blocking
           # checks quietly absent.

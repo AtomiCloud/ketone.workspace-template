@@ -261,20 +261,28 @@ orchestrator_finalize_report() {
   probes='[{"id":"policy-proof-unavailable","outcome":"Fail","reasonCode":"NotCollected","required":true}]'
   [[ ! -f $collected/hostile-probes.json ]] || probes=$(jq -c . "$collected/hostile-probes.json")
 
-  local driver_outcome
+  local driver_outcome driver_nonblocking=false
   driver_outcome=$(jq -r '.outcome' "$base_report")
-  if [[ $driver_outcome != Pass ]]; then
+  if [[ $ORCH_KIND == vendor ]] && jq -e '
+    .outcome == "Unavailable" and .vendorOutcome.outcome == "Unavailable" and
+    .vendorOutcome.required == false
+  ' "$base_report" >/dev/null; then
+    driver_nonblocking=true
+  elif [[ $driver_outcome != Pass ]]; then
     orchestrator_fail "$DIENE_REASON_EXIT" "$(jq -r '.reasonCode // "DriverFailed"' "$base_report")" \
       'on-instance driver reported a red result'
   fi
-  local lifecycle_outcome=Pass report_outcome=Pass report_reason=''
+  local lifecycle_outcome=Pass report_outcome=$driver_outcome report_reason=''
   for outcome in "$ORCH_CREATE_OUTCOME" "$ORCH_TRANSFER_OUTCOME" "$ORCH_SSH_OUTCOME" \
     "$ORCH_COLLECTION_OUTCOME" "$ORCH_DESTROY_OUTCOME" "$ORCH_ABSENCE_OUTCOME"; do
     [[ $outcome == Pass ]] || lifecycle_outcome=Fail
   done
-  if ((ORCH_FIRST_RC != 0)) || [[ $lifecycle_outcome != Pass || $driver_outcome != Pass ]]; then
+  if ((ORCH_FIRST_RC != 0)) || [[ $lifecycle_outcome != Pass ]] ||
+    [[ $driver_outcome != Pass && $driver_nonblocking != true ]]; then
     report_outcome=Fail
     report_reason=${ORCH_FIRST_REASON:-NamespaceLifecycleFailed}
+  elif [[ $driver_nonblocking == true ]]; then
+    report_reason=$(jq -r '.reasonCode' "$base_report")
   fi
 
   local lifecycle="$ORCH_STATE/namespace-lifecycle.json"
@@ -338,7 +346,7 @@ orchestrator_finalize_report() {
       destroySeconds:$destroySeconds,totalColdSeconds:$totalSeconds} |
     .teardown.transitions += ["NamespaceDestroy:"+$lifecycle.destroy.outcome,
       "NamespaceAbsence:"+$lifecycle.absence.outcome] |
-    .teardown.outcome = (if $verdict == "Pass" then "Pass" else "Fail" end) |
+    .teardown.outcome = (if $verdict == "Fail" then "Fail" else "Pass" end) |
     .teardown.absenceProof = (if $lifecycle.absence.outcome == "Pass" then "ReceiptDestroyed" else "ReceiptRetainedAsDebt" end) |
     .outcome = $verdict |
     if $verdict == "Pass" then del(.reasonCode) else .reasonCode = $reason end
@@ -581,6 +589,135 @@ orchestrate() {
     orchestrator_fail "$collection_rc" EvidenceCollectionFailed 'fixed proof download, digest, or extraction failed'
   fi
   return "$ORCH_FIRST_RC"
+}
+
+# A separate workflow `if: always()` step invokes this mode. The normal
+# orchestrator EXIT trap has already destroyed and proved absence; this mode
+# re-proves that terminal state. If the runner step died before its trap ran,
+# it may recover only the exact cidfile/metadata/receipt-bound cluster_id. A
+# recovery is deliberately returned red: late cleanup closes debt but cannot
+# rewrite the failed run green.
+orchestrator_cleanup_command() {
+  diene_validate_inputs
+  diene_require_command jq
+  diene_require_command tar
+  diene_require_command "$(diene_nsc_bin)"
+  ORCH_RECEIPT_ID=$(diene_receipt_id)
+  ORCH_STATE="${RUNNER_TEMP:?}/diene-namespace/$ORCH_RECEIPT_ID"
+  ORCH_RECEIPT=$(diene_receipt_path "$ORCH_RECEIPT_ID")
+  local lifecycle="$ORCH_STATE/namespace-lifecycle.json"
+  local cluster_id=''
+
+  if [[ -f $ORCH_RECEIPT ]]; then
+    cluster_id=$(jq -er '.namespace.clusterId | select(type == "string" and length > 0)' "$ORCH_RECEIPT") ||
+      diene_die NamespaceIdentityMismatch 'receipt carries no exact Namespace cluster_id'
+    diene_validate_receipt_owner "$ORCH_RECEIPT" "$cluster_id"
+  elif [[ -s $ORCH_STATE/cluster.cid && -s $ORCH_STATE/create.json ]]; then
+    cluster_id=$(diene_nsc_extract_cluster_id "$ORCH_STATE/cluster.cid" "$ORCH_STATE/create.json")
+  fi
+
+  if [[ -f $lifecycle ]]; then
+    local recorded
+    recorded=$(jq -er '.clusterId | select(type == "string" and length > 0)' "$lifecycle") ||
+      diene_die NamespaceIdentityMismatch 'lifecycle evidence carries no exact cluster_id'
+    [[ -z $cluster_id || $cluster_id == "$recorded" ]] ||
+      diene_die NamespaceIdentityMismatch 'receipt and lifecycle cluster_id disagree'
+    cluster_id=$recorded
+    diene_require_safe_id cluster_id "$cluster_id"
+    if jq -e '
+      .duration == "2h" and .ephemeral == true and .lateCleanupCanRewrite == false and
+      .destroy.outcome == "Pass" and .absence.outcome == "Pass"
+    ' "$lifecycle" >/dev/null && diene_nsc_absent "$cluster_id"; then
+      [[ -s ${DIENE_PROOF_BUNDLE:-$RUNNER_TEMP/diene-proof-bundle.tar} ]] ||
+        diene_die EvidenceCollectionFailed 'terminal proof bundle is absent after successful lifecycle convergence'
+      printf 'NamespaceLifecycleConverged: %s\n' "$cluster_id"
+      return 0
+    fi
+  fi
+
+  [[ -n $cluster_id ]] ||
+    diene_die NamespaceIdentityMismatch 'no exact agreed cluster_id exists; refusing broad cleanup'
+  local nsc_bin rc=0 absent=false
+  nsc_bin=$(diene_nsc_bin)
+  "$nsc_bin" destroy --force "$cluster_id" || rc=$?
+  if diene_nsc_wait_absent "$cluster_id"; then absent=true; fi
+  install -d -m 0700 "$ORCH_STATE/final-proof"
+  jq -n --arg clusterId "$cluster_id" --argjson destroyExit "$rc" --argjson absent "$absent" '
+    {outcome:"Fail",reasonCode:"LateExactCleanupCannotRewriteRun",clusterId:$clusterId,
+     destroyExit:$destroyExit,absenceProven:$absent,lateCleanupCanRewrite:false}' |
+    diene_write_json "$ORCH_STATE/final-proof/late-cleanup.json"
+  diene_die LateCleanupCannotRewriteRun \
+    "exact cluster_id $cluster_id was handled after the primary lifecycle; a fresh run is required"
+}
+
+orchestrator_verify_lifecycle() {
+  local bundle=${1:?proof bundle required}
+  diene_validate_inputs
+  diene_require_command jq
+  diene_require_command tar
+  [[ -f $bundle && ! -L $bundle ]] ||
+    diene_die EvidenceCollectionFailed 'workflow-owned lifecycle proof bundle is absent or unsafe'
+  local listing extract
+  listing=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-lifecycle-list.XXXXXX")
+  extract=$(mktemp -d "${RUNNER_TEMP:-/tmp}/diene-lifecycle-proof.XXXXXX")
+  trap 'rm -f -- "$listing"; rm -r -- "$extract"' RETURN
+  tar -tf "$bundle" >"$listing" || diene_die EvidenceCollectionFailed 'lifecycle proof tar is unreadable'
+  awk '
+    /^\// || /(^|\/)\.\.($|\/)/ {bad=1}
+    !/^\.\/$/ && !/^\.\/(diene-environment-report\.v1\.json|diene-vendor-report\.v1\.json|namespace-lifecycle\.json|checkpoint-chain\.json|ci-receipt\.json)$/ {bad=1}
+    END {exit bad ? 1 : 0}
+  ' "$listing" || diene_die EvidenceCollectionFailed 'lifecycle proof has an unexpected or unsafe member'
+  tar --extract --no-same-owner --no-same-permissions -f "$bundle" -C "$extract"
+  find "$extract" -type l -print -quit | grep -q . &&
+    diene_die EvidenceCollectionFailed 'lifecycle proof contains a link'
+
+  local schema=diene-environment-report-v1.schema.json
+  local report="$extract/diene-environment-report.v1.json"
+  if [[ $DIENE_LANE == ditto-vendor ]]; then
+    schema=diene-vendor-report-v1.schema.json
+    report="$extract/diene-vendor-report.v1.json"
+  fi
+  diene_schema_validate "$schema" "$report" \
+    'workflow-owned terminal report'
+  local lifecycle="$extract/namespace-lifecycle.json" checkpoint="$extract/checkpoint-chain.json"
+  [[ -f $lifecycle && -f $checkpoint ]] ||
+    diene_die EvidenceCollectionFailed 'terminal lifecycle or checkpoint evidence is absent'
+  local cluster_id receipt_id
+  cluster_id=$(jq -er '.clusterId | select(type == "string" and length > 0)' "$lifecycle") ||
+    diene_die NamespaceIdentityMismatch 'terminal lifecycle has no exact cluster_id'
+  receipt_id=$(diene_receipt_id)
+  diene_require_safe_id cluster_id "$cluster_id"
+  jq -e \
+    --arg sha "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+    --arg lane "$DIENE_LANE" --arg receipt "$receipt_id" --arg cluster "$cluster_id" '
+    .repositoryRevision == $sha and .workflow.runId == $runId and
+    .workflow.runAttempt == $runAttempt and .lane == $lane and .receiptId == $receipt and
+    .instance.clusterId == $cluster and .namespaceLifecycle.clusterId == $cluster and
+    .namespaceLifecycle.duration == "2h" and .namespaceLifecycle.ephemeral == true and
+    .namespaceLifecycle.endpointUsed == false and .namespaceLifecycle.cacheAttached == false and
+    .namespaceLifecycle.lateCleanupCanRewrite == false and
+    ([.namespaceLifecycle.create,.namespaceLifecycle.transfer,.namespaceLifecycle.ssh,
+      .namespaceLifecycle.collection,.namespaceLifecycle.destroy,.namespaceLifecycle.absence] |
+      all(.outcome == "Pass")) and
+    .namespaceLifecycle.outcome == "Pass" and
+    (.outcome == "Pass" or
+      (.outcome == "Unavailable" and .vendorOutcome.outcome == "Unavailable" and
+       .vendorOutcome.required == false)) and
+    .evidence.proofBundle.outcome == "Pass" and
+    .evidence.egressCanary.platformStatus ==
+      "platform per-instance policy pending (support ask #4)" and
+    .checkpointChain.validated == true and .checkpointChain.finalCleanPass == true and
+    .checkpointChain.resumedLegs == 0 and
+    .checkpointChain.checkpoints[-1].id == "final-clean-pass"
+  ' "$report" >/dev/null ||
+    diene_die NamespaceLifecycleFailed 'terminal report is not a green exact-id lifecycle proof'
+  diene_checkpoint_validate "$checkpoint"
+  jq -e '.validated == true and .finalCleanPass == true and .resumedLegs == 0' "$checkpoint" >/dev/null ||
+    diene_die FinalCleanPassRequired 'terminal checkpoint chain is not a clean full pass'
+  if [[ -f $extract/ci-receipt.json ]]; then
+    diene_validate_receipt_owner "$extract/ci-receipt.json" "$cluster_id"
+  fi
+  printf 'NamespaceLifecycleVerified: %s\n' "$cluster_id"
 }
 
 # ---------------------------------------------------------------------------
@@ -961,6 +1098,14 @@ case ${1:-orchestrate} in
   orchestrate)
     shift || true
     orchestrate "$@"
+    ;;
+  cleanup)
+    shift
+    orchestrator_cleanup_command "$@"
+    ;;
+  lifecycle)
+    shift
+    orchestrator_verify_lifecycle "$@"
     ;;
   driver)
     shift
