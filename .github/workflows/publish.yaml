@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - uses: docker/setup-qemu-action@v3
+      - name: Validate Helm Tooling Matrix
+        run: ./scripts/validate-helm-tooling.sh
       - name: Install CyanPrint
         run: ./scripts/setup-ubuntu.sh
       - name: Run CyanPrint Tests
