@@ -97,11 +97,10 @@ record_coverage local-finalizer-window FinalizerQuiescenceInterfaceUnavailable
 # mutation, so a cancellation inside `pls env up` still converges.
 # ---------------------------------------------------------------------------
 
-# The canonical wire enum the runner client and conductor validate:
-# `closure-denied-network` admits only the runner-assigned lane CIDRs, while
-# `allowlist` also admits the literal connected endpoints. It is the same value
-# end to end — emitted in the document, recorded on the receipt, reported in
-# the evidence.
+# The posture this lane requires. It is not the lane's to grant: the lease
+# authorizes a mode from the stable job identity, and the check below refuses
+# any disagreement. The value is then the same one end to end — emitted in the
+# document, recorded on the receipt, reported in the evidence.
 policy_mode=closure-denied-network
 case $DIENE_LANE in
   ditto-build-local | ditto-target-pull) policy_mode=allowlist ;;
@@ -331,6 +330,9 @@ if [[ $DIENE_LANE == absol ]]; then
   closure_verifier=$(diene_require_closure_verifier)
 fi
 diene_require_host_broker
+# The lease must authorize exactly the posture this lane requires, before any
+# document is generated or any mutation is attempted.
+diene_authorized_policy_mode "$policy_mode" >/dev/null
 
 case $DIENE_LANE in
   absol)

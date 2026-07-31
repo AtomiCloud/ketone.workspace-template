@@ -195,11 +195,25 @@ chmod 0755 "$fake_policy"
 
 # The runner-owned 0440 isolation receipt. The template consumes laneCidrs and
 # connectedEndpoints from here and carries no CIDR constants of its own.
+# `authorizedPolicyMode` is derived by the runner from the root lease's stable
+# job identity; the lane may not choose its own. A hermetic lease publishes an
+# empty connectedEndpoints regardless of configuration.
+write_isolation() {
+  local target=$1 mode=$2
+  local endpoints='["10.203.0.9:5000"]'
+  [[ $mode == allowlist ]] || endpoints='[]'
+  jq -n --arg mode "$mode" --argjson endpoints "$endpoints" \
+    '{apiVersion:"diene.atomi.cloud/ci-runner-isolation/v1",
+      leaseId:"00000000-0000-4000-8000-000000000000",
+      authorizedPolicyMode:$mode,
+      laneCidrs:["127.0.0.0/8","::1/128","10.202.0.0/24","10.203.0.0/16","10.42.0.0/16","10.43.0.0/16"],
+      connectedEndpoints:$endpoints}' >"$target"
+  chmod 0440 "$target"
+}
 fake_isolation=$scratch/isolation.json
-jq -n '{apiVersion:"diene.atomi.cloud/ci-runner-isolation/v1",leaseId:"00000000-0000-4000-8000-000000000000",
-        laneCidrs:["127.0.0.0/8","::1/128","10.202.0.0/24","10.203.0.0/16","10.42.0.0/16","10.43.0.0/16"],
-        connectedEndpoints:["10.203.0.9:5000"]}' >"$fake_isolation"
-chmod 0440 "$fake_isolation"
+write_isolation "$fake_isolation" allowlist
+fake_isolation_hermetic=$scratch/isolation-hermetic.json
+write_isolation "$fake_isolation_hermetic" closure-denied-network
 
 fake_pull_proof=$scratch/diene-artifact-pull-proof
 cat >"$fake_pull_proof" <<'PULL'
@@ -624,6 +638,13 @@ while read -r verb; do
 done < <(grep -o "^host-policy '\?[a-z-]*" "$DIENE_TEST_PLS_LOG" | sed "s/^host-policy '\?//" | sort -u)
 ok 'only the ratified apply and release verbs are invoked'
 
+# The first accepted policy binds (lease, receipt): a re-apply with a changed
+# allow set is refused and the original stands. The lane must therefore apply
+# exactly once per receipt.
+applies=$(grep -c '^host-policy .\?apply' "$DIENE_TEST_PLS_LOG" || true)
+((applies == 1)) || fail "the lane applied a policy $applies times for one receipt"
+ok 'a policy is applied exactly once per receipt'
+
 # `release` is deferred by contract, so the lane must never read it as proof
 # that the enforcing table is gone.
 grep -Fq 'PolicyReleaseRequested:Deferred' "$DIENE_CORE_REPORT" ||
@@ -876,12 +897,26 @@ DIENE_ISOLATION_FILE='' \
 
 # A receipt that is not the 0440 runner-owned projection is refused.
 loose_isolation=$scratch/loose-isolation.json
-cp -- "$fake_isolation" "$loose_isolation"
+cp -- "$fake_isolation_hermetic" "$loose_isolation"
 chmod 0644 "$loose_isolation"
 DIENE_ISOLATION_FILE="$loose_isolation" \
   expect_refusal HostPolicyInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
 ok 'lane CIDRs come only from the 0440 runner-owned isolation receipt'
+
+# The lane does not choose its own posture: the lease authorizes one, and a
+# disagreement refuses instead of emitting a mode the conductor would reject.
+: >"$DIENE_TEST_PLS_LOG"
+DIENE_ISOLATION_FILE="$fake_isolation" \
+  expect_refusal HostPolicyInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
+grep -Fq 'the lease authorizes policy mode allowlist but this lane requires closure-denied-network' \
+  "$scratch/stderr" || fail 'the refusal does not name the lease-authorized mode'
+! grep -Fq 'host-policy apply' "$DIENE_TEST_PLS_LOG" ||
+  fail 'a lane emitted a posture its lease did not authorize'
+ok 'a lease-authorized mode the lane disagrees with refuses before any document is emitted'
+
 export DIENE_ISOLATION_FILE=$fake_isolation
+export DIENE_LANE=ditto-build-local
+write_lease environment-ditto-build-local
 unset DIENE_FIXTURE_ID
 
 # A connected lane with no runner-published enforceable endpoint refuses: the
