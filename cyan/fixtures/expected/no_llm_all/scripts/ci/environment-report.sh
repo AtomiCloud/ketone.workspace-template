@@ -104,11 +104,28 @@ else
   canary=${DIENE_LEAK_CANARY:-}
   [[ -n $canary ]] ||
     diene_die EvidenceLeakDetected 'DIENE_LEAK_CANARY is mandatory for runtime reports; refusing to publish unscanned evidence'
-  surfaces=("$input")
+
+  # Every required surface must have actually been captured. Runtime output
+  # streamed straight to the GitHub log is already published by the time any
+  # grep runs, so a lane that did not route stdout/stderr into mode-0600
+  # staging cannot claim a scan happened at all.
+  staging=${DIENE_EVIDENCE_STAGING:-}
+  [[ -n $staging && -d $staging ]] ||
+    diene_die EvidenceLeakageInterfaceUnavailable \
+      'no mode-0600 evidence staging directory; runtime stdout/stderr was published unscanned and cannot be suppressed retroactively'
+  for required in stdout stderr argv environ; do
+    [[ -e "$staging/$required" ]] ||
+      diene_die EvidenceLeakageInterfaceUnavailable \
+        "the $required surface was never captured; leakageScan cannot be claimed over it"
+  done
+
+  surfaces=("$input" "$staging")
   [[ -z ${RUNNER_TEMP:-} ]] || surfaces+=("$RUNNER_TEMP")
+  [[ -z ${GITHUB_WORKSPACE:-} || ! -d ${GITHUB_WORKSPACE:-} ]] || surfaces+=("$GITHUB_WORKSPACE")
+  [[ -z ${GITHUB_ENV:-} || ! -f ${GITHUB_ENV:-} ]] || surfaces+=("$GITHUB_ENV")
   [[ -z ${GITHUB_OUTPUT:-} || ! -f ${GITHUB_OUTPUT:-} ]] || surfaces+=("$GITHUB_OUTPUT")
   [[ -z ${GITHUB_STEP_SUMMARY:-} || ! -f ${GITHUB_STEP_SUMMARY:-} ]] || surfaces+=("$GITHUB_STEP_SUMMARY")
-  [[ -z ${DIENE_ARGV_LOG:-} || ! -e ${DIENE_ARGV_LOG:-} ]] || surfaces+=("$DIENE_ARGV_LOG")
+  [[ -z ${DIENE_CACHE_DIR:-} || ! -d ${DIENE_CACHE_DIR:-} ]] || surfaces+=("$DIENE_CACHE_DIR")
   if ! scan_surfaces "$canary" "${surfaces[@]}"; then
     leak_outcome=Fail
     leak_reason=CanaryFoundInEvidence

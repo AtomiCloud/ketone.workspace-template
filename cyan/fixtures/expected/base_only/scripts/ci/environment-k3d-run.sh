@@ -34,6 +34,22 @@ runtime_dir=$(diene_runtime_dir)
 export DIENE_REASON_FILE="$runtime_dir/reason"
 : >"$DIENE_REASON_FILE"
 
+# Runtime output is routed into mode-0600 staging instead of straight to the
+# GitHub log: a canary streamed to the live log is already published and cannot
+# be suppressed by a later scan.
+export DIENE_EVIDENCE_STAGING="$runtime_dir/evidence"
+install -d -m 0700 "$DIENE_EVIDENCE_STAGING"
+for surface in stdout stderr argv environ; do
+  : >"$DIENE_EVIDENCE_STAGING/$surface"
+  chmod 0600 "$DIENE_EVIDENCE_STAGING/$surface"
+done
+printf '%s\n' "$0" "$@" >"$DIENE_EVIDENCE_STAGING/argv"
+# A bounded environment snapshot, so a leak into the process environment is
+# detectable. The tracer itself is excluded: it is a marker for other values
+# escaping, and matching its own definition would make every run a false hit.
+env | grep -v '^DIENE_LEAK_CANARY=' | LC_ALL=C sort >"$DIENE_EVIDENCE_STAGING/environ"
+chmod 0600 "$DIENE_EVIDENCE_STAGING/argv" "$DIENE_EVIDENCE_STAGING/environ"
+
 lane_started=$SECONDS
 setup_seconds=0
 substrate_seconds=0
@@ -81,15 +97,19 @@ record_coverage local-finalizer-window FinalizerQuiescenceInterfaceUnavailable
 # mutation, so a cancellation inside `pls env up` still converges.
 # ---------------------------------------------------------------------------
 
-policy_mode=none
+# `hermetic` denies DNS and every route the isolation receipt does not name;
+# `connected` additionally carries the exact seed and registry routes the lane
+# genuinely needs. Ditto core is connected by contract, so describing it as
+# hermetic would be a posture the lane cannot actually run under.
+policy_mode=hermetic
 case $DIENE_LANE in
-  absol) policy_mode=closure-denied-network ;;
-  ditto-build-local | ditto-target-pull | fleet-independence) policy_mode=allowlist ;;
+  ditto-build-local | ditto-target-pull) policy_mode=connected ;;
 esac
 
 receipt=$(diene_arm_receipt "$receipt_id" "$DIENE_LANE" "$profile" "$build_mode" "$policy_mode")
 
 policy_applied=0
+posture_sustained=0
 cleanup_attempted=0
 cleanup_result=1
 teardown_transitions=()
@@ -132,15 +152,31 @@ cleanup() {
     record_debt "exact receipt sweep did not converge for $receipt_id"
   fi
 
-  # Egress posture is released only after teardown. Absol never releases: its
-  # closure denial stays active for the whole lane by contract.
-  if ((policy_applied)) && [[ $policy_mode == allowlist ]]; then
-    if diene_host_policy_release "$receipt_id"; then
-      teardown_transitions+=("PolicyRelease:Pass")
+  # Apply-time acknowledgement is not lifetime enforcement: ask the host-owned
+  # broker to re-attest that the posture was actually held for the whole lane.
+  if ((policy_applied)); then
+    if diene_host_policy_verify "$receipt_id"; then
+      posture_sustained=1
+      teardown_transitions+=("PostureSustained:Pass")
     else
       failed=1
-      teardown_transitions+=("PolicyRelease:Fail")
-      record_debt "host policy release failed for $receipt_id"
+      posture_sustained=0
+      teardown_transitions+=("PostureSustained:Fail")
+      record_debt "the host-owned egress posture was not sustained for $receipt_id"
+    fi
+  fi
+
+  # The job may only request deferred cleanup: the outer enforcement persists
+  # until root-owned runner teardown removes it, so a job that knows its own
+  # receipt cannot dissolve the boundary containing it. Exact removal is the
+  # runner lifecycle's evidence to record, not this lane's to claim.
+  if ((policy_applied)); then
+    if diene_host_policy_request_release "$receipt_id"; then
+      teardown_transitions+=("PolicyReleaseRequested:Deferred")
+    else
+      failed=1
+      teardown_transitions+=("PolicyReleaseRequested:Fail")
+      record_debt "the deferred host policy cleanup request was not accepted for $receipt_id"
     fi
   fi
 
@@ -184,6 +220,7 @@ emit_report() {
     --arg absenceProof "$absence_proof" \
     --arg verdict "$verdict" --arg reason "$reason" \
     --argjson policyApplied "$policy_applied" \
+    --argjson postureSustained "$posture_sustained" \
     --argjson finalizerWait "$finalizer_wait" \
     --argjson setupSeconds "$setup_seconds" \
     --argjson substrateSeconds "$substrate_seconds" \
@@ -216,10 +253,11 @@ emit_report() {
       evidence: {
         leakageScan: { outcome: "Pass", reasonCode: "ScanPendingFinalisation", encodings: [], scannedPaths: [] },
         egressCanary: {
-          outcome: (if $policyMode == "none" then "NotRequired"
-                    elif $policyApplied == 1 then "Pass" else "Fail" end),
-          reasonCode: (if $policyMode == "none" then "NoDeclaredPosture"
-                       elif $policyApplied == 1 then "DeclaredPostureHeld" else "PostureNeverEstablished" end),
+          outcome: (if $policyApplied != 1 then "Fail"
+                    elif $postureSustained == 1 then "Pass" else "Fail" end),
+          reasonCode: (if $policyApplied != 1 then "PostureNeverEstablished"
+                       elif $postureSustained == 1 then "HostAttestedPostureSustained"
+                       else "PostureNotSustainedForLaneLifetime" end),
           mode: $policyMode
         }
       },
@@ -299,32 +337,65 @@ trap 'on_signal 130' INT
 # Posture, then substrate.
 # ---------------------------------------------------------------------------
 
-case $policy_mode in
-  allowlist)
-    # An allowlist, never a denylist of named systems: DNS and the default
-    # route are denied, so an unlisted control plane is unreachable by literal
-    # IP and by alternate DNS alike.
+# Mandatory lane proofs are demanded before anything at all is touched, so a
+# lane that cannot prove its required results never reaches the broker, let
+# alone the substrate.
+if [[ $DIENE_LANE == ditto-target-pull ]]; then
+  pull_proof=$(diene_require_pull_proof)
+fi
+if [[ $DIENE_LANE == absol ]]; then
+  closure_verifier=$(diene_require_closure_verifier)
+fi
+diene_require_host_broker
+
+case $DIENE_LANE in
+  absol)
+    # Goal order: verify and import the closure, THEN activate denial, THEN
+    # re-render and prove exact-set equality under denial, and only then let
+    # any volume or cluster exist.
+    "$closure_verifier" verify \
+      --digest "$DIENE_CLOSURE_DIGEST" \
+      --bundle "$DIENE_CLOSURE_BUNDLE_REF" \
+      --signature-digest "$DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST" \
+      --trust-root-digest "$DIENE_CLOSURE_TRUST_ROOT_DIGEST" ||
+      diene_die ClosureAttestationInterfaceUnavailable 'signed closure verification did not pass'
+    "$pls_bin" closure import "$DIENE_CLOSURE_BUNDLE_REF"
+
     allow_file="$runtime_dir/host-policy.json"
-    diene_write_allow_file "$allow_file" allowlist "${DIENE_LOCAL_REGISTRY_ENDPOINT:-127.0.0.1:5000}"
+    diene_write_allow_file "$allow_file" "$receipt_id" hermetic
     diene_host_policy_apply "$receipt_id" "$allow_file"
     policy_applied=1
-    # shellcheck disable=SC2016 # $mode and $file are jq variables, bound below
-    diene_receipt_patch "$receipt" '.hostPolicy = {applied: true, mode: $mode, allowFile: $file}' \
-      --arg mode "$policy_mode" --arg file "$allow_file"
-    ;;
-  closure-denied-network)
-    # Ratified: denial is established by the closure preflight, before any
-    # Docker volume or k3d cluster exists, and this lane never releases it.
     "$pls_bin" closure preflight --denied-network
+
+    "$closure_verifier" exact-set --digest "$DIENE_CLOSURE_DIGEST" --network-denied ||
+      diene_die ClosureAttestationInterfaceUnavailable 'exact-set equality did not hold under denial'
+    ;;
+  fleet-independence)
+    allow_file="$runtime_dir/host-policy.json"
+    diene_write_allow_file "$allow_file" "$receipt_id" hermetic
+    diene_host_policy_apply "$receipt_id" "$allow_file"
     policy_applied=1
-    # shellcheck disable=SC2016 # $mode is a jq variable, bound below
-    diene_receipt_patch "$receipt" '.hostPolicy = {applied: true, mode: $mode, allowFile: null}' \
-      --arg mode "$policy_mode"
+    ;;
+  ditto-build-local | ditto-target-pull)
+    # Connected Ditto is not hermetic: it must reach its scoped seed and, for
+    # target-pull, the registry. The broker issues that posture or the lane
+    # refuses; it never reports readiness through a posture that makes the
+    # required operations impossible.
+    allow_file="$runtime_dir/host-policy.json"
+    diene_write_allow_file "$allow_file" "$receipt_id" connected
+    diene_host_policy_apply "$receipt_id" "$allow_file"
+    policy_applied=1
     ;;
 esac
+if ((policy_applied)); then
+  # shellcheck disable=SC2016 # $mode and $file are jq variables, bound below
+  diene_receipt_patch "$receipt" '.hostPolicy = {applied: true, mode: $mode, allowFile: $file}' \
+    --arg mode "$policy_mode" --arg file "${allow_file:-}"
+fi
 
-if [[ $DIENE_LANE == absol ]]; then
-  "$pls_bin" closure import "$DIENE_CLOSURE_BUNDLE_REF"
+if [[ $DIENE_LANE == ditto-target-pull ]]; then
+  # Mandatory, not optional coverage: refuse when no interface can prove them.
+  pull_proof=$(diene_require_pull_proof)
 fi
 
 setup_seconds=$((SECONDS - lane_started))
@@ -364,14 +435,16 @@ case $DIENE_LANE in
     jq -e 'any(.readiness[]; .id == "ArtifactPullReady" and .required == true and .outcome == "Pass")' \
       "$readiness_file" >/dev/null ||
       diene_die EnvironmentNotReady 'target-pull did not prove ArtifactPullReady'
-    record_coverage artifact-evict-repull PullEvictionInterfaceUnavailable
-    record_coverage artifact-sibling-denial PullSiblingDenialInterfaceUnavailable
+    # Each of these is a required result in the lane table, so each is proven
+    # or the lane fails. None of them may become optional green coverage.
+    for proof in real-pull evict-repull sibling-denial pull-secret-ownership credential-removal; do
+      "$pull_proof" "$proof" --digest "$DIENE_ARTIFACT_DIGEST" --receipt "$receipt_id" ||
+        diene_die RequiredCoverageUnavailable "target-pull did not prove $proof"
+    done
     ;;
   absol)
     jq -e 'any(.readiness[]; .id == "SeedReady" and .outcome == "NotRequired")' "$readiness_file" >/dev/null ||
       diene_die EnvironmentNotReady 'Absol reported a required seed'
-    record_coverage closure-signature-verification ClosureAttestationInterfaceUnavailable
-    record_coverage closure-exact-set-equality ClosureExactSetInterfaceUnavailable
     ;;
   fleet-independence)
     jq -e 'any(.readiness[]; .id == "SeedReady" and .outcome == "NotRequired")' "$readiness_file" >/dev/null ||

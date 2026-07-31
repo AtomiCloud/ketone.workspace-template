@@ -399,27 +399,54 @@ diene_discover_runtime() {
 # When the runner does not expose the interface the lane refuses.
 # ---------------------------------------------------------------------------
 
+# A repository-controlled job holds CAP_NET_ADMIN, so any nft table this job
+# installs in its own namespace is a cooperative setting the job can flush or
+# delete — never a security boundary. Egress policy is therefore delegated
+# wholly to a root-owned broker enforced in a host layer the job cannot mutate,
+# and the lane refuses when that broker is absent rather than presenting a
+# self-enforced table as proof.
 diene_host_policy_bin() {
-  printf '%s\n' "${DIENE_HOST_POLICY_BIN:-/opt/diene/bin/diene-host-policy}"
+  printf '%s\n' "${DIENE_HOST_POLICY_BROKER_BIN:-/opt/diene/bin/diene-host-policy-broker}"
 }
 
+diene_require_host_broker() {
+  local bin
+  bin=$(diene_host_policy_bin)
+  command -v "$bin" >/dev/null 2>&1 || [[ -x $bin ]] ||
+    diene_die HostPolicyInterfaceUnavailable \
+      "root-owned host-policy broker $bin is absent; a job-namespace table the job can flush is not an egress boundary"
+}
+
+# The receipt-assigned routes come from the broker's authenticated isolation
+# receipt. This node never duplicates bridge/pod/service constants: a stale
+# copy of the runner's CIDRs is exactly how the two arms drift apart.
 diene_write_allow_file() {
   local target=${1:?target required}
-  local mode=${2:?mode required}
-  shift 2
+  local receipt_id=${2:?receipt id required}
+  local posture=${3:?posture required}
+  shift 3
+  local bin routes
+  bin=$(diene_host_policy_bin)
+  routes=$("$bin" routes --receipt "$receipt_id" --posture "$posture") ||
+    diene_die HostPolicyInterfaceUnavailable "the broker issued no isolation receipt for $receipt_id"
   local extra_json='[]'
   if (($#)); then
     extra_json=$(printf '%s\n' "$@" | jq -R . | jq -sc .)
   fi
-  jq -n --arg mode "$mode" --argjson extra "$extra_json" \
-    '{
-      apiVersion: "diene.atomi.cloud/ci-host-policy/v1",
-      mode: $mode,
-      allow: (["127.0.0.0/8", "::1/128", "10.42.0.0/16", "10.43.0.0/16", "172.16.0.0/12"] + $extra),
-      denyDns: true,
-      denyDefaultRoute: true
-    }' | diene_write_json "$target"
+  printf '%s' "$routes" | jq --argjson extra "$extra_json" --arg posture "$posture" \
+    '{apiVersion: "diene.atomi.cloud/ci-host-policy/v1", mode: $posture,
+      allow: ((.allow // []) + $extra), denyDns: (.denyDns // true),
+      denyDefaultRoute: (.denyDefaultRoute // true)}' | diene_write_json "$target"
   diene_schema_validate diene-host-policy-v1.schema.json "$target" 'host policy allowlist'
+
+  # A posture that denies everything the lane must actually reach is not a
+  # posture, it is a broken lane reporting readiness it cannot have.
+  if [[ $posture == connected ]]; then
+    jq -e '(.allow | length) > 0 and (.denyDns == false or ((.allow[] | select(test(":"))) | length) > 0)' \
+      "$target" >/dev/null ||
+      diene_die HostPolicyInterfaceUnavailable \
+        'the connected posture reaches no registry or seed route; readiness through it would be unprovable'
+  fi
 }
 
 diene_host_policy_apply() {
@@ -427,17 +454,48 @@ diene_host_policy_apply() {
   local allow_file=${2:?allow file required}
   local bin
   bin=$(diene_host_policy_bin)
-  command -v "$bin" >/dev/null 2>&1 || [[ -x $bin ]] ||
-    diene_die HostPolicyInterfaceUnavailable "runner host-policy interface $bin is absent; the allowlist cannot be proven"
+  diene_require_host_broker
   "$bin" apply --receipt "$receipt_id" --allow-file "$allow_file" ||
     diene_die HostPolicyInterfaceUnavailable "host policy apply failed for $receipt_id"
 }
 
-diene_host_policy_release() {
+# Apply-time acknowledgement is not lifetime enforcement. The broker is asked
+# to re-attest that the posture is still held, from the host side, after the
+# lane has run.
+diene_host_policy_verify() {
   local receipt_id=${1:?receipt id required}
   local bin
   bin=$(diene_host_policy_bin)
-  "$bin" release --receipt "$receipt_id"
+  "$bin" verify --receipt "$receipt_id"
+}
+
+# A job that knows its own receipt could otherwise call a passwordless broker
+# to tear down the very enforcement that contains it. The job side may only
+# REQUEST deferred cleanup; the outer table persists until root-owned runner
+# teardown removes it. This never deletes anything and never reports absence.
+diene_host_policy_request_release() {
+  local receipt_id=${1:?receipt id required}
+  local bin
+  bin=$(diene_host_policy_bin)
+  "$bin" request-release --receipt "$receipt_id"
+}
+
+# Mandatory lane proofs that Garden has not ratified an interface for. They are
+# requirements, not optional coverage, so their absence is a refusal.
+diene_require_pull_proof() {
+  local bin=${DIENE_PULL_PROOF_BIN:-/opt/diene/bin/diene-artifact-pull-proof}
+  command -v "$bin" >/dev/null 2>&1 || [[ -x $bin ]] ||
+    diene_die RequiredCoverageUnavailable \
+      'target-pull requires proof of real pull, eviction/repull, sibling-package denial, imagePullSecret ownership and credential removal; no ratified interface provides it'
+  printf '%s\n' "$bin"
+}
+
+diene_require_closure_verifier() {
+  local bin=${DIENE_CLOSURE_VERIFY_BIN:-/opt/diene/bin/diene-closure-verify}
+  command -v "$bin" >/dev/null 2>&1 || [[ -x $bin ]] ||
+    diene_die ClosureAttestationInterfaceUnavailable \
+      'Absol requires signature/certificate/Rekor verification and exact-set equality; no ratified interface provides it'
+  printf '%s\n' "$bin"
 }
 
 # ---------------------------------------------------------------------------
@@ -466,7 +524,18 @@ diene_run_argv() {
   [[ $working_directory =~ ^(\.|[A-Za-z0-9_.-]+)(/[A-Za-z0-9_.-]+)*$ && -d $working_directory ]] ||
     diene_die InputContractInvalid 'workingDirectory escapes or is absent'
   diene_require_command timeout
-  (cd -- "$working_directory" && timeout --foreground --kill-after=10s "${timeout_seconds}s" "${argv[@]}" </dev/null)
+  printf '%s\n' "${argv[*]}" >>"${DIENE_EVIDENCE_STAGING:-/dev/null}/argv" 2>/dev/null || true
+  # Declared-command output goes to mode-0600 staging, never straight to the
+  # live job log, so the leakage scan can suppress it before publication.
+  local staged_out=${DIENE_EVIDENCE_STAGING:+$DIENE_EVIDENCE_STAGING/stdout}
+  local staged_err=${DIENE_EVIDENCE_STAGING:+$DIENE_EVIDENCE_STAGING/stderr}
+  if [[ -n $staged_out && -n $staged_err ]]; then
+    (cd -- "$working_directory" &&
+      timeout --foreground --kill-after=10s "${timeout_seconds}s" "${argv[@]}" \
+        </dev/null >>"$staged_out" 2>>"$staged_err")
+  else
+    (cd -- "$working_directory" && timeout --foreground --kill-after=10s "${timeout_seconds}s" "${argv[@]}" </dev/null)
+  fi
 }
 
 # Bounded, condition-driven wait. Never a retry-to-green loop: it polls one

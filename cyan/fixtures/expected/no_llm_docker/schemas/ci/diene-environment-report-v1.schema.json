@@ -58,12 +58,32 @@
       "then": { "required": ["reasonCode"] }
     },
     {
-      "description": "A passing report can never omit readiness evidence or leave teardown unattempted.",
+      "description": "A passing report can never omit readiness evidence, leave teardown unattempted, or carry a load-bearing obligation as unavailable coverage. Those obligations are mandatory, so their absence is a refusal, not optional green coverage.",
       "if": { "properties": { "outcome": { "const": "Pass" } }, "required": ["outcome"] },
       "then": {
         "properties": {
           "readiness": { "type": "object" },
-          "teardown": { "properties": { "outcome": { "const": "Pass" }, "absenceProof": { "const": "ReceiptDestroyed" } } }
+          "teardown": { "properties": { "outcome": { "const": "Pass" }, "absenceProof": { "const": "ReceiptDestroyed" } } },
+          "coverage": {
+            "items": {
+              "properties": {
+                "required": { "const": false },
+                "id": {
+                  "not": {
+                    "enum": [
+                      "artifact-real-pull",
+                      "artifact-evict-repull",
+                      "artifact-sibling-denial",
+                      "artifact-pull-secret-ownership",
+                      "artifact-credential-removal",
+                      "closure-signature-verification",
+                      "closure-exact-set-equality"
+                    ]
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -157,7 +177,7 @@
           "properties": {
             "outcome": { "enum": ["Pass", "Fail", "NotRequired", "Unavailable"] },
             "reasonCode": { "type": "string", "minLength": 1 },
-            "mode": { "enum": ["allowlist", "closure-denied-network", "none"] }
+            "mode": { "enum": ["hermetic", "connected"] }
           }
         }
       }

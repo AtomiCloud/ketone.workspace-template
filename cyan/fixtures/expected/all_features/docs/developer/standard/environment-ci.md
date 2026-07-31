@@ -87,7 +87,16 @@ under test, so a substituted or stale workflow identity refuses.
 
 Runtime labels are the fixed four image labels plus one deterministic
 job label, and the runner lease must carry **that job's** label — a lease
-minted for a sibling lane of the same run is refused. Fork, Dependabot,
+minted for a sibling lane of the same run is refused.
+
+The lease the job reads is the runner arm's job-visible projection:
+`/run/diene-runner-lease.v1.public.json`, exactly mode `0440`. The private
+lease is never job-readable, so any other mode refuses. The job identity holds
+`CAP_NET_ADMIN` and is explicitly denied `CAP_SYS_ADMIN`; the preflight proves
+both directions — `nft` must work, and `unshare --net` and `nsenter` must
+**fail**. Requiring `unshare` to succeed would demand `CAP_SYS_ADMIN` and
+contradict the isolation model, so a job that can create or enter a namespace
+is refused. Fork, Dependabot,
 unprotected, substituted, mutable, or stale tuples refuse before credentials,
 network policy, volume, or substrate mutation.
 
@@ -202,14 +211,20 @@ It runs in `environment-contract-tests` on every CI run.
 These are refusals, not silent gaps. Each names a stable reason code and
 resolves the moment the upstream interface lands.
 
-| Blocker | Reason code | Resolves when |
+**Every one of these is a hard refusal.** None is recorded as optional
+`Unavailable` coverage, and the report schema rejects a `Pass` report that
+tries to carry one, so a missing enforcement primitive cannot become green
+coverage.
+
+| Blocker | Reason code | Effect |
 | --- | --- | --- |
-| No ratified runtime-free executable render | `ProfileRenderInterfaceUnavailable` | Garden publishes a render command; point `DIENE_PROFILE_RENDER_BIN` at it and the gate becomes executable with no template change. Until then a repository that has declared an environment lock fails this gate. |
-| No ratified host-policy verb | `HostPolicyInterfaceUnavailable` | The runner image ships `/opt/diene/bin/diene-host-policy`. `pls` ratifies no network verb, so inventing one here would be a second lifecycle. |
-| No ratified closure signature/Rekor verification | `ClosureAttestationInterfaceUnavailable` | Recorded as explicit `Unavailable` coverage in the Absol report; never counted as passed. |
-| No ratified exact-set equality probe | `ClosureExactSetInterfaceUnavailable` | Same. |
-| No ratified eviction/repull or sibling-denial probe | `PullEvictionInterfaceUnavailable`, `PullSiblingDenialInterfaceUnavailable` | Recorded as explicit `Unavailable` coverage in the target-pull report. |
-| No ratified finalizer-quiescence probe | `FinalizerQuiescenceInterfaceUnavailable` | The profile's 90-second local-finalizer window cannot be observed from here, so it is declared unavailable rather than simulated. |
+| No runtime-free executable render | `ProfileRenderInterfaceUnavailable` | A repository that has declared an environment lock fails the profile gate. `DIENE_PROFILE_RENDER_BIN` makes it executable with no template change; repos without a lock stay `NotApplicable`/green. |
+| No root-owned host egress broker | `HostPolicyInterfaceUnavailable` | Every runtime lane refuses. A job holds `CAP_NET_ADMIN`, so any nft table it installs in its own namespace is a cooperative setting it can flush — not a boundary. The broker must enforce in a host layer the job cannot mutate, publish the receipt-assigned lane CIDRs (never a broad constant), and attest afterwards that the posture was actually held. The job side may only *request* deferred cleanup: the outer table persists until root-owned runner teardown, so a job that knows its own receipt cannot dissolve the enforcement containing it. |
+| No closure signature/certificate/Rekor verification or exact-set equality | `ClosureAttestationInterfaceUnavailable` | Absol refuses; both are mandatory results in the lane table. |
+| No real-pull / evict-repull / sibling-denial / pull-secret-ownership / credential-removal proof | `RequiredCoverageUnavailable` | target-pull refuses; all five are required results. |
+| No vendor egress proxy or credential broker | `VendorBrokerInterfaceUnavailable` | The vendor lane refuses. nft can express neither SNI nor HTTP methods, and a step-injected secret is live during preflight, substrate creation and readiness, so it is not phase-scoped in any meaningful sense. |
+| No captured stdout/stderr/argv/environ staging | `EvidenceLeakageInterfaceUnavailable` | The report refuses. Output streamed to the live GitHub log is already published and cannot be suppressed retroactively, so `leakageScan` is never claimed over a surface that was not actually captured. |
+| No finalizer-quiescence probe | `FinalizerQuiescenceInterfaceUnavailable` | The profile's 90-second window cannot be observed from here, so it is declared unavailable rather than simulated. |
 
 `pls env doctor --profile <p> --json` is the one upstream affordance this node
 assumes beyond the literal ratified signature: the ratified command is
