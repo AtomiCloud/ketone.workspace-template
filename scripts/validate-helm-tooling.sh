@@ -34,7 +34,7 @@ require_exactly_once() {
   local count
 
   [[ -f "${file}" ]] || fail "missing ${file}"
-  count="$(grep -Ec "^[[:space:]]*${tool}([[:space:]]*#.*)?[[:space:]]*$" "${file}" || true)"
+  count="$(grep -Ec "^[[:space:]]*${tool}([[:space:]]|$)" "${file}" || true)"
   [[ "${count}" == 1 ]] || fail "expected ${tool} exactly once in ${file}, found ${count}"
 }
 
@@ -43,7 +43,7 @@ require_absent() {
   local tool="$2"
 
   [[ -f "${file}" ]] || fail "missing ${file}"
-  if grep -Eq "^[[:space:]]*${tool}([[:space:]]*#.*)?[[:space:]]*$" "${file}"; then
+  if grep -Eq "^[[:space:]]*${tool}([[:space:]]|$)" "${file}"; then
     fail "unexpected ${tool} in non-Helm fixture ${file}"
   fi
 }
@@ -56,11 +56,10 @@ for fixture in "${NON_HELM_FIXTURES[@]}"; do
   [[ -z "${FIXTURE_KIND[${fixture}]:-}" ]] || fail "duplicate fixture classification: ${fixture}"
   FIXTURE_KIND["${fixture}"]=non-helm
 done
-for fixture_dir in cyan/fixtures/expected/*; do
-  [[ -d "${fixture_dir}" ]] || continue
+while IFS= read -r -d '' fixture_dir; do
   fixture="${fixture_dir##*/}"
   [[ -n "${FIXTURE_KIND[${fixture}]:-}" ]] || fail "unclassified fixture directory: ${fixture}"
-done
+done < <(find cyan/fixtures/expected -mindepth 1 -maxdepth 1 -type d -print0)
 
 require_in_block() {
   local file="$1"
