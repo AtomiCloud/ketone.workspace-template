@@ -23,6 +23,8 @@ let
           gitlint
           go-task
           infisical
+          kubeconform
+          kyverno
           pre-commit
           shellcheck
           treefmt
