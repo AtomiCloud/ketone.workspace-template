@@ -408,6 +408,7 @@
       "additionalProperties": false,
       "required": ["inputDigest", "checkpoints", "validated", "resumedLegs", "finalCleanPass"],
       "properties": {
+        "apiVersion": { "const": "diene.atomi.cloud/ci-checkpoint-chain/v1" },
         "inputDigest": { "$ref": "#/$defs/digest" },
         "checkpoints": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/checkpoint" } },
         "validated": { "type": "boolean" },
