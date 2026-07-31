@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.atomi.cloud/diene/diene-readiness-v1.schema.json",
+  "title": "Consumption view of read-only `pls env doctor` readiness evidence",
+  "description": "goals/ci-k3d-lanes.md fixes the resource-native readiness DAG. This node consumes that evidence from the ratified read-only `pls env doctor --profile <p>` command; it never derives readiness itself and never accepts an empty leaf set. Unknown Garden-owned fields are accepted, but every one of the seventeen contract leaves must be present exactly once with an explicit outcome, so a truncated or empty emission refuses instead of passing vacuously.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["apiVersion", "profile", "aggregate", "outcome", "readiness"],
+  "properties": {
+    "apiVersion": { "const": "diene-readiness/v1" },
+    "profile": { "enum": ["ditto", "absol"] },
+    "aggregate": { "const": "EnvironmentReady" },
+    "outcome": { "enum": ["Pass", "Fail"] },
+    "readiness": {
+      "type": "array",
+      "minItems": 17,
+      "maxItems": 17,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/leaf" }
+    }
+  },
+  "$defs": {
+    "leafId": {
+      "enum": [
+        "SubstrateReady",
+        "SeedReady",
+        "StoreReady",
+        "ExternalSecretsReady",
+        "DependenciesReady",
+        "PVCsReady",
+        "MigrationsReady",
+        "FixturesReady",
+        "LogtoReady",
+        "ArtifactPullReady",
+        "ApplicationWorkloadsReady",
+        "ExposurePrerequisitesReady",
+        "ExposureReady",
+        "EnvironmentReady",
+        "AllocationReady",
+        "CastformProdSafetyReady",
+        "CallbackReady"
+      ]
+    },
+    "leaf": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "outcome", "required", "reasonCode"],
+      "properties": {
+        "id": { "$ref": "#/$defs/leafId" },
+        "outcome": { "enum": ["Pass", "Fail", "NotRequired"] },
+        "required": { "type": "boolean" },
+        "reasonCode": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "sourceUid": { "type": "string", "minLength": 1 },
+        "observedGeneration": { "type": ["string", "integer"] },
+        "allocationKey": { "type": "string", "minLength": 1 },
+        "transitionTime": { "type": "string", "format": "date-time" }
+      },
+      "allOf": [
+        {
+          "description": "An applicable leaf must carry its full evidence tuple; only a NotRequired leaf may omit it.",
+          "if": { "properties": { "outcome": { "enum": ["Pass", "Fail"] } }, "required": ["outcome"] },
+          "then": { "required": ["sourceUid", "observedGeneration", "allocationKey", "transitionTime"] }
+        },
+        {
+          "description": "A leaf declared required may never report NotRequired.",
+          "if": { "properties": { "required": { "const": true } }, "required": ["required"] },
+          "then": { "properties": { "outcome": { "enum": ["Pass", "Fail"] } } }
+        }
+      ]
+    }
+  }
+}

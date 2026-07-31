@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.atomi.cloud/diene/diene-environment-report-v1.schema.json",
+  "title": "Diene core environment report v1",
+  "description": "Evidence for one core runtime lane. It is emitted for failing runs as well as passing ones: a red lane must still publish its readiness, journey, teardown, debt and timing evidence. It carries no vendor field, so the vendor namespace stays disjoint.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "repositoryRevision",
+    "workflow",
+    "lane",
+    "profile",
+    "buildMode",
+    "subject",
+    "instance",
+    "receiptId",
+    "tooling",
+    "readiness",
+    "journeys",
+    "coverage",
+    "evidence",
+    "teardown",
+    "timings",
+    "outcome"
+  ],
+  "properties": {
+    "apiVersion": { "const": "diene.atomi.cloud/ci-environment-report/v1" },
+    "repositoryRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "workflow": { "$ref": "#/$defs/workflow" },
+    "lane": { "enum": ["ditto-build-local", "ditto-target-pull", "absol", "fleet-independence"] },
+    "profile": { "enum": ["ditto", "absol"] },
+    "buildMode": { "enum": ["build-local", "target-pull"] },
+    "subject": { "$ref": "#/$defs/subject" },
+    "instance": { "$ref": "#/$defs/instance" },
+    "receiptId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "tooling": { "$ref": "#/$defs/tooling" },
+    "readiness": {
+      "description": "The verbatim consumed readiness document; every leaf and the EnvironmentReady aggregate are retained. Null only on a failing report that refused before readiness evidence existed.",
+      "anyOf": [{ "$ref": "diene-readiness-v1.schema.json" }, { "type": "null" }]
+    },
+    "journeys": { "type": "array", "items": { "$ref": "#/$defs/outcome" } },
+    "coverage": {
+      "type": "array",
+      "description": "Lane proof obligations that have no ratified upstream interface yet. They are recorded as explicit Unavailable coverage and never counted as passed.",
+      "items": { "$ref": "#/$defs/outcome" }
+    },
+    "evidence": { "$ref": "#/$defs/evidence" },
+    "teardown": { "$ref": "#/$defs/teardown" },
+    "timings": { "$ref": "#/$defs/timings" },
+    "outcome": { "enum": ["Pass", "Fail"] },
+    "reasonCode": { "type": "string", "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "description": "A failing report must name why it failed.",
+      "if": { "properties": { "outcome": { "const": "Fail" } }, "required": ["outcome"] },
+      "then": { "required": ["reasonCode"] }
+    },
+    {
+      "description": "A passing report can never omit readiness evidence or leave teardown unattempted.",
+      "if": { "properties": { "outcome": { "const": "Pass" } }, "required": ["outcome"] },
+      "then": {
+        "properties": {
+          "readiness": { "type": "object" },
+          "teardown": { "properties": { "outcome": { "const": "Pass" }, "absenceProof": { "const": "ReceiptDestroyed" } } }
+        }
+      }
+    },
+    {
+      "description": "The vendor namespace may never be opened by a core report.",
+      "not": { "anyOf": [{ "required": ["vendorOutcome"] }, { "required": ["vendorOutcomes"] }, { "required": ["actionId"] }, { "required": ["providerCleanup"] }] }
+    }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "runAttempt", "workflowRef"],
+      "properties": {
+        "runId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "runAttempt": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "workflowRef": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$" }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactDigest", "imageRef", "producerWorkflowRef"],
+      "properties": {
+        "artifactDigest": { "$ref": "#/$defs/digest" },
+        "imageRef": { "type": "string", "minLength": 1 },
+        "producerWorkflowRef": { "type": "string", "minLength": 1 },
+        "provenanceAttestationDigest": { "$ref": "#/$defs/digest" },
+        "closureDigest": { "$ref": "#/$defs/digest" },
+        "closureSignatureBundleDigest": { "$ref": "#/$defs/digest" },
+        "closureTrustRootDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "instance": {
+      "description": "Safe instance identity only: keys and paths, never credential, seed, Secret or kubeconfig bytes.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allocationKey", "generationKey"],
+      "properties": {
+        "allocationKey": { "type": "string", "minLength": 1 },
+        "generationKey": { "type": "string", "minLength": 1 },
+        "substrateName": { "type": "string", "minLength": 1 },
+        "substrateReceipt": { "type": "string", "minLength": 1 }
+      }
+    },
+    "tooling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gardenLockDigest", "journeyManifestDigest"],
+      "properties": {
+        "gardenLockDigest": { "$ref": "#/$defs/digest" },
+        "journeyManifestDigest": { "$ref": "#/$defs/digest" },
+        "environmentLockDigest": { "$ref": "#/$defs/digest" },
+        "artifactSubjectDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "outcome", "reasonCode", "required"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "outcome": { "enum": ["Pass", "Fail", "NotApplicable", "Unavailable"] },
+        "reasonCode": { "type": "string", "minLength": 1 },
+        "required": { "type": "boolean" },
+        "durationSeconds": { "type": "integer", "minimum": 0 },
+        "fixturePackDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leakageScan", "egressCanary"],
+      "properties": {
+        "leakageScan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outcome", "reasonCode", "encodings", "scannedPaths"],
+          "properties": {
+            "outcome": { "enum": ["Pass", "Fail"] },
+            "reasonCode": { "type": "string", "minLength": 1 },
+            "encodings": { "type": "array", "minItems": 6, "items": { "type": "string", "minLength": 1 } },
+            "scannedPaths": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "egressCanary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outcome", "reasonCode"],
+          "properties": {
+            "outcome": { "enum": ["Pass", "Fail", "NotRequired", "Unavailable"] },
+            "reasonCode": { "type": "string", "minLength": 1 },
+            "mode": { "enum": ["allowlist", "closure-denied-network", "none"] }
+          }
+        }
+      }
+    },
+    "teardown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "reasonCode", "transitions", "finalizerWaitSeconds", "debt", "absenceProof"],
+      "properties": {
+        "outcome": { "enum": ["Pass", "Fail"] },
+        "reasonCode": { "type": "string", "minLength": 1 },
+        "transitions": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "finalizerWaitSeconds": { "type": "integer", "minimum": 0, "maximum": 900 },
+        "debt": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "absenceProof": { "enum": ["ReceiptDestroyed", "ReceiptRetainedAsDebt", "NotAttempted"] }
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["setupSeconds", "substrateSeconds", "readinessSeconds", "journeysSeconds", "teardownSeconds"],
+      "properties": {
+        "setupSeconds": { "type": "integer", "minimum": 0 },
+        "substrateSeconds": { "type": "integer", "minimum": 0 },
+        "readinessSeconds": { "type": "integer", "minimum": 0 },
+        "journeysSeconds": { "type": "integer", "minimum": 0 },
+        "teardownSeconds": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.atomi.cloud/diene/diene-profile-report-v1.schema.json",
+  "title": "Diene runtime-free profile, corpus and parity report v1",
+  "description": "Evidence for the no-cluster profile lane. It records the imported preview-manifest/v1 version and digest, the petname word-list version, consumer-lock parity, one-writer ownership, and every rejected alias reason. It never claims an executable Castform or Eevee render.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "outcome", "reasonCode", "renderedProfiles", "validatedProfiles", "staticContract"],
+  "properties": {
+    "apiVersion": { "const": "diene.atomi.cloud/ci-profile-report/v1" },
+    "outcome": { "enum": ["Pass", "Fail", "NotApplicable", "Unavailable"] },
+    "reasonCode": { "type": "string", "minLength": 1 },
+    "repositoryRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "renderedProfiles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["lapras", "ditto", "rotom", "absol"] }
+    },
+    "validatedProfiles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["eevee", "castform"] }
+    },
+    "previewManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "schemaDigest", "wordListVersion"],
+      "properties": {
+        "schemaVersion": { "const": "preview-manifest/v1" },
+        "schemaDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "wordListVersion": { "type": "string", "minLength": 1 }
+      }
+    },
+    "staticContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profileSet", "substrateParity", "retiredNames", "consumerPinAliases", "oneWriter", "buildModeMatrix"],
+      "properties": {
+        "profileSet": { "$ref": "#/$defs/check" },
+        "substrateParity": { "$ref": "#/$defs/check" },
+        "retiredNames": { "$ref": "#/$defs/check" },
+        "consumerPinAliases": { "$ref": "#/$defs/check" },
+        "oneWriter": { "$ref": "#/$defs/check" },
+        "buildModeMatrix": { "$ref": "#/$defs/check" }
+      }
+    },
+    "rejectedAliases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pointer", "reasonCode"],
+        "properties": {
+          "pointer": { "type": "string", "minLength": 1 },
+          "reasonCode": { "const": "PreviewManifestSchemaMismatch" }
+        }
+      }
+    },
+    "castformExecutable": { "$ref": "#/$defs/check" },
+    "eeveeExecutable": { "$ref": "#/$defs/check" },
+    "localExecutableRender": {
+      "description": "Executable render of the four local profiles. Unavailable until Garden ratifies a runtime-free render interface; unavailable coverage is never counted as passed.",
+      "$ref": "#/$defs/check"
+    },
+    "toolingDigests": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "environmentLockDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } }
+    }
+  },
+  "$defs": {
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "reasonCode"],
+      "properties": {
+        "outcome": { "enum": ["Pass", "Fail", "NotApplicable", "Unavailable"] },
+        "reasonCode": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

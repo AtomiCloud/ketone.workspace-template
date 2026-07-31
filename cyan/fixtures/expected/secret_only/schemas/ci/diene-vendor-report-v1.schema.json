@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.atomi.cloud/diene/diene-vendor-report-v1.schema.json",
+  "title": "Diene declared-vendor action report v1",
+  "description": "Evidence for one separately invoked vendor action. It is emitted for failing runs as well as passing ones. It may not carry core readiness or journey fields, so a vendor action can never satisfy, replace or weaken a core assertion.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "repositoryRevision",
+    "workflow",
+    "lane",
+    "profile",
+    "buildMode",
+    "actionId",
+    "componentClass",
+    "permissionRule",
+    "receiptId",
+    "instance",
+    "tooling",
+    "vendorOutcome",
+    "providerCleanup",
+    "evidence",
+    "teardown",
+    "timings",
+    "outcome"
+  ],
+  "properties": {
+    "apiVersion": { "const": "diene.atomi.cloud/ci-vendor-report/v1" },
+    "repositoryRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "workflow": { "$ref": "diene-environment-report-v1.schema.json#/$defs/workflow" },
+    "lane": { "const": "ditto-vendor" },
+    "profile": { "const": "ditto" },
+    "buildMode": { "const": "build-local" },
+    "actionId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,127}$" },
+    "componentClass": { "const": "K9" },
+    "permissionRule": { "const": "ditto-vendor-demo" },
+    "receiptId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "instance": { "$ref": "diene-environment-report-v1.schema.json#/$defs/instance" },
+    "tooling": { "$ref": "diene-environment-report-v1.schema.json#/$defs/tooling" },
+    "vendorOutcome": { "$ref": "diene-environment-report-v1.schema.json#/$defs/outcome" },
+    "providerCleanup": { "$ref": "#/$defs/providerCleanup" },
+    "credential": { "$ref": "#/$defs/credential" },
+    "evidence": { "$ref": "diene-environment-report-v1.schema.json#/$defs/evidence" },
+    "teardown": { "$ref": "diene-environment-report-v1.schema.json#/$defs/teardown" },
+    "timings": { "$ref": "diene-environment-report-v1.schema.json#/$defs/timings" },
+    "outcome": { "enum": ["Pass", "Fail", "NotApplicable", "Unavailable"] },
+    "reasonCode": { "type": "string", "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "description": "A vendor report may never open the core namespace.",
+      "not": { "anyOf": [{ "required": ["readiness"] }, { "required": ["journeys"] }, { "required": ["coverage"] }, { "required": ["subject"] }] }
+    },
+    {
+      "description": "Anything other than a plain pass must name its stable reason.",
+      "if": { "properties": { "outcome": { "enum": ["Fail", "NotApplicable", "Unavailable"] } }, "required": ["outcome"] },
+      "then": { "required": ["reasonCode"] }
+    }
+  ],
+  "$defs": {
+    "providerCleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "reasonCode", "objectIds", "absenceProven"],
+      "properties": {
+        "outcome": { "enum": ["Pass", "Fail", "Unavailable"] },
+        "reasonCode": { "type": "string", "minLength": 1 },
+        "objectIds": {
+          "description": "Provider object IDs recorded in the run receipt. Empty only when the adapter created none.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "absenceProven": { "type": "boolean" },
+        "durableDebtRecord": { "type": ["string", "null"], "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "description": "Unproven provider absence must leave a durable debt record; it can never be silently dropped.",
+          "if": { "properties": { "absenceProven": { "const": false } }, "required": ["absenceProven"] },
+          "then": { "properties": { "durableDebtRecord": { "type": "string" } }, "required": ["durableDebtRecord"] }
+        }
+      ]
+    },
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["env", "masked", "phaseScoped", "removed"],
+      "properties": {
+        "env": { "const": "DIENE_VENDOR_CREDENTIAL" },
+        "masked": { "type": "boolean" },
+        "phaseScoped": { "type": "boolean" },
+        "removed": { "type": "boolean" }
+      }
+    }
+  }
+}

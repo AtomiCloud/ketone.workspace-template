@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.atomi.cloud/diene/diene-vendors-v1.schema.json",
+  "title": "Diene separately-invoked vendor declarations v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "actions"],
+  "properties": {
+    "apiVersion": { "const": "diene.atomi.cloud/ci-vendors/v1" },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["componentClass", "actionId", "permissionRule", "profile", "buildMode", "required", "fixturePack", "account", "endpoint", "credentialEnv", "credentialWriter", "egress", "setup", "probe", "cleanup", "absence", "timeoutSeconds", "retryAttempts", "callbackCompletion"],
+        "properties": {
+          "componentClass": { "const": "K9" },
+          "actionId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,127}$" },
+          "permissionRule": { "const": "ditto-vendor-demo" },
+          "profile": { "const": "ditto" },
+          "buildMode": { "const": "build-local" },
+          "required": { "type": "boolean" },
+          "fixturePack": { "$ref": "diene-journeys-v1.schema.json#/$defs/pack" },
+          "personaPack": { "$ref": "diene-journeys-v1.schema.json#/$defs/pack" },
+          "account": { "type": "string", "pattern": "^(sandbox|demo)-[A-Za-z0-9._-]+$" },
+          "endpoint": { "type": "string", "format": "uri", "pattern": "^https://" },
+          "credentialEnv": { "const": "DIENE_VENDOR_CREDENTIAL" },
+          "credentialWriter": { "const": "github-environment" },
+          "egress": {
+            "type": "array", "minItems": 1,
+            "items": {
+              "type": "object", "additionalProperties": false, "required": ["dns", "sni", "port", "methods"],
+              "properties": {
+                "dns": { "type": "string", "format": "hostname" }, "sni": { "type": "string", "format": "hostname" },
+                "port": { "const": 443 }, "methods": { "type": "array", "minItems": 1, "items": { "enum": ["GET", "POST", "DELETE"] } }
+              }
+            }
+          },
+          "setup": { "$ref": "diene-journeys-v1.schema.json#/$defs/argv" },
+          "probe": { "$ref": "diene-journeys-v1.schema.json#/$defs/argv" },
+          "cleanup": { "$ref": "diene-journeys-v1.schema.json#/$defs/argv" },
+          "absence": { "$ref": "diene-journeys-v1.schema.json#/$defs/argv" },
+          "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+          "retryAttempts": { "const": 0 },
+          "callbackCompletion": { "enum": ["poll", "local-injection", "unavailable"] }
+        }
+      }
+    }
+  }
+}

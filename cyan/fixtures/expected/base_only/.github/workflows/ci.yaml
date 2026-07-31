@@ -1,8 +1,70 @@
 name: CI
 on:
   push:
+  pull_request:
 jobs:
   precommit:
     name: Pre-Commit
+    permissions:
+      contents: read
     uses: ./.github/workflows/⚡reusable-precommit.yaml
     secrets: inherit
+  artifact-build:
+    name: Artifact Build
+    needs: precommit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - name: Produce the immutable application artifact
+        env:
+          DIENE_BASE_WORKFLOW_REF: ${{ github.repository }}/.github/workflows/ci.yaml@${{ github.sha }}
+        run: |
+          # The subject is produced by the repository's own publisher. This
+          # job never derives a digest from a source tree and never fabricates
+          # provenance; a repository that has declared no publisher simply has
+          # no artifact yet, which is explicit rather than implied.
+          producer=.diene/ci/artifact-producer.sh
+          if [[ ! -x $producer ]]; then
+            printf 'NoDeclaration: %s is absent; no application artifact is produced\n' "$producer"
+            exit 0
+          fi
+          "$producer" --source-sha "$GITHUB_SHA" --output "$RUNNER_TEMP/artifact.v1.json"
+          nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh \
+            --validate-subject "$RUNNER_TEMP/artifact.v1.json"
+  environment-contract-tests:
+    name: Environment Contract Tests
+    needs: precommit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - name: Prove the environment contract refusals locally
+        run: nix develop .#ci -c ./scripts/ci/test-environment-contract.sh
+  environment-profile-contract:
+    name: Environment Profile Contract
+    if: github.event_name == 'pull_request' || github.ref_protected == true
+    needs: [precommit, artifact-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - name: Validate runtime-free profile, corpus, and parity
+        run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh
+      - name: Upload safe profile contract report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-profile-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-profile-contract.json
+          if-no-files-found: error
+          retention-days: 7
+permissions: {}
