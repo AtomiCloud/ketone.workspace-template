@@ -25,6 +25,8 @@ jobs:
     timeout-minutes: 8
     env:
       EXPECTED_STORE_PATH: /nix/store/lpk86xcf9p6v22js8xnvlz7qkcjyhgj3-ratchet-workspace-g17-ubuntu-26.04-amd64
+      GC_ROOT: /nix/var/nix/gcroots/ratchet-workspace-g17-ubuntu-26.04-amd64
+      RUN_ATTEMPT: ${{ github.run_attempt }}
     steps:
       - name: Record runner identity
         run: |
@@ -33,14 +35,22 @@ jobs:
       - uses: AtomiCloud/actions.setup-nix@v3
         with:
           checkout: 'false'
-      - name: Prove warm cache restoration
+      - name: Prove cold or warm cache state
         shell: bash
         run: |
           set -euo pipefail
-          test -f "${EXPECTED_STORE_PATH}"
-          grep -Fx 'workspace-g17 ubuntu-26.04 cache proof' "${EXPECTED_STORE_PATH}"
-          printf 'cache_state=warm restored_path=%s\n' "${EXPECTED_STORE_PATH}"
-      - name: Populate exact OS cache
+          if [ "${RUN_ATTEMPT}" = 1 ]; then
+            test ! -e "${EXPECTED_STORE_PATH}"
+            printf 'cache_state=cold store_path=absent attempt=1\n'
+          else
+            test -L "${GC_ROOT}"
+            test "$(readlink -f "${GC_ROOT}")" = "${EXPECTED_STORE_PATH}"
+            test -f "${EXPECTED_STORE_PATH}"
+            grep -Fx 'workspace-g17 ubuntu-26.04 cache proof' "${EXPECTED_STORE_PATH}"
+            printf 'cache_state=warm restored_path=%s attempt=%s\n' \
+              "${EXPECTED_STORE_PATH}" "${RUN_ATTEMPT}"
+          fi
+      - name: Populate and root exact OS cache
         shell: bash
         run: |
           set -euo pipefail
@@ -48,6 +58,9 @@ jobs:
           printf 'workspace-g17 ubuntu-26.04 cache proof\n' > "${proof_file}"
           proof_path=$(nix store add-file "${proof_file}")
           test "${proof_path}" = "${EXPECTED_STORE_PATH}"
+          sudo mkdir -p "$(dirname "${GC_ROOT}")"
+          sudo ln -sfn "${proof_path}" "${GC_ROOT}"
+          test "$(readlink -f "${GC_ROOT}")" = "${proof_path}"
           test -f "${proof_path}"
           grep -Fx 'workspace-g17 ubuntu-26.04 cache proof' "${proof_path}"
           printf 'cache_populated=true path=%s\n' "${proof_path}"
