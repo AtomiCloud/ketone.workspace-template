@@ -253,9 +253,21 @@ evidence=$state/evidence
 source "${TEMPLATE_SCRIPT_DIR:?}/environment-lib.sh"
 input_digest=$(diene_sha256_text "$(jq -cS . "$inputs")")
 diene_checkpoint_init "$evidence/checkpoint-chain.json" "$input_digest"
-diene_checkpoint_append "$evidence/checkpoint-chain.json" final-clean-pass Pass \
-  "$(diene_sha256_text "$cluster_id|final-clean-pass")" false
-diene_checkpoint_seal "$evidence/checkpoint-chain.json" true
+if [[ $scenario == checkpoint-resumed ]]; then
+  diene_checkpoint_append "$evidence/checkpoint-chain.json" resumed-readiness Pass \
+    "$(diene_sha256_text "$cluster_id|resumed-readiness")" true
+  diene_checkpoint_append "$evidence/checkpoint-chain.json" final-clean-pass Pass \
+    "$(diene_sha256_text "$cluster_id|final-clean-pass")" false
+  diene_checkpoint_seal "$evidence/checkpoint-chain.json" false
+elif [[ $scenario == checkpoint-no-final ]]; then
+  diene_checkpoint_append "$evidence/checkpoint-chain.json" environment-ready Pass \
+    "$(diene_sha256_text "$cluster_id|environment-ready")" false
+  diene_checkpoint_seal "$evidence/checkpoint-chain.json" false
+else
+  diene_checkpoint_append "$evidence/checkpoint-chain.json" final-clean-pass Pass \
+    "$(diene_sha256_text "$cluster_id|final-clean-pass")" false
+  diene_checkpoint_seal "$evidence/checkpoint-chain.json" true
+fi
 if [[ $scenario == checkpoint-broken ]]; then
   jq '.checkpoints[0].predecessorDigest = "sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
     "$evidence/checkpoint-chain.json" >"$evidence/checkpoint-chain.json.tmp"
@@ -1490,5 +1502,295 @@ grep -Fq 'diene_die VendorBrokerInterfaceUnavailable' "$script_dir/environment-v
 grep -Fq 'if ! "$broker" revoke' "$script_dir/environment-vendor-run.sh" ||
   fail 'the vendor driver does not make broker revocation cleanup-blocking'
 ok 'vendor broker issue/revoke and exact vendor allowlist remain fail closed'
+
+printf '== report namespaces and additive schema compatibility ==\n'
+
+validate_report_namespace_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_validate_report_namespace "$@"
+)
+
+validate_report_namespace_case ditto-build-local "$ARTIFACT_DIGEST" ''
+validate_report_namespace_case ditto-vendor '' "$ARTIFACT_DIGEST"
+ok 'the exact core and vendor digest namespaces are accepted only by their owning lanes'
+
+expect_refusal ReportNamespaceViolation validate_report_namespace_case ditto-build-local '' ''
+expect_refusal ReportNamespaceViolation validate_report_namespace_case ditto-build-local \
+  "$ARTIFACT_DIGEST" "$ARTIFACT_DIGEST"
+expect_refusal ReportNamespaceViolation validate_report_namespace_case ditto-build-local '' "$ARTIFACT_DIGEST"
+expect_refusal ReportNamespaceViolation validate_report_namespace_case ditto-vendor '' ''
+expect_refusal ReportNamespaceViolation validate_report_namespace_case ditto-vendor \
+  "$ARTIFACT_DIGEST" "$ARTIFACT_DIGEST"
+expect_refusal ReportNamespaceViolation validate_report_namespace_case ditto-vendor "$ARTIFACT_DIGEST" ''
+
+core_with_vendor=$scratch/core-with-vendor.json
+vendor_with_core=$scratch/vendor-with-core.json
+jq '.vendorOutcome = {id:"foreign",outcome:"Pass",reasonCode:"Foreign",required:false,durationSeconds:0}' \
+  "$happy_core_report" >"$core_with_vendor"
+jq '.journeys = []' "$happy_vendor_report" >"$vendor_with_core"
+expect_refusal ReportNamespaceViolation "$work/scripts/ci/environment-report.sh" \
+  --kind core --input "$happy_vendor_report" --output "$scratch/vendor-as-core.json"
+expect_refusal ReportNamespaceViolation "$work/scripts/ci/environment-report.sh" \
+  --kind vendor --input "$happy_core_report" --output "$scratch/core-as-vendor.json"
+expect_refusal ReportNamespaceViolation "$work/scripts/ci/environment-report.sh" \
+  --kind core --input "$core_with_vendor" --output "$scratch/core-cross-field.json"
+expect_refusal ReportNamespaceViolation "$work/scripts/ci/environment-report.sh" \
+  --kind vendor --input "$vendor_with_core" --output "$scratch/vendor-cross-field.json"
+
+legacy_core=$scratch/legacy-core-report.json
+legacy_vendor=$scratch/legacy-vendor-report.json
+legacy_runtime=$scratch/legacy-garden-runtime.json
+jq '
+  del(.namespaceLifecycle,.checkpointChain,
+      .instance.clusterId,.instance.osId,.instance.osVersion,.instance.k3sVersion,
+      .instance.kubernetesVersion,.instance.nodeCount,.instance.capacity,
+      .tooling.nscVersion,.tooling.sourceArchiveDigest,.tooling.artifactSubjectDigest,
+      .evidence.proofBundle,
+      .evidence.egressCanary.profileId,.evidence.egressCanary.enforcement,
+      .evidence.egressCanary.platformStatus,.evidence.egressCanary.hostileProbes,
+      .timings.createToKubernetesReadySeconds,.timings.driverTransferSetupSeconds,
+      .timings.renderApplySeconds,.timings.collectionSeconds,.timings.destroySeconds,
+      .timings.totalColdSeconds)
+' "$happy_core_report" >"$legacy_core"
+jq '
+  del(.namespaceLifecycle,.checkpointChain,
+      .instance.clusterId,.instance.osId,.instance.osVersion,.instance.k3sVersion,
+      .instance.kubernetesVersion,.instance.nodeCount,.instance.capacity,
+      .tooling.nscVersion,.tooling.sourceArchiveDigest,.tooling.artifactSubjectDigest,
+      .evidence.proofBundle,
+      .evidence.egressCanary.profileId,.evidence.egressCanary.enforcement,
+      .evidence.egressCanary.platformStatus,.evidence.egressCanary.hostileProbes,
+      .timings.createToKubernetesReadySeconds,.timings.driverTransferSetupSeconds,
+      .timings.renderApplySeconds,.timings.collectionSeconds,.timings.destroySeconds,
+      .timings.totalColdSeconds) |
+  .credential.issuer = "host-owned-broker"
+' "$happy_vendor_report" >"$legacy_vendor"
+jq -n --arg digest "$ARTIFACT_DIGEST" '
+  {apiVersion:"diene-runtime/v1",profile:"ditto",buildMode:"build-local",
+   owner:{repositoryId:"12345",repositoryKey:"AtomiCloud/example",
+     allocationKey:"legacy-allocation",generationKey:"legacy-generation",gardenOwnedField:"retained"},
+   substrate:{kind:"k3d",name:"opaque-compatibility-name",receipt:"legacy-receipt",
+     kubeconfig:"/run/legacy/kubeconfig",context:"legacy-context",gardenOwnedField:true},
+   artifact:{digest:$digest,gardenOwnedField:"retained"},gardenOwnedTopLevel:{retained:true}}
+' >"$legacy_runtime"
+
+validator=${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}
+schema_dir=$work/schemas/ci
+"$validator" --base-uri "file://$schema_dir/" \
+  --schemafile "$schema_dir/diene-environment-report-v1.schema.json" "$legacy_core" >/dev/null ||
+  fail 'the additive Namespace schema rejected a previously valid core report'
+"$validator" --base-uri "file://$schema_dir/" \
+  --schemafile "$schema_dir/diene-vendor-report-v1.schema.json" "$legacy_vendor" >/dev/null ||
+  fail 'the additive Namespace schema rejected a previously valid vendor report'
+"$validator" --base-uri "file://$schema_dir/" \
+  --schemafile "$schema_dir/diene-runtime-consumption-v1.schema.json" "$legacy_runtime" >/dev/null ||
+  fail 'the Garden consumption view required CI-owned Namespace fields'
+ok 'legacy core/vendor reports and the Garden-owned runtime view remain backward compatible'
+
+printf '== every leakage encoding is suppressed on every evidence surface ==\n'
+
+jq -e '
+  .evidence.leakageScan.outcome == "Pass" and
+  .evidence.leakageScan.encodings ==
+    ["raw","base64","url-encoded","json-escaped","newline-normalized","kubeconfig-embedded"] and
+  (.evidence.leakageScan.scannedPaths | length) >= 3
+' "$happy_core_report" >/dev/null || fail 'the clean lifecycle did not record the complete leakage scan vocabulary'
+ok 'a clean outer proof records all six leakage encodings and scanned surfaces'
+
+leak_interface=$scratch/leak-interface
+install -d -m 0700 "$leak_interface/staging" "$leak_interface/proof" "$leak_interface/runner"
+for required_surface in stdout stderr argv environ; do : >"$leak_interface/staging/$required_surface"; done
+: >"$leak_interface/github-output"
+: >"$leak_interface/github-env"
+: >"$leak_interface/summary"
+expect_refusal EvidenceLeakDetected env -u DIENE_LEAK_CANARY \
+  DIENE_EVIDENCE_STAGING="$leak_interface/staging" DIENE_PROOF_BUNDLE_DIR="$leak_interface/proof" \
+  DIENE_SCHEMA_DIR="$schema_dir" RUNNER_TEMP="$leak_interface/runner" \
+  GITHUB_OUTPUT="$leak_interface/github-output" GITHUB_ENV="$leak_interface/github-env" \
+  GITHUB_STEP_SUMMARY="$leak_interface/summary" "$work/scripts/ci/environment-report.sh" \
+  --kind core --input "$happy_core_report" --output "$leak_interface/no-canary.json"
+rm -f -- "$leak_interface/staging/stderr"
+expect_refusal EvidenceLeakageInterfaceUnavailable env DIENE_LEAK_CANARY=interface-canary \
+  DIENE_EVIDENCE_STAGING="$leak_interface/staging" DIENE_PROOF_BUNDLE_DIR="$leak_interface/proof" \
+  DIENE_SCHEMA_DIR="$schema_dir" RUNNER_TEMP="$leak_interface/runner" \
+  GITHUB_OUTPUT="$leak_interface/github-output" GITHUB_ENV="$leak_interface/github-env" \
+  GITHUB_STEP_SUMMARY="$leak_interface/summary" "$work/scripts/ci/environment-report.sh" \
+  --kind core --input "$happy_core_report" --output "$leak_interface/missing-surface.json"
+
+leak_canary=$'line one/+"?&\nline two'
+leak_base64=$(printf '%s' "$leak_canary" | base64 | tr -d '\n')
+leak_url=$(jq -rn --arg value "$leak_canary" '$value | @uri')
+leak_json=$(jq -rn --arg value "$leak_canary" '$value | tojson | .[1:-1]')
+leak_newline=$(printf '%s' "$leak_canary" | tr '\n' ' ')
+leak_kubeconfig=$(printf '%s' "$leak_base64" | base64 | tr -d '\n')
+leak_encoding_names=(raw base64 url-encoded json-escaped newline-normalized kubeconfig-embedded)
+leak_encoding_values=("$leak_canary" "$leak_base64" "$leak_url" "$leak_json" "$leak_newline" "$leak_kubeconfig")
+leak_surfaces=(argv stdout stderr environ garden-json workspace runner-temp github-env github-output summary cache candidate-artifact)
+leak_cases=0
+for leak_surface in "${leak_surfaces[@]}"; do
+  for leak_index in "${!leak_encoding_names[@]}"; do
+    leak_encoding=${leak_encoding_names[$leak_index]}
+    leak_value=${leak_encoding_values[$leak_index]}
+    leak_case=$scratch/leak-matrix/$leak_surface/$leak_encoding
+    leak_staging=$leak_case/staging
+    leak_proof=$leak_case/proof
+    leak_runner=$leak_case/runner
+    leak_workspace=$leak_case/workspace
+    leak_cache=$leak_case/cache
+    install -d -m 0700 "$leak_staging" "$leak_proof" "$leak_runner/extra" \
+      "$leak_workspace" "$leak_cache"
+    for required_surface in stdout stderr argv environ; do : >"$leak_staging/$required_surface"; done
+    leak_output_file=$leak_case/github-output
+    leak_env_file=$leak_case/github-env
+    leak_summary_file=$leak_case/summary
+    : >"$leak_output_file"
+    : >"$leak_env_file"
+    : >"$leak_summary_file"
+    case $leak_surface in
+      argv | stdout | stderr | environ) leak_target=$leak_staging/$leak_surface ;;
+      garden-json) leak_target=$leak_proof/garden-command.json ;;
+      workspace) leak_target=$leak_workspace/leak.txt ;;
+      runner-temp) leak_target=$leak_runner/extra/leak.txt ;;
+      github-env) leak_target=$leak_env_file ;;
+      github-output) leak_target=$leak_output_file ;;
+      summary) leak_target=$leak_summary_file ;;
+      cache) leak_target=$leak_cache/leak.txt ;;
+      candidate-artifact) leak_target=$leak_proof/candidate-artifact.tar ;;
+      *) fail "unknown leakage test surface $leak_surface" ;;
+    esac
+    printf '%s' "$leak_value" >"$leak_target"
+    if DIENE_LEAK_CANARY="$leak_canary" DIENE_EVIDENCE_STAGING="$leak_staging" \
+      DIENE_PROOF_BUNDLE_DIR="$leak_proof" DIENE_SCHEMA_DIR="$schema_dir" RUNNER_TEMP="$leak_runner" \
+      GITHUB_WORKSPACE="$leak_workspace" GITHUB_OUTPUT="$leak_output_file" GITHUB_ENV="$leak_env_file" \
+      GITHUB_STEP_SUMMARY="$leak_summary_file" DIENE_CACHE_DIR="$leak_cache" \
+      "$work/scripts/ci/environment-report.sh" --kind core --input "$happy_core_report" \
+        --output "$leak_case/published.json" >"$leak_case/out" 2>"$leak_case/err"; then
+      fail "$leak_encoding leakage on $leak_surface was published"
+    fi
+    grep -Fq EvidenceLeakDetected "$leak_case/err" || {
+      sed -n '1,120p' "$leak_case/err" >&2
+      fail "$leak_encoding leakage on $leak_surface lost its stable refusal"
+    }
+    [[ ! -e $leak_case/published.json ]] || fail "$leak_encoding leakage left a candidate report"
+    leak_cases=$((leak_cases + 1))
+  done
+  ok "all six leakage encodings are suppressed on $leak_surface"
+done
+[[ $leak_cases == 72 ]] || fail 'the complete six-by-twelve leakage matrix did not execute'
+
+printf '== archive membership consumes tar output without SIGPIPE ==\n'
+
+require_source_members_case() (
+  # shellcheck source=/dev/null
+  source "$work/scripts/ci/environment-lib.sh"
+  diene_require_archive_members "$@"
+)
+for _ in {1..64}; do
+  require_source_members_case "$source_archive" \
+    scripts/ci/environment-k3d-run.sh \
+    schemas/ci/diene-environment-report-v1.schema.json
+done
+if rg -n 'tar[[:space:]]+-tf[^|]*\|[[:space:]]*grep[^[:space:]]*[[:space:]]+-[^[:space:]]*q' \
+  "$work/scripts/ci/environment-k3d-run.sh" >"$scratch/tar-grep-q"; then
+  sed -n '1,120p' "$scratch/tar-grep-q" >&2
+  fail 'a timing-sensitive tar-to-grep-q membership pipeline remains'
+fi
+ok '64 repeated source-archive checks consume one complete listing without SIGPIPE'
+expect_refusal UntrustedSubject require_source_members_case "$source_archive" missing/driver.sh
+
+printf '== checkpoint chains refuse broken, resumed, and retry-to-green tails ==\n'
+
+checkpoint_validate_case() (
+  # shellcheck source=/dev/null
+  source "$work/scripts/ci/environment-lib.sh"
+  diene_checkpoint_validate "${1:?checkpoint required}"
+)
+checkpoint_seal_final_case() (
+  # shellcheck source=/dev/null
+  source "$work/scripts/ci/environment-lib.sh"
+  diene_checkpoint_seal "${1:?checkpoint required}" true
+)
+
+checkpoint_clean=$scratch/checkpoint-clean.json
+(
+  # shellcheck source=/dev/null
+  source "$work/scripts/ci/environment-lib.sh"
+  diene_checkpoint_init "$checkpoint_clean" "$ARTIFACT_DIGEST"
+  diene_checkpoint_append "$checkpoint_clean" instance-preflight Pass "$ATTESTATION_DIGEST" false
+  diene_checkpoint_append "$checkpoint_clean" environment-ready Pass "$CLOSURE_DIGEST" false
+  diene_checkpoint_append "$checkpoint_clean" final-clean-pass Pass "$GARDEN_DIGEST" false
+  diene_checkpoint_seal "$checkpoint_clean" true
+)
+jq -e '.validated == true and .resumedLegs == 0 and .finalCleanPass == true and
+  (.checkpoints | length) == 3 and .checkpoints[-1].id == "final-clean-pass" and
+  all(.checkpoints[]; .outcome == "Pass" and .resumed == false)' "$checkpoint_clean" >/dev/null ||
+  fail 'a complete clean predecessor chain did not seal'
+ok 'a complete non-resumed predecessor chain seals as the final clean full pass'
+
+checkpoint_broken=$scratch/checkpoint-broken.json
+cp "$checkpoint_clean" "$checkpoint_broken"
+jq '.checkpoints[1].predecessorDigest = "sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
+  "$checkpoint_broken" >"$checkpoint_broken.tmp"
+mv "$checkpoint_broken.tmp" "$checkpoint_broken"
+expect_refusal CheckpointChainInvalid checkpoint_validate_case "$checkpoint_broken"
+
+checkpoint_resumed=$scratch/checkpoint-resumed.json
+(
+  # shellcheck source=/dev/null
+  source "$work/scripts/ci/environment-lib.sh"
+  diene_checkpoint_init "$checkpoint_resumed" "$ARTIFACT_DIGEST"
+  diene_checkpoint_append "$checkpoint_resumed" resumed-readiness Pass "$ATTESTATION_DIGEST" true
+  diene_checkpoint_append "$checkpoint_resumed" final-clean-pass Pass "$GARDEN_DIGEST" false
+  diene_checkpoint_seal "$checkpoint_resumed" false
+)
+expect_refusal FinalCleanPassRequired checkpoint_seal_final_case "$checkpoint_resumed"
+
+checkpoint_failed=$scratch/checkpoint-failed.json
+(
+  # shellcheck source=/dev/null
+  source "$work/scripts/ci/environment-lib.sh"
+  diene_checkpoint_init "$checkpoint_failed" "$ARTIFACT_DIGEST"
+  diene_checkpoint_append "$checkpoint_failed" failed-journey Fail "$ATTESTATION_DIGEST" false
+  diene_checkpoint_append "$checkpoint_failed" final-clean-pass Pass "$GARDEN_DIGEST" false
+  diene_checkpoint_seal "$checkpoint_failed" false
+)
+expect_refusal FinalCleanPassRequired checkpoint_seal_final_case "$checkpoint_failed"
+
+checkpoint_no_final=$scratch/checkpoint-no-final.json
+(
+  # shellcheck source=/dev/null
+  source "$work/scripts/ci/environment-lib.sh"
+  diene_checkpoint_init "$checkpoint_no_final" "$ARTIFACT_DIGEST"
+  diene_checkpoint_append "$checkpoint_no_final" environment-ready Pass "$GARDEN_DIGEST" false
+  diene_checkpoint_seal "$checkpoint_no_final" false
+)
+expect_refusal FinalCleanPassRequired checkpoint_seal_final_case "$checkpoint_no_final"
+
+for forged_kind in resumed failed; do
+  forged_report=$scratch/forged-$forged_kind-report.json
+  if [[ $forged_kind == resumed ]]; then
+    jq '.checkpointChain.checkpoints[0].resumed = true' "$happy_core_report" >"$forged_report"
+  else
+    jq '.checkpointChain.checkpoints[0].outcome = "Fail"' "$happy_core_report" >"$forged_report"
+  fi
+  if "$validator" --base-uri "file://$schema_dir/" \
+    --schemafile "$schema_dir/diene-environment-report-v1.schema.json" "$forged_report" >/dev/null 2>&1; then
+    fail "a green Namespace report forged a $forged_kind checkpoint behind clean summary booleans"
+  fi
+done
+ok 'green report schemas reject resumed or failed checkpoint entries behind forged clean summaries'
+
+expect_lifecycle_failure 7201 checkpoint-broken CheckpointChainInvalid
+! find "$FAILURE_NSC_ROOT/instances" -name live -print -quit | grep -q . ||
+  fail 'broken predecessor evidence left its exact Namespace instance live'
+expect_lifecycle_failure 7202 checkpoint-resumed FinalCleanPassRequired
+! find "$FAILURE_NSC_ROOT/instances" -name live -print -quit | grep -q . ||
+  fail 'resumed checkpoint evidence left its exact Namespace instance live'
+expect_lifecycle_failure 7203 checkpoint-no-final FinalCleanPassRequired
+! find "$FAILURE_NSC_ROOT/instances" -name live -print -quit | grep -q . ||
+  fail 'missing final-clean evidence left its exact Namespace instance live'
+ok 'broken, resumed, and incomplete checkpoint archives stay red after exact destroy and absence proof'
 
 printf '\nenvironment contract checkpoint: PASS (%d checks)\n' "$passed"

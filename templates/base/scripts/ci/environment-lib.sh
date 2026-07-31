@@ -65,6 +65,28 @@ diene_write_json() {
   mv -- "$tmp" "$target"
 }
 
+diene_require_archive_members() {
+  local archive=${1:?archive required}
+  shift
+  (($# > 0)) || diene_die InputContractInvalid 'at least one required archive member must be declared'
+  [[ -f $archive && ! -L $archive ]] ||
+    diene_die UntrustedSubject 'source archive is absent or not a regular file'
+  local listing member
+  listing=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-archive-list.XXXXXX") ||
+    diene_die UntrustedSubject 'could not allocate a source archive listing'
+  if ! tar -tf "$archive" >"$listing"; then
+    rm -f -- "$listing"
+    diene_die UntrustedSubject 'source archive could not be listed completely'
+  fi
+  for member in "$@"; do
+    if ! grep -Fx -- "$member" "$listing" >/dev/null; then
+      rm -f -- "$listing"
+      diene_die UntrustedSubject "source archive does not carry required member $member"
+    fi
+  done
+  rm -f -- "$listing"
+}
+
 # ---------------------------------------------------------------------------
 # JSON Schema validation.
 # ---------------------------------------------------------------------------
@@ -544,10 +566,13 @@ diene_checkpoint_seal() {
   local file=${1:?checkpoint file required}
   local require_final=${2:-false}
   diene_checkpoint_validate "$file"
-  local final_clean=false
+  local final_clean=false all_pass=false
+  if jq -e 'all(.checkpoints[]; .outcome == "Pass")' "$file" >/dev/null; then
+    all_pass=true
+  fi
   if [[ $(jq -r '.checkpoints[-1].id' "$file") == final-clean-pass &&
     $(jq -r '.checkpoints[-1].outcome' "$file") == Pass &&
-    $DIENE_CHECKPOINT_RESUMED_COUNT == 0 ]]; then
+    $DIENE_CHECKPOINT_RESUMED_COUNT == 0 && $all_pass == true ]]; then
     final_clean=true
   fi
   [[ $require_final != true || $final_clean == true ]] ||
@@ -838,7 +863,7 @@ diene_preflow_start() {
     DIENE_PREFLOW_HOST DIENE_PREFLOW_ADAPTER
   local waited=0
   while ((waited < 20)); do
-    ss -Htn state established dst "$host:$port" | grep -q . && return 0
+    ss -Htn state established dst "$host:$port" | grep . >/dev/null && return 0
     kill -0 "$DIENE_PREFLOW_PID" 2>/dev/null || break
     sleep 0.1
     waited=$((waited + 1))
@@ -871,7 +896,7 @@ diene_policy_exec() {
 
 diene_policy_hook_present() {
   local binary=${1:?binary required} base=${2:?base chain required} chain=${3:?receipt chain required}
-  "$binary" -w 5 -S "$base" 2>/dev/null | grep -Fqx -- "-A $base -j $chain"
+  "$binary" -w 5 -S "$base" 2>/dev/null | grep -Fx -- "-A $base -j $chain" >/dev/null
 }
 
 # Idempotent exact cleanup for both complete policies and partially installed
@@ -939,7 +964,7 @@ diene_apply_interim_policy() {
   local iptables_bin=${DIENE_IPTABLES_BIN:-/sbin/iptables}
   local ip6tables_bin=${DIENE_IP6TABLES_BIN:-/sbin/ip6tables}
   diene_require_command "$iptables_bin"
-  "$iptables_bin" --version | grep -Fq nf_tables ||
+  "$iptables_bin" --version | grep -F nf_tables >/dev/null ||
     diene_die InterimPolicyUnavailable 'iptables is not using the measured nf_tables backend'
 
   local hash out_chain forward_chain out6_chain forward6_chain
@@ -1006,7 +1031,7 @@ diene_apply_interim_policy() {
     local ipv6_armed=false
     if [[ $ipv6_disabled != 1 ]]; then
       diene_require_command "$ip6tables_bin"
-      "$ip6tables_bin" --version | grep -Fq nf_tables ||
+      "$ip6tables_bin" --version | grep -F nf_tables >/dev/null ||
         diene_die InterimPolicyUnavailable 'ip6tables is not using the measured nf_tables backend'
       diene_policy_exec "$ip6tables_bin" -w 5 -N "$out6_chain"
       diene_policy_exec "$ip6tables_bin" -w 5 -N "$forward6_chain"
