@@ -138,9 +138,9 @@ The weekly schedule reaches fleet independence and nothing else.
 ## Lane semantics
 
 - Ditto build-local and target-pull select the same vendor-free journeys and
-  both run under a generated host **allowlist**: DNS and the default route are
-  denied, so an unlisted system is unreachable by literal IP and by alternate
-  DNS alike. Target-pull additionally requires `ArtifactPullReady` to be a
+  both run under the `allowlist` posture: DNS and the default route are denied,
+  so an unlisted system is unreachable by literal IP and by alternate DNS
+  alike. Target-pull additionally requires `ArtifactPullReady` to be a
   required, passing leaf and a read identity distinct from the publisher.
 - Vendor actions come only from `.diene/ci/vendors.v1.yaml`, currently only
   the ratified K9 demo exception. They use `ci-ditto-vendor`, an exact declared
@@ -170,9 +170,41 @@ local lane, and Absol and the independence fixture must report `SeedReady`
 
 The egress posture, the receipt, and the EXIT/TERM/INT traps are all
 established **before** `pls env up`, so a run cancelled inside the substrate
-mutation still converges instead of orphaning a cluster or leaving host denial
-applied. Cleanup executes the ratified `pls env down --profile <ditto|absol>`
-against the exact runtime file, then releases the egress posture.
+mutation still converges instead of orphaning a cluster. Cleanup executes the
+ratified `pls env down --profile <ditto|absol>` against the exact runtime file,
+then requests deferred cleanup of the egress posture.
+
+### The host-policy seam
+
+The egress interface is runner-owned and its ABI is exactly two verbs:
+
+```text
+diene-host-policy apply   --receipt <id> --allow-file <diene-host-policy/v1>
+diene-host-policy release --receipt <id>
+```
+
+The lane generates the document; the runner enforces it in the host namespace.
+`mode` is the canonical wire enum `allowlist | closure-denied-network`, used
+unchanged end to end — emitted in the document, recorded on the receipt, and
+reported in the evidence.
+
+`release` is **deferred and non-destructive by contract**. It runs as the very
+principal the policy constrains, so if it deleted anything a lane could invoke
+it with its own known receipt at lane start and restore its own egress.
+Deletion belongs solely to the root-owned runner teardown transition. The lane
+records `PolicyReleaseRequested:Deferred` and never treats it as proof the
+enforcing table is gone.
+
+Lane CIDRs are runner-owned too: they are read from the `0440` isolation
+receipt at `$DIENE_ISOLATION_FILE`, never copied into this template as
+constants and never re-derived from the runner's path layout. A duplicated
+constant is exactly how two arms drift apart.
+
+Lifetime attestation is likewise not the lane's to claim. `apply` proves the
+metadata endpoint denied from outside the lane namespace at apply time, which
+the lane cannot defeat; that the posture held for the whole lane is evidence
+the root-owned teardown produces and the controller-owned
+`environment-runner-lifecycle` check carries.
 
 The post-job sweep is always parameterized by repository ID, run ID, run
 attempt, and opaque receipt ID — the exact four-selector interface, never
@@ -219,7 +251,8 @@ coverage.
 | Blocker | Reason code | Effect |
 | --- | --- | --- |
 | No runtime-free executable render | `ProfileRenderInterfaceUnavailable` | A repository that has declared an environment lock fails the profile gate. `DIENE_PROFILE_RENDER_BIN` makes it executable with no template change; repos without a lock stay `NotApplicable`/green. |
-| No root-owned host egress broker | `HostPolicyInterfaceUnavailable` | Every runtime lane refuses. A job holds `CAP_NET_ADMIN`, so any nft table it installs in its own namespace is a cooperative setting it can flush — not a boundary. The broker must enforce in a host layer the job cannot mutate, publish the receipt-assigned lane CIDRs (never a broad constant), and attest afterwards that the posture was actually held. The job side may only *request* deferred cleanup: the outer table persists until root-owned runner teardown, so a job that knows its own receipt cannot dissolve the enforcement containing it. |
+| No runner host-policy client or isolation receipt | `HostPolicyInterfaceUnavailable` | Every runtime lane refuses. A job holds `CAP_NET_ADMIN`, so any nft table it installs in its own namespace is a cooperative setting it can flush — not a boundary. Enforcement lives in a root-owned host layer the job cannot mutate. |
+| No enforceable connected endpoint | `ConnectedEgressInterfaceUnavailable` | The connected Ditto lanes refuse. The enforcement layer denies DNS and admits only literal addresses, so a bare hostname such as `ghcr.io:443` could never be enforced; the template refuses rather than emitting one the conductor would reject, or worse, one it would accept as if enforced. |
 | No closure signature/certificate/Rekor verification or exact-set equality | `ClosureAttestationInterfaceUnavailable` | Absol refuses; both are mandatory results in the lane table. |
 | No real-pull / evict-repull / sibling-denial / pull-secret-ownership / credential-removal proof | `RequiredCoverageUnavailable` | target-pull refuses; all five are required results. |
 | No vendor egress proxy or credential broker | `VendorBrokerInterfaceUnavailable` | The vendor lane refuses. nft can express neither SNI nor HTTP methods, and a step-injected secret is live during preflight, substrate creation and readiness, so it is not phase-scoped in any meaningful sense. |

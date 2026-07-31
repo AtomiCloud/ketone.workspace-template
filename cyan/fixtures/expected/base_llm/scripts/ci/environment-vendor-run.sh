@@ -336,7 +336,15 @@ trap 'on_signal 130' INT
 # ---------------------------------------------------------------------------
 
 allow_file="$runtime_dir/host-policy.json"
+# The declared egress is DNS + SNI + method. The enforcement layer refuses bare
+# hostnames and cannot express SNI or methods at all, so these entries are
+# unenforceable by construction. This is unreachable in practice — the broker
+# gate above already refused — but it must never silently emit a hostname the
+# conductor would reject or, worse, one it would accept as if enforced.
 mapfile -t egress_entries < <(jq -r '.egress[] | "\(.dns):\(.port)"' "$action_file")
+for egress_entry in "${egress_entries[@]}"; do
+  diene_require_literal_endpoint "$egress_entry"
+done
 diene_write_allow_file "$allow_file" allowlist "${egress_entries[@]}"
 diene_host_policy_apply "$receipt_id" "$allow_file"
 policy_applied=1
