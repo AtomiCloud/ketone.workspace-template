@@ -124,6 +124,10 @@ nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64
 Rotating the runner OS rotates the tag (the 24.04 fallback uses
 `nscloud-cache-tag-atomi-nix-store-cache-ubuntu-24.04-amd64`), so stores never cross OS versions.
 
+The tag is only carried by **cache-eligible** jobs, which run on a `-with-cache` venue label such
+as `nscloud-ubuntu-26.04-amd64-16x32-with-cache`. Lanes that must **not** share a cache run on the
+bare venue label and carry no cache tag at all.
+
 ### Platform / Service usage
 
 The platform and service identify the service in the LPSM tree and appear in published
