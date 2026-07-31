@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - 'main'
+  pull_request:
+    branches:
+      - 'main'
 
 env:
   DOCKER_DOMAIN: ghcr.io
@@ -28,6 +31,9 @@ jobs:
         run: cyanprint test template .
   publish:
     needs: test
+    # Publishing stays push-only: pull requests run the test job and stop there, so they
+    # never log into the registry, never publish, and never need the release secrets.
+    if: github.event_name == 'push'
     name: Publish
     runs-on: ubuntu-22.04
     steps:
