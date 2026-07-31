@@ -157,7 +157,7 @@
     "evidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["leakageScan", "egressCanary"],
+      "required": ["leakageScan", "egressCanary", "shipment"],
       "properties": {
         "leakageScan": {
           "type": "object",
@@ -178,6 +178,16 @@
             "outcome": { "enum": ["Pass", "Fail", "NotRequired", "Unavailable"] },
             "reasonCode": { "type": "string", "minLength": 1 },
             "mode": { "enum": ["allowlist", "closure-denied-network"] }
+          }
+        },
+        "shipment": {
+          "description": "Whether the sealed evidence can actually leave the guest. It is Unavailable until a courier endpoint and a digest-bound acknowledgement exist, so a green lane is never misread as evidence shipped. The transport is a release gate, not a lane obligation.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outcome", "reasonCode"],
+          "properties": {
+            "outcome": { "enum": ["Pass", "Unavailable"] },
+            "reasonCode": { "type": "string", "minLength": 1 }
           }
         }
       }
