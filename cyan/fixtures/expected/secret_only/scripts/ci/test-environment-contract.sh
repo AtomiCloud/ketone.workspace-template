@@ -197,8 +197,20 @@ ok 'a sibling lane lease is refused, the matching one is accepted'
 DIENE_GARDEN_LOCK_DIGEST=sha256:$(printf garden | sha256sum | cut -d' ' -f1)
 DIENE_ARTIFACT_DIGEST=sha256:$(printf artifact | sha256sum | cut -d' ' -f1)
 export DIENE_GARDEN_LOCK_DIGEST DIENE_ARTIFACT_DIGEST
-export DIENE_ARTIFACT_IMAGE_REF="ghcr.io/atomicloud/example@$DIENE_ARTIFACT_DIGEST"
-export DIENE_ARTIFACT_PRODUCER_WORKFLOW_REF="AtomiCloud/example/.github/workflows/environment-k3d.yaml@$GITHUB_SHA"
+# The subject handoff carries image ref, producer identity and pull identity;
+# they are deliberately not workflow_call inputs.
+export DIENE_ARTIFACT_SUBJECT=$scratch/subject.v1.json
+write_subject() {
+  jq -n --arg sha "$GITHUB_SHA" --arg digest "$DIENE_ARTIFACT_DIGEST" \
+    --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+    --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" --argjson provenance "${1:-null}" \
+    '{apiVersion:"diene.atomi.cloud/ci-artifact-subject/v1",sourceSha:$sha,
+      artifact:{imageRef:("ghcr.io/atomicloud/example@"+$digest),digest:$digest,registry:"ghcr.io",
+                producer:{workflowRef:$workflowRef,runId:$runId,runAttempt:$runAttempt}}}
+     + (if $provenance == null then {} else {provenance:$provenance} end)' \
+    >"$DIENE_ARTIFACT_SUBJECT"
+}
+write_subject
 
 printf '== profile and prerequisite gates ==\n'
 
@@ -248,12 +260,60 @@ printf '== input contract ==\n'
 DIENE_BASE_WORKFLOW_REF="AtomiCloud/example/.github/workflows/environment-k3d.yaml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
   expect_refusal UntrustedSubject ./scripts/ci/environment-k3d-run.sh --validate-inputs
 : >"$DIENE_TEST_PLS_LOG"
+attest="sha256:$(printf attest | sha256sum | cut -d' ' -f1)"
+
+# A puller identity equal to the publisher is refused, and the identity comes
+# from the validated subject document rather than a caller-supplied input.
+write_subject "$(jq -nc --arg attest "$attest" --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" \
+  '{predicateType:"https://slsa.dev/provenance/v1",provenanceRef:"https://example/prov",
+    attestationDigest:$attest,workflowRef:$workflowRef,runId:"8001",runAttempt:"1",
+    pullIdentity:$workflowRef}')"
 DIENE_LANE=ditto-target-pull \
-  DIENE_ARTIFACT_ATTESTATION_DIGEST="sha256:$(printf attest | sha256sum | cut -d' ' -f1)" \
-  DIENE_ARTIFACT_PULL_IDENTITY="$DIENE_ARTIFACT_PRODUCER_WORKFLOW_REF" \
+  DIENE_ARTIFACT_ATTESTATION_DIGEST="$attest" \
+  DIENE_ARTIFACT_PROVENANCE_REF="https://example/prov" \
   expect_refusal UntrustedSubject ./scripts/ci/environment-k3d-run.sh --validate-inputs
+
+# A caller-substituted provenance selector cannot override the published one.
+write_subject "$(jq -nc --arg attest "$attest" --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" \
+  '{predicateType:"https://slsa.dev/provenance/v1",provenanceRef:"https://example/prov",
+    attestationDigest:$attest,workflowRef:$workflowRef,runId:"8001",runAttempt:"1",
+    pullIdentity:"ghcr-reader-identity"}')"
+DIENE_LANE=ditto-target-pull \
+  DIENE_ARTIFACT_ATTESTATION_DIGEST="$attest" \
+  DIENE_ARTIFACT_PROVENANCE_REF="https://attacker/prov" \
+  expect_refusal UntrustedSubject ./scripts/ci/environment-k3d-run.sh --validate-inputs
+
+# A subject that binds a different run cannot be replayed into this one.
+jq '.artifact.producer.runAttempt = "9"' "$DIENE_ARTIFACT_SUBJECT" >"$scratch/replay.json"
+DIENE_ARTIFACT_SUBJECT="$scratch/replay.json" \
+  expect_refusal UntrustedSubject ./scripts/ci/environment-k3d-run.sh --validate-inputs
+write_subject
 [[ ! -s $DIENE_TEST_PLS_LOG ]] || fail 'a refusal reached the substrate'
 ok 'refusals never touch the substrate'
+
+printf '== workflow ABI is exactly the ratified set ==\n'
+reusable=$repo_root/.github/workflows/⚡reusable-environment-k3d.yaml
+declared=$(awk '/^    inputs:$/{f=1;next} /^    outputs:$/{f=0} f && /^      [a-z_]+:/{gsub(/[ :]/,"",$1);print $1}' "$reusable" | sort)
+expected=$(printf '%s\n' lane repository_id repository_key source_sha garden_lock_digest \
+  artifact_digest artifact_provenance_ref artifact_attestation_digest journey_manifest \
+  vendor_manifest action_id closure_digest closure_bundle_ref closure_signature_bundle_digest \
+  closure_trust_root_digest | sort)
+[[ $declared == "$expected" ]] || {
+  diff <(printf '%s\n' "$expected") <(printf '%s\n' "$declared") >&2
+  fail 'the reusable workflow_call ABI drifted from the ratified input set'
+}
+ok 'workflow_call exposes exactly the ratified diene-ci-k3d/v1 inputs'
+
+for lane in ditto-build-local ditto-target-pull ditto-vendor absol fleet-independence; do
+  group="k3d-\${{ inputs.repository_id }}-\${{ github.run_id }}-\${{ github.run_attempt }}-$lane"
+  [[ $lane != ditto-vendor ]] || group="$group-\${{ inputs.action_id }}"
+  grep -Fq "group: $group" "$reusable" || fail "lane $lane lacks its exact per-run concurrency group"
+done
+ok 'all five lanes carry their exact run-scoped concurrency group'
+
+grep -Fq 'environment: ci-ditto' "$reusable" || fail 'the fleet lane lost its exact environment'
+! grep -Fq 'ci-ditto-independence' "$reusable" || fail 'the fleet lane invented a new environment name'
+ok 'fleet independence uses the exact ci-ditto environment'
 
 printf '== schema validation precedes every pls call ==\n'
 

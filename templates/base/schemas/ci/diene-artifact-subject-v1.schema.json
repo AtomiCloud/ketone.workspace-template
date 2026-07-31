@@ -32,7 +32,7 @@
     {
       "description": "A declaration that carries provenance must bind it to the same source revision as the subject itself.",
       "if": { "required": ["provenance"] },
-      "then": { "properties": { "provenance": { "required": ["predicateType", "attestationDigest", "workflowRef", "runId", "runAttempt"] } } }
+      "then": { "properties": { "provenance": { "required": ["predicateType", "provenanceRef", "attestationDigest", "workflowRef", "runId", "runAttempt"] } } }
     }
   ],
   "$defs": {
@@ -54,9 +54,14 @@
     "provenance": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["predicateType", "attestationDigest", "workflowRef", "runId", "runAttempt"],
+      "required": ["predicateType", "provenanceRef", "attestationDigest", "workflowRef", "runId", "runAttempt"],
       "properties": {
         "predicateType": { "const": "https://slsa.dev/provenance/v1" },
+        "provenanceRef": {
+          "description": "The real, resolvable reference to the published provenance statement. It is emitted by the producer and cross-checked against the workflow_call input of the same name; it is never assembled from run metadata.",
+          "type": "string",
+          "minLength": 1
+        },
         "attestationDigest": { "$ref": "#/$defs/digest" },
         "workflowRef": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$" },
         "runId": { "type": "string", "pattern": "^[1-9][0-9]*$" },

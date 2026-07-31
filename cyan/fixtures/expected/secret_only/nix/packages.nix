@@ -18,6 +18,8 @@ let
         inherit
           actionlint
           check-jsonschema
+          check-jsonschema
+          check-jsonschema
           git
           gitlint
           go-task

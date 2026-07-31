@@ -176,13 +176,11 @@ diene_validate_inputs() {
   [[ ${workflow_ref##*@} == "${GITHUB_SHA}" ]] ||
     diene_die UntrustedSubject 'base workflow ref does not bind source_sha'
 
-  # The subject is repository-declared, never CI-derived.
-  [[ ${DIENE_ARTIFACT_IMAGE_REF:-} =~ @sha256:[0-9a-f]{64}$ ]] ||
-    diene_die ArtifactProducerUnavailable 'artifact image ref must be digest-pinned'
-  [[ ${DIENE_ARTIFACT_IMAGE_REF##*@} == "${DIENE_ARTIFACT_DIGEST}" ]] ||
-    diene_die UntrustedSubject 'artifact image ref and artifact digest disagree'
-  [[ ${DIENE_ARTIFACT_PRODUCER_WORKFLOW_REF:-} =~ ^${repository_key}/\.github/workflows/[^@]+@[0-9a-f]{40}$ ]] ||
-    diene_die ArtifactProducerUnavailable 'artifact producer workflow ref is absent or not repository-owned'
+  # Image ref, producer identity and pull identity are NOT workflow_call
+  # inputs: they live inside the same-run subject document the repository's own
+  # producer emitted, so a caller cannot substitute them. The public ABI stays
+  # exactly the ratified diene-ci-k3d/v1 input set.
+  diene_load_subject
 
   case $lane in
     ditto-build-local | ditto-target-pull | absol | fleet-independence)
@@ -204,12 +202,20 @@ diene_validate_inputs() {
 
   if [[ $lane == ditto-target-pull ]]; then
     diene_require_digest artifact_attestation_digest "${DIENE_ARTIFACT_ATTESTATION_DIGEST:-}"
-    [[ -n ${DIENE_ARTIFACT_PULL_IDENTITY:-} ]] ||
+    [[ -n ${DIENE_ARTIFACT_PROVENANCE_REF:-} ]] ||
+      diene_die InputContractInvalid 'target-pull requires the published provenance reference'
+    # The ratified provenance selector is cross-checked against the validated
+    # subject document rather than assembled from run metadata.
+    [[ ${DIENE_ARTIFACT_PROVENANCE_REF} == "${DIENE_SUBJECT_PROVENANCE_REF}" ]] ||
+      diene_die UntrustedSubject 'artifact_provenance_ref does not match the published provenance'
+    [[ ${DIENE_ARTIFACT_ATTESTATION_DIGEST} == "${DIENE_SUBJECT_ATTESTATION_DIGEST}" ]] ||
+      diene_die UntrustedSubject 'artifact_attestation_digest does not match the published attestation'
+    [[ -n ${DIENE_SUBJECT_PULL_IDENTITY:-} ]] ||
       diene_die InputContractInvalid 'target-pull requires a selected-package read identity'
-    [[ ${DIENE_ARTIFACT_PULL_IDENTITY} != "${DIENE_ARTIFACT_PRODUCER_WORKFLOW_REF}" ]] ||
+    [[ ${DIENE_SUBJECT_PULL_IDENTITY} != "${DIENE_SUBJECT_PRODUCER_WORKFLOW_REF}" ]] ||
       diene_die UntrustedSubject 'puller identity must differ from the publisher'
   else
-    [[ -z ${DIENE_ARTIFACT_ATTESTATION_DIGEST:-} && -z ${DIENE_ARTIFACT_PULL_IDENTITY:-} ]] ||
+    [[ -z ${DIENE_ARTIFACT_ATTESTATION_DIGEST:-} && -z ${DIENE_ARTIFACT_PROVENANCE_REF:-} ]] ||
       diene_die InputContractInvalid 'non-pull lane forbids pull selectors'
   fi
 
@@ -232,6 +238,41 @@ diene_validate_inputs() {
   elif [[ $lane != ditto-vendor ]]; then
     [[ -z ${DIENE_FIXTURE_ID:-} ]] || diene_die InputContractInvalid 'only the independence lane carries a fixture selector'
   fi
+}
+
+# Load the same-run subject document produced by the repository's own
+# artifact-build handoff. Image ref, producer identity, pull identity and the
+# published provenance reference all come from here, never from a
+# caller-supplied workflow input, so the public workflow_call ABI stays exactly
+# the ratified diene-ci-k3d/v1 set.
+diene_load_subject() {
+  local subject=${DIENE_ARTIFACT_SUBJECT:-}
+  [[ -n $subject ]] ||
+    diene_die ArtifactProducerUnavailable 'no same-run artifact subject handoff was provided'
+  [[ -f $subject ]] ||
+    diene_die ArtifactProducerUnavailable 'the artifact subject handoff is absent'
+  diene_schema_validate diene-artifact-subject-v1.schema.json "$subject" 'artifact subject'
+  jq -e \
+    --arg sha "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+    --arg workflowRef "${DIENE_BASE_WORKFLOW_REF:?}" --arg digest "$DIENE_ARTIFACT_DIGEST" '
+      .sourceSha == $sha and .artifact.digest == $digest and
+      .artifact.producer.runId == $runId and .artifact.producer.runAttempt == $runAttempt and
+      .artifact.producer.workflowRef == $workflowRef
+    ' "$subject" >/dev/null ||
+    diene_die UntrustedSubject 'the artifact subject is not a same-run output bound to this workflow, run, attempt and digest'
+
+  DIENE_SUBJECT_IMAGE_REF=$(jq -r '.artifact.imageRef' "$subject")
+  DIENE_SUBJECT_PRODUCER_WORKFLOW_REF=$(jq -r '.artifact.producer.workflowRef' "$subject")
+  DIENE_SUBJECT_PROVENANCE_REF=$(jq -r '.provenance.provenanceRef // ""' "$subject")
+  DIENE_SUBJECT_ATTESTATION_DIGEST=$(jq -r '.provenance.attestationDigest // ""' "$subject")
+  DIENE_SUBJECT_PULL_IDENTITY=$(jq -r '.provenance.pullIdentity // ""' "$subject")
+  export DIENE_SUBJECT_IMAGE_REF DIENE_SUBJECT_PRODUCER_WORKFLOW_REF \
+    DIENE_SUBJECT_PROVENANCE_REF DIENE_SUBJECT_ATTESTATION_DIGEST DIENE_SUBJECT_PULL_IDENTITY
+
+  [[ $DIENE_SUBJECT_IMAGE_REF =~ @sha256:[0-9a-f]{64}$ ]] ||
+    diene_die ArtifactProducerUnavailable 'artifact image ref must be digest-pinned'
+  [[ ${DIENE_SUBJECT_IMAGE_REF##*@} == "$DIENE_ARTIFACT_DIGEST" ]] ||
+    diene_die UntrustedSubject 'artifact image ref and artifact digest disagree'
 }
 
 diene_file_digest() {

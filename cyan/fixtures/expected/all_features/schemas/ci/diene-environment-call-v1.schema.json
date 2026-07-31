@@ -5,23 +5,19 @@
   "description": "The exact workflow_call ABI of the reusable environment workflow. Every caller binds the immutable repository identity, the full source revision, the base workflow path/ref it was dispatched from, the Garden lock digest, and the repository-declared immutable artifact subject. Provenance and closure selectors come from the repository's own artifact-subject declaration; CI never derives or computes them.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["lane", "repository_id", "repository_key", "source_sha", "base_workflow_ref", "garden_lock_digest", "artifact_digest", "artifact_image_ref", "artifact_producer_workflow_ref"],
+  "required": ["lane", "repository_id", "repository_key", "source_sha", "garden_lock_digest", "artifact_digest"],
   "properties": {
     "lane": { "enum": ["ditto-build-local", "ditto-target-pull", "ditto-vendor", "absol", "fleet-independence"] },
     "repository_id": { "type": "integer", "minimum": 1 },
     "repository_key": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+$" },
     "source_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-    "base_workflow_ref": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$" },
     "garden_lock_digest": { "$ref": "#/$defs/digest" },
     "artifact_digest": { "$ref": "#/$defs/digest" },
-    "artifact_image_ref": { "type": "string", "pattern": "@sha256:[0-9a-f]{64}$" },
-    "artifact_producer_workflow_ref": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$" },
+    "artifact_provenance_ref": { "type": "string", "minLength": 1 },
     "artifact_attestation_digest": { "$ref": "#/$defs/digest" },
-    "artifact_pull_identity": { "type": "string", "minLength": 1 },
     "journey_manifest": { "const": ".diene/ci/journeys.v1.yaml" },
     "vendor_manifest": { "const": ".diene/ci/vendors.v1.yaml" },
     "action_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,127}$" },
-    "fixture_id": { "const": "bootstrap-fleet-independence-v1" },
     "closure_digest": { "$ref": "#/$defs/digest" },
     "closure_bundle_ref": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://[^\\s]+$" },
     "closure_signature_bundle_digest": { "$ref": "#/$defs/digest" },
@@ -32,7 +28,7 @@
       "if": { "properties": { "lane": { "const": "ditto-vendor" } }, "required": ["lane"] },
       "then": {
         "required": ["vendor_manifest", "action_id"],
-        "not": { "anyOf": [{ "required": ["journey_manifest"] }, { "required": ["closure_digest"] }, { "required": ["fixture_id"] }] }
+        "not": { "anyOf": [{ "required": ["journey_manifest"] }, { "required": ["closure_digest"] }] }
       },
       "else": {
         "required": ["journey_manifest"],
@@ -40,10 +36,10 @@
       }
     },
     {
-      "description": "target-pull must present the publisher's attestation and a read identity distinct from that publisher.",
+      "description": "target-pull alone presents the published provenance and attestation; the read identity distinct from the publisher lives in the validated same-run subject document, not in this ABI.",
       "if": { "properties": { "lane": { "const": "ditto-target-pull" } }, "required": ["lane"] },
-      "then": { "required": ["artifact_attestation_digest", "artifact_pull_identity"] },
-      "else": { "not": { "required": ["artifact_pull_identity"] } }
+      "then": { "required": ["artifact_provenance_ref", "artifact_attestation_digest"] },
+      "else": { "not": { "anyOf": [{ "required": ["artifact_provenance_ref"] }, { "required": ["artifact_attestation_digest"] }] } }
     },
     {
       "if": { "properties": { "lane": { "const": "absol" } }, "required": ["lane"] },
@@ -51,8 +47,8 @@
       "else": { "not": { "anyOf": [{ "required": ["closure_digest"] }, { "required": ["closure_bundle_ref"] }, { "required": ["closure_signature_bundle_digest"] }, { "required": ["closure_trust_root_digest"] }] } }
     },
     {
-      "if": { "properties": { "lane": { "const": "fleet-independence" } }, "required": ["lane"] },
-      "then": { "required": ["fixture_id"] }
+      "description": "The independence fixture is fixed by the contract, not selected by a caller, so no fixture selector is expressible in this ABI.",
+      "not": { "required": ["fixture_id"] }
     }
   ],
   "$defs": {

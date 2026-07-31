@@ -70,13 +70,22 @@ GitHub-hosted authorization path has accepted the controller/image pin, the
 ## Trust and subjects
 
 The reusable workflow first validates selectors and immutable subjects on
-`ubuntu-24.04`; invalid calls never select a disposable runner. Protected
-callers bind repository numeric ID and canonical key, full source SHA, base
-workflow path/ref, run/attempt, Garden lock digest, artifact digest and image
-ref, and, when applicable, attestation/pull identity or
-closure/bundle/signature/trust-root digests. The base workflow ref is checked
-against `github.workflow_sha`, so a substituted or stale workflow identity
-refuses. Runtime labels are the fixed four image labels plus one deterministic
+`ubuntu-24.04`; invalid calls never select a disposable runner.
+
+Its `workflow_call` surface is exactly the ratified `diene-ci-k3d/v1` set:
+`lane`, `repository_id`, `repository_key`, `source_sha`, `garden_lock_digest`,
+`artifact_digest`, `artifact_provenance_ref`, `artifact_attestation_digest`,
+`journey_manifest`, `vendor_manifest`, `action_id` and the four closure
+selectors. Nothing else is accepted, and a contract test asserts the input list
+has not drifted. In particular the image ref, the producer identity and the
+selected-package read identity are **not** inputs — they live inside the
+validated same-run subject document, so a caller cannot substitute a subject
+the producer never made — and the independence fixture is hard-coded rather
+than selected. The base workflow identity is derived inside the workflow from
+`github.workflow_ref` and `github.workflow_sha` and must equal the revision
+under test, so a substituted or stale workflow identity refuses.
+
+Runtime labels are the fixed four image labels plus one deterministic
 job label, and the runner lease must carry **that job's** label — a lease
 minted for a sibling lane of the same run is refused. Fork, Dependabot,
 unprotected, substituted, mutable, or stale tuples refuse before credentials,
@@ -99,7 +108,23 @@ receiptId     = <allocationKey>-<generationKey>
 ```
 
 Parallel lanes of one workflow run therefore never share a receipt, a runtime
-directory, or a cleanup selector.
+directory, or a cleanup selector. Each runtime job additionally carries its own
+run-scoped concurrency group
+(`k3d-<repositoryId>-<runId>-<runAttempt>-<lane>`, plus `-<actionId>` for the
+vendor lane) with `cancel-in-progress: false`, so unrelated runs are never
+serialised against each other.
+
+## Trigger matrix
+
+| Lane | Events |
+| --- | --- |
+| `environment-ditto-build-local` | protected push, authorized dispatch |
+| `environment-ditto-target-pull` | protected push, authorized dispatch |
+| `environment-absol` | protected push, or dispatch with `release_candidate` |
+| `environment-fleet-independence` | protected push, weekly schedule |
+| `environment-ditto-vendor` | explicit dispatch only |
+
+The weekly schedule reaches fleet independence and nothing else.
 
 ## Lane semantics
 
@@ -117,9 +142,10 @@ directory, or a cleanup selector.
   `pls closure preflight --denied-network` before any Docker volume or k3d
   cluster exists, imports with `pls closure import`, and never releases denial:
   it stays active through teardown.
-- Fleet independence is exactly Ditto/build-local with
-  `bootstrap-fleet-independence-v1`, in its own `ci-ditto-independence`
-  environment so it cannot inherit the ordinary Ditto seed-fetch identity.
+- Fleet independence is exactly Ditto/build-local with the hard-coded
+  `bootstrap-fleet-independence-v1` fixture, in the `ci-ditto` environment.
+  Environment secrets are only injected where a workflow references them, and
+  this lane references none, so it holds no seed-fetch identity.
 
 ## Readiness
 
