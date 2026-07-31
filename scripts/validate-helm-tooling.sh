@@ -201,7 +201,7 @@ require_inherited_from_channel() {
       code = 4
       next
     }
-    bound && $1 == "inherit" { in_inherit = 1; next }
+    bound && $0 ~ /^[[:space:]]*inherit[[:space:]]*$/ { in_inherit = 1; next }
     in_inherit && $1 == ";" { in_inherit = 0; next }
     in_inherit && $1 == tool { code = 0; exit }
     $1 == ");" { exit }
