@@ -551,6 +551,8 @@ prepare_run() {
   unset DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST DIENE_CLOSURE_TRUST_ROOT_DIGEST
   unset DIENE_NAMESPACE_INGRESS DIENE_PUBLIC_ENDPOINT DIENE_NSC_CACHE_TAG DIENE_CACHE_DIR
   unset DIENE_SEED_IDENTITY DIENE_VENDOR_CREDENTIAL DIENE_NSC_MACHINE_TYPE GITHUB_WORKSPACE
+  unset DIENE_PRE_SIT_NEGATIVE_CANARY DIENE_PRE_SIT_FIXTURE_ROOT
+  unset FAKE_L7_COMPLETE FAKE_PROBE_FAIL_SCOPE FAKE_L7_LOG FAKE_PROBE_LOG FAKE_BROKER_LOG
   if [[ $lane == ditto-target-pull ]]; then
     export DIENE_ARTIFACT_PROVENANCE_REF="oci://ghcr.io/atomicloud/example/provenance/$SOURCE_SHA"
     export DIENE_ARTIFACT_ATTESTATION_DIGEST=$ATTESTATION_DIGEST
@@ -579,3 +581,325 @@ ok 'local fixture and measured fake-nsc surface are ready'
 
 # Test sections are intentionally below the leakage canary section too: a
 # canary refusal must not terminate the parent harness before the final tail.
+
+assert_contains() {
+  local file=${1:?file required} needle=${2:?needle required}
+  grep -Fq -- "$needle" "$file" || fail "$file does not contain $needle"
+}
+
+assert_not_contains() {
+  local file=${1:?file required} needle=${2:?needle required}
+  ! grep -Fq -- "$needle" "$file" || fail "$file unexpectedly contains $needle"
+}
+
+printf '== static workflow and compatibility ABI ==\n'
+
+workflow=$template_root/.github/workflows/⚡reusable-environment-k3d.yaml
+for job in environment-ditto-build-local environment-ditto-target-pull environment-ditto-vendor \
+  environment-absol environment-fleet-independence environment-runner-lifecycle; do
+  grep -Eq "^  ${job}:" "$workflow" || fail "stable workflow job $job is absent"
+done
+ok 'all six runtime/lifecycle job IDs remain stable'
+
+for entrypoint in environment-profile-contract.sh environment-k3d-run.sh environment-vendor-run.sh \
+  environment-report.sh environment-receipt-sweep.sh environment-runner-preflight.sh; do
+  [[ -x $script_dir/$entrypoint ]] || fail "retained entrypoint $entrypoint is absent or non-executable"
+done
+[[ ! -e $script_dir/environment-nsc-lifecycle.sh ]] ||
+  fail 'an unratified seventh environment-nsc-lifecycle entrypoint was added'
+ok 'the exact six retained entrypoints own the lifecycle surface'
+
+[[ ! -e $template_root/schemas/ci/diene-runner-pin-v1.schema.json &&
+  ! -e $template_root/schemas/ci/diene-host-policy-v1.schema.json ]] ||
+  fail 'a shelved DigitalOcean runner schema remains active'
+jq -e '.properties.substrate.properties.kind.const == "k3d"' \
+  "$template_root/schemas/ci/diene-runtime-consumption-v1.schema.json" >/dev/null ||
+  fail 'the Garden-owned opaque runtime-consumption ABI changed'
+ok 'DO-only schemas are retired while the Garden k3d compatibility field remains opaque'
+
+grep -Fq 'runs-on: nscloud-ubuntu-26.04-amd64-16x32' "$workflow" ||
+  fail 'runtime jobs do not use the ratified Namespace 26.04 label'
+grep -Fq 'runs-on: ubuntu-24.04' "$workflow" ||
+  fail 'the documented GitHub-hosted 24.04 fallback is absent'
+grep -Fq 'platform per-instance policy pending (support ask #4)' \
+  "$template_root/scripts/ci/environment-k3d-run.sh" ||
+  fail 'the interim platform-policy status is not stamped into workflow evidence'
+ok 'runner labels and the interim support-ask stamp are explicit'
+
+if rg -n 'runs-on:.*self-hosted|digitalocean|doctl|k3d (cluster|create|delete)|k3s ctr images export|nsc ingress|actions/cache' \
+  --glob '!test-environment-contract.sh' "$template_root/.github/workflows" \
+  "$template_root/scripts/ci" >"$scratch/forbidden-static"; then
+  sed -n '1,120p' "$scratch/forbidden-static" >&2
+  fail 'an executable workflow/script revives a forbidden substrate or cache path'
+fi
+if rg -n 'runner-pin|host-policy|leaseId|DigitalOcean|JIT' --glob '!test-environment-contract.sh' \
+  "$workflow" "$template_root/scripts/ci" \
+  >"$scratch/forbidden-shelved"; then
+  sed -n '1,120p' "$scratch/forbidden-shelved" >&2
+  fail 'the active runtime surface still depends on shelved runner apparatus'
+fi
+ok 'active code contains no self-hosted, DO, nested-k3d, ingress, cache, or export path'
+
+for input in lane repository_id repository_key source_sha garden_lock_digest artifact_digest \
+  artifact_provenance_ref artifact_attestation_digest journey_manifest vendor_manifest action_id \
+  closure_digest closure_bundle_ref closure_signature_bundle_digest closure_trust_root_digest; do
+  grep -Eq "^      ${input}:" "$workflow" || fail "workflow_call input $input is absent"
+done
+for output in subject_digest receipt_id core_report_digest vendor_report_digest; do
+  grep -Eq "^      ${output}:" "$workflow" || fail "workflow_call output $output is absent"
+done
+ok 'workflow_call retains the complete ratified v1 input/output vocabulary'
+
+printf '== every cheap refusal precedes nsc create ==\n'
+
+prepare_run 3001
+export DIENE_TRUSTED_RUNTIME_CONTEXT=untrusted-pull-request
+expect_precreate_refusal UntrustedSubject ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3002
+export DIENE_NSC_DURATION=45m
+expect_precreate_refusal InputContractInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3003
+export DIENE_NAMESPACE_INGRESS=generated.namespace.example
+expect_precreate_refusal InputContractInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3004 absol
+export DIENE_NSC_CACHE_TAG=shared-cache
+expect_precreate_refusal InputContractInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3005 fleet-independence
+export DIENE_SEED_IDENTITY=forbidden-seed
+expect_precreate_refusal InputContractInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3006
+export DIENE_LANE=unknown-lane
+expect_precreate_refusal InputContractInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3007
+export DIENE_JOURNEY_MANIFEST=.diene/ci/other-journeys.yaml
+expect_precreate_refusal InputContractInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3008 ditto-vendor
+export DIENE_JOURNEY_MANIFEST=.diene/ci/journeys.v1.yaml
+expect_precreate_refusal InputContractInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3009 ditto-target-pull
+unset DIENE_ARTIFACT_PROVENANCE_REF
+expect_precreate_refusal InputContractInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3010 ditto-target-pull
+export DIENE_ARTIFACT_ATTESTATION_DIGEST=$CLOSURE_DIGEST
+expect_precreate_refusal UntrustedSubject ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3011 ditto-target-pull
+export DIENE_CONNECTED_EGRESS_JSON='[{"dns":"api.example.test","sni":"api.example.test","port":443,"methods":["GET"]}]'
+expect_precreate_refusal ConnectedEgressInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3012 absol
+export DIENE_CLOSURE_DIGEST=$ATTESTATION_DIGEST
+expect_precreate_refusal UntrustedSubject ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3013 absol
+unset DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST
+expect_precreate_refusal InputContractInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3014
+write_subject "$DIENE_ARTIFACT_SUBJECT" 999999 1
+expect_precreate_refusal UntrustedSubject ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3015
+chmod 0644 "$work/.diene/ci/artifact-producer.sh"
+expect_precreate_refusal ArtifactProducerUnavailable ./scripts/ci/environment-k3d-run.sh orchestrate
+chmod 0755 "$work/.diene/ci/artifact-producer.sh"
+
+prepare_run 3016
+export DIENE_PRE_SIT_NEGATIVE_CANARY=1
+expect_precreate_refusal ProductionFixtureInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+unset DIENE_PRE_SIT_NEGATIVE_CANARY
+
+fixture_backup=$scratch/demo-manifest.backup
+cp "$work/.diene/ci/fixtures/demo/manifest.yaml" "$fixture_backup"
+prepare_run 3017
+printf '%s\n' '{"apiVersion":"diene.atomi.cloud/ci-fixture/v1","id":"demo","duration":"sixty-minutes"}' \
+  >"$work/.diene/ci/fixtures/demo/manifest.yaml"
+expect_precreate_refusal ProductionFixtureInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+cp "$fixture_backup" "$work/.diene/ci/fixtures/demo/manifest.yaml"
+
+prepare_run 3018
+printf '%s\n' '{"apiVersion":"diene.atomi.cloud/ci-fixture/v1","id":"demo","duration":"60m"}' \
+  >"$work/.diene/ci/fixtures/demo/manifest.yaml"
+expect_precreate_refusal ProductionFixtureInvalid ./scripts/ci/environment-k3d-run.sh orchestrate
+cp "$fixture_backup" "$work/.diene/ci/fixtures/demo/manifest.yaml"
+
+prepare_run 3019 ditto-vendor
+export DIENE_VENDOR_CREDENTIAL_BROKER_BIN=''
+expect_precreate_refusal VendorBrokerInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh orchestrate
+
+prepare_run 3020
+export DIENE_EGRESS_L7_ENFORCER_BIN=/tmp/untrusted-l7-enforcer
+expect_precreate_refusal ConnectedEgressInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh orchestrate
+
+vendor_backup=$scratch/vendors.backup
+cp "$work/.diene/ci/vendors.v1.yaml" "$vendor_backup"
+prepare_run 3021 ditto-vendor
+jq '.actions[0].componentClass = "K10" | .actions[0].permissionRule = "off"' \
+  "$vendor_backup" >"$work/.diene/ci/vendors.v1.yaml"
+expect_precreate_refusal SchemaValidationFailed ./scripts/ci/environment-k3d-run.sh orchestrate
+cp "$vendor_backup" "$work/.diene/ci/vendors.v1.yaml"
+ok 'trust, selectors, closure, vendor, producer, and fixture defects all stop before create'
+
+printf '== exact measured Namespace happy path ==\n'
+
+run_happy_lane() {
+  local run_id=${1:?run id required} lane=${2:?lane required} scenario=${3:-happy}
+  prepare_run "$run_id" "$lane"
+  run_orchestrator "$scenario" >"$scratch/happy-$run_id.out" 2>"$scratch/happy-$run_id.err" || {
+    sed -n '1,160p' "$scratch/happy-$run_id.err" >&2
+    fail "$lane happy lifecycle failed"
+  }
+  LAST_REPORT=$DIENE_CORE_REPORT
+  [[ $lane != ditto-vendor ]] || LAST_REPORT=$DIENE_VENDOR_REPORT
+  [[ -s $LAST_REPORT && -s $DIENE_PROOF_BUNDLE ]] || fail "$lane produced no final report/proof"
+  jq -e '
+    .namespaceLifecycle.duration == "2h" and .namespaceLifecycle.ephemeral == true and
+    .namespaceLifecycle.endpointUsed == false and .namespaceLifecycle.cacheAttached == false and
+    .namespaceLifecycle.lateCleanupCanRewrite == false and
+    ([.namespaceLifecycle.create,.namespaceLifecycle.transfer,.namespaceLifecycle.ssh,
+      .namespaceLifecycle.collection,.namespaceLifecycle.destroy,.namespaceLifecycle.absence] |
+      all(.outcome == "Pass")) and .checkpointChain.validated == true and
+    .checkpointChain.finalCleanPass == true and .checkpointChain.resumedLegs == 0 and
+    .evidence.egressCanary.platformStatus ==
+      "platform per-instance policy pending (support ask #4)"
+  ' "$LAST_REPORT" >/dev/null || fail "$lane final lifecycle evidence is not complete"
+  LAST_CLUSTER=$(jq -er '.instance.clusterId' "$LAST_REPORT")
+  LAST_LOG=$FAKE_NSC_LOG
+  LAST_BUNDLE=$DIENE_PROOF_BUNDLE
+}
+
+run_happy_lane 4001 ditto-build-local
+happy_core_report=$scratch/happy-core.json
+happy_core_bundle=$scratch/happy-core-proof.tar
+cp "$LAST_REPORT" "$happy_core_report"
+cp "$LAST_BUNDLE" "$happy_core_bundle"
+happy_cluster=$LAST_CLUSTER
+happy_log=$LAST_LOG
+
+grep -Eq '^create --ephemeral --duration 2h --wait_kube_system .*--output_json_to .*--output json .*--purpose .*--unique_tag .*--label .*--label .*--label ' \
+  "$happy_log" || fail 'fake nsc did not observe the exact stable create surface'
+[[ $(grep -Ec '^instance upload ' "$happy_log") == 5 ]] || fail 'immutable upload count is not exactly five'
+[[ $(grep -Ec '^instance download ' "$happy_log") == 2 ]] || fail 'fixed proof download count is not exactly two'
+grep -Eq "^ssh ${happy_cluster} -T " "$happy_log" || fail 'driver did not use exact-id noninteractive ssh'
+[[ $(grep -Ec "^destroy --force ${happy_cluster} " "$happy_log") == 1 ]] ||
+  fail 'cleanup did not issue exactly one exact-id force destroy'
+grep -Eq '^list --all -o json ' "$happy_log" || fail 'positive absence did not query the complete list'
+if grep -Eq '^destroy .*diene_|^destroy .*\*|^destroy .*--label|^(scp|cp|ingress|egress) ' "$happy_log"; then
+  fail 'the Namespace adapter used a prefix, broad selector, invented copy verb, ingress, or tenant policy'
+fi
+[[ $(FAKE_NSC_SCENARIO=happy "$fake_nsc" list --all -o json) == null ]] ||
+  fail 'the measured empty-list null result was not normalized as exact absence'
+ok 'create/cid agreement/upload/ssh/download/exact destroy/list absence use measured nsc syntax'
+
+nsc_lines_before=$(wc -l <"$happy_log")
+(cd -- "$work" && FAKE_NSC_SCENARIO=happy ./scripts/ci/environment-k3d-run.sh lifecycle "$happy_core_bundle") \
+  >"$scratch/lifecycle.out" 2>"$scratch/lifecycle.err" || {
+  sed -n '1,120p' "$scratch/lifecycle.err" >&2
+  fail 'workflow-owned lifecycle verifier rejected the green proof'
+}
+[[ $(wc -l <"$happy_log") == "$nsc_lines_before" ]] ||
+  fail 'the unprivileged lifecycle verifier invoked Namespace authority'
+assert_contains "$scratch/lifecycle.out" 'NamespaceLifecycleVerified:'
+ok 'workflow-owned lifecycle verification consumes proof without nsc authority'
+
+destroy_before=$(grep -Ec '^destroy ' "$happy_log")
+(cd -- "$work" && FAKE_NSC_SCENARIO=happy ./scripts/ci/environment-k3d-run.sh cleanup) \
+  >"$scratch/cleanup.out" 2>"$scratch/cleanup.err" || {
+  sed -n '1,120p' "$scratch/cleanup.err" >&2
+  fail 'normal always-step cleanup did not re-prove convergence'
+}
+[[ $(grep -Ec '^destroy ' "$happy_log") == "$destroy_before" ]] ||
+  fail 'normal always-step cleanup destroyed an already-converged instance twice'
+assert_contains "$scratch/cleanup.out" 'NamespaceLifecycleConverged:'
+ok 'the separate always-step re-proves absence without a duplicate destroy'
+
+run_happy_lane 4002 ditto-target-pull
+cp "$LAST_REPORT" "$scratch/happy-target-pull.json"
+run_happy_lane 4003 absol
+assert_not_contains "$LAST_LOG" '--cache'
+run_happy_lane 4004 fleet-independence
+assert_not_contains "$LAST_LOG" '--cache'
+run_happy_lane 4005 ditto-vendor
+happy_vendor_report=$scratch/happy-vendor.json
+cp "$LAST_REPORT" "$happy_vendor_report"
+grep -Fq 'vendor_report_digest=sha256:' "$GITHUB_OUTPUT" || fail 'vendor output digest is absent'
+! grep -Fq 'core_report_digest=' "$GITHUB_OUTPUT" || fail 'vendor run opened the core output namespace'
+run_happy_lane 4006 ditto-vendor vendor-unavailable
+jq -e '.outcome == "Unavailable" and .vendorOutcome.outcome == "Unavailable" and
+  .vendorOutcome.required == false and .namespaceLifecycle.outcome == "Pass"' "$LAST_REPORT" >/dev/null ||
+  fail 'optional provider unavailability was not nonblocking and separately explicit'
+ok 'all five lanes converge; optional vendor unavailability alone remains nonblocking'
+
+printf '== lifecycle phase failures stay red and exact ==\n'
+
+expect_lifecycle_failure() {
+  local run_id=${1:?run id required} scenario=${2:?scenario required} reason=${3:?reason required}
+  prepare_run "$run_id"
+  local nsc_root=$FAKE_NSC_ROOT rc
+  if run_orchestrator "$scenario" >"$scratch/failure-$scenario.out" 2>"$scratch/failure-$scenario.err"; then
+    fail "$scenario unexpectedly passed"
+  else
+    rc=$?
+  fi
+  ((rc != 0)) || fail "$scenario returned a green status"
+  grep -Fq -- "$reason" "$scratch/failure-$scenario.err" || {
+    sed -n '1,160p' "$scratch/failure-$scenario.err" >&2
+    fail "$scenario did not retain $reason"
+  }
+  if grep -Eq '^destroy .*diene_|^destroy .*\*|^destroy .*--label' "$FAKE_NSC_LOG"; then
+    fail "$scenario attempted prefix or broad cleanup"
+  fi
+  FAILURE_NSC_ROOT=$nsc_root
+  FAILURE_LOG=$FAKE_NSC_LOG
+  ok "$scenario remains red with $reason"
+}
+
+expect_lifecycle_failure 5001 create-fail NamespaceCreateFailed
+! find "$FAILURE_NSC_ROOT/instances" -name live -print -quit | grep -q . ||
+  fail 'a failed create unexpectedly left a modeled live instance'
+! grep -Eq '^destroy ' "$FAILURE_LOG" || fail 'failed create guessed an identity to destroy'
+
+expect_lifecycle_failure 5002 transfer-fail NamespaceTransferFailed
+transfer_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^destroy --force ${transfer_id} " "$FAILURE_LOG") == 1 ]] ||
+  fail 'transfer failure did not destroy its exact cluster once'
+[[ ! -e $FAILURE_NSC_ROOT/instances/$transfer_id/live ]] || fail 'transfer failure left its cluster live'
+
+expect_lifecycle_failure 5003 ssh-fail NamespaceSshDriverFailed
+ssh_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^destroy --force ${ssh_id} " "$FAILURE_LOG") == 1 ]] ||
+  fail 'SSH failure did not destroy its exact cluster once'
+[[ ! -e $FAILURE_NSC_ROOT/instances/$ssh_id/live ]] || fail 'SSH failure left its cluster live'
+
+expect_lifecycle_failure 5004 collection-fail EvidenceCollectionFailed
+collection_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^destroy --force ${collection_id} " "$FAILURE_LOG") == 1 ]] ||
+  fail 'download failure did not destroy its exact cluster once'
+[[ ! -e $FAILURE_NSC_ROOT/instances/$collection_id/live ]] || fail 'download failure left its cluster live'
+
+expect_lifecycle_failure 5005 destroy-fail NamespaceDestroyFailed
+destroy_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^destroy --force ${destroy_id} " "$FAILURE_LOG") == 1 ]] ||
+  fail 'destroy failure did not retain its exact destructive selector'
+[[ -e $FAILURE_NSC_ROOT/instances/$destroy_id/live ]] ||
+  fail 'the destroy-failure model incorrectly claimed the instance absent'
+assert_contains "$scratch/failure-destroy-fail.err" 'NamespaceAbsenceUnproven'
+
+expect_lifecycle_failure 5006 list-fail NamespaceAbsenceUnproven
+list_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^destroy --force ${list_id} " "$FAILURE_LOG") == 1 ]] ||
+  fail 'list failure did not destroy its exact cluster once'
+[[ ! -e $FAILURE_NSC_ROOT/instances/$list_id/live ]] || fail 'list failure left its cluster live'
+grep -Eq '^list --all -o json ' "$FAILURE_LOG" || fail 'list failure never attempted positive absence'
+ok 'all modeled lifecycle phase failures preserve exact-id cleanup semantics'
+
+printf '\nenvironment contract checkpoint: PASS (%d checks)\n' "$passed"
