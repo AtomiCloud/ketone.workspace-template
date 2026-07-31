@@ -60,6 +60,17 @@ require_in_block() {
   ' "${file}" || fail "expected ${tool} inside ${block} in ${file}"
 }
 
+require_merged_package_set() {
+  local file="$1"
+  local package_set="$2"
+
+  awk -v package_set="${package_set}" '
+    /^[[:space:]]*with[[:space:]]+all;[[:space:]]*$/ { result = 1; next }
+    result && index($0, package_set) { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "${file}" || fail "expected ${package_set} in the merged result of ${file}"
+}
+
 for tool in "${TOOLS[@]}"; do
   require_exactly_once "${SOURCE_FILES[0]}" "${tool}"
   require_exactly_once "${SOURCE_FILES[1]}" "${tool}"
@@ -71,6 +82,7 @@ for tool in "${TOOLS[@]}"; do
     packages_file="cyan/fixtures/expected/${fixture}/nix/packages.nix"
     require_exactly_once "${env_file}" "${tool}"
     require_exactly_once "${packages_file}" "${tool}"
+    require_in_block "${env_file}" lint '];' "${tool}"
     require_in_block "${packages_file}" nix-2605 ');' "${tool}"
   done
 
@@ -80,8 +92,10 @@ for tool in "${TOOLS[@]}"; do
   done
 done
 
-grep -Fxq 'atomipkgs // nix-2605' templates/helm/nix/packages.nix ||
-  fail 'Helm package set does not merge the nix-2605 tool set'
+require_merged_package_set templates/helm/nix/packages.nix nix-2605
+for fixture in "${HELM_FIXTURES[@]}"; do
+  require_merged_package_set "cyan/fixtures/expected/${fixture}/nix/packages.nix" nix-2605
+done
 
 if command -v nix-instantiate >/dev/null 2>&1; then
   nix_files=("${SOURCE_FILES[@]}")
