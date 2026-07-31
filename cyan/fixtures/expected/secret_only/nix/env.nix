@@ -20,6 +20,7 @@ with packages;
     check-jsonschema
     check-jsonschema
     check-jsonschema
+    check-jsonschema
     gitlint
     go-task
     pre-commit
@@ -37,6 +38,7 @@ with packages;
 
   system = [
     atomiutils
+    pls
     pls
     pls
     pls
