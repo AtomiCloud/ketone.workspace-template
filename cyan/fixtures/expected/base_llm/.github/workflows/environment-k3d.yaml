@@ -38,10 +38,16 @@ jobs:
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
           REF_PROTECTED: ${{ github.ref_protected }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
         run: |
-          test "${#REQUESTED_SHA}" -eq 40
+          # A full lowercase 40-hex commit, not merely a 40-character string: a
+          # 40-character ref name must never pass as a commit SHA.
+          [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "$REQUESTED_SHA^{commit}"
+          test "$(git rev-parse --verify "$REQUESTED_SHA^{commit}")" = "$REQUESTED_SHA"
           test "$GITHUB_REPOSITORY_OWNER" = AtomiCloud
-          git merge-base --is-ancestor "$REQUESTED_SHA" origin/main
+          # The commit must be reachable from the protected default branch.
+          git merge-base --is-ancestor "$REQUESTED_SHA" "origin/$DEFAULT_BRANCH"
           if [[ "$GITHUB_EVENT_NAME" == push && "$REF_PROTECTED" != true ]]; then exit 1; fi
           if [[ "$GITHUB_ACTOR" == dependabot[bot] ]]; then exit 1; fi
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
@@ -55,19 +61,17 @@ jobs:
           test "$WORKFLOW_SHA" = "$REQUESTED_SHA"
           base_workflow_ref="${WORKFLOW_REF%@*}@$REQUESTED_SHA"
 
-          # Runtime lanes are enabled only when every repository-owned
-          # declaration the contract needs is actually present.
+          # Only an absent journey declaration disables the runtime callers,
+          # and that claims no coverage. Every OTHER prerequisite — the Garden
+          # lock, the artifact producer, the accepted runner pin, the closure —
+          # is a refusal in the runtime-free jobs below, never a silent skip:
+          # a repository that opted in must not go green with the blocking
+          # checks quietly absent.
           enabled=true
-          for declaration in \
-            .diene/ci/journeys.v1.yaml \
-            .diene/ci/environment-lock.v1.json \
-            .diene/ci/artifact-producer.sh \
-            .diene/ci/runner-pin.v1.json; do
-            if [[ ! -f "$declaration" ]]; then
-              printf 'runtime lanes disabled: %s is absent\n' "$declaration" >&2
-              enabled=false
-            fi
-          done
+          if [[ ! -f .diene/ci/journeys.v1.yaml ]]; then
+            printf 'runtime lanes disabled: no journey declaration, so no coverage is claimed\n' >&2
+            enabled=false
+          fi
           printf 'enabled=%s\nsource_sha=%s\nbase_workflow_ref=%s\n' \
             "$enabled" "$REQUESTED_SHA" "$base_workflow_ref" >>"$GITHUB_OUTPUT"
 
@@ -95,7 +99,6 @@ jobs:
       closure_bundle_ref: ${{ steps.subject.outputs.closure_bundle_ref }}
       closure_signature_bundle_digest: ${{ steps.subject.outputs.closure_signature_bundle_digest }}
       closure_trust_root_digest: ${{ steps.subject.outputs.closure_trust_root_digest }}
-      absol_ready: ${{ steps.subject.outputs.absol_ready }}
     steps:
       - uses: actions/checkout@v4
         with: { ref: '${{ needs.authorize-runtime.outputs.source_sha }}' }
@@ -126,8 +129,7 @@ jobs:
               "closure_digest=" + (.closure.digest // ""),
               "closure_bundle_ref=" + (.closure.bundleRef // ""),
               "closure_signature_bundle_digest=" + (.closure.signatureBundleDigest // ""),
-              "closure_trust_root_digest=" + (.closure.trustRootDigest // ""),
-              "absol_ready=" + (if .closure then "true" else "false" end)
+              "closure_trust_root_digest=" + (.closure.trustRootDigest // "")
             ' "$subject"
           } >>"$GITHUB_OUTPUT"
       - name: Hand the immutable subject to the same-run gates
@@ -147,6 +149,10 @@ jobs:
     if: needs.authorize-runtime.outputs.enabled == 'true'
     needs: [authorize-runtime, artifact-build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: profile-${{ fromJSON(github.repository_id) }}-${{ needs.authorize-runtime.outputs.source_sha }}
+      cancel-in-progress: false
     permissions:
       contents: read
     steps:
@@ -214,10 +220,11 @@ jobs:
       artifact_attestation_digest: ${{ needs.artifact-build.outputs.artifact_attestation_digest }}
       journey_manifest: .diene/ci/journeys.v1.yaml
 
+  # Absol is never silently omitted: an incomplete closure has already refused
+  # in environment-profile-contract, so this gate is the trigger matrix alone.
   environment-absol:
     if: >-
       needs.authorize-runtime.outputs.enabled == 'true' &&
-      needs.artifact-build.outputs.absol_ready == 'true' &&
       (github.event_name == 'push' ||
        (github.event_name == 'workflow_dispatch' && inputs.release_candidate == true))
     needs: [authorize-runtime, artifact-build, environment-profile-contract]
@@ -236,10 +243,13 @@ jobs:
       closure_signature_bundle_digest: ${{ needs.artifact-build.outputs.closure_signature_bundle_digest }}
       closure_trust_root_digest: ${{ needs.artifact-build.outputs.closure_trust_root_digest }}
 
+  # The schedule reaches this lane and no other, and an authorized dispatch may
+  # rerun it under the same full-commit/reachable/write-or-admin predicate.
   environment-fleet-independence:
     if: >-
       needs.authorize-runtime.outputs.enabled == 'true' &&
-      (github.event_name == 'push' || github.event_name == 'schedule')
+      (github.event_name == 'push' || github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch')
     needs: [authorize-runtime, artifact-build, environment-profile-contract]
     permissions: { contents: read }
     uses: ./.github/workflows/⚡reusable-environment-k3d.yaml

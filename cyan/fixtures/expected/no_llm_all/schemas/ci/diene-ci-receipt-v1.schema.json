@@ -20,7 +20,7 @@
       "required": ["applied", "mode"],
       "properties": {
         "applied": { "type": "boolean" },
-        "mode": { "enum": ["allowlist", "closure-denied-network", "none"] },
+        "mode": { "enum": ["hermetic", "connected"] },
         "allowFile": { "type": ["string", "null"], "pattern": "^/" }
       }
     },

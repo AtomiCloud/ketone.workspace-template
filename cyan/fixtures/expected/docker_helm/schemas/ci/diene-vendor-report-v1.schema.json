@@ -83,15 +83,23 @@
       ]
     },
     "credential": {
+      "description": "Observed credential lifecycle, never asserted. `removed` may only be true when the broker confirmed revocation after provider absence was proved.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["env", "masked", "phaseScoped", "removed"],
+      "required": ["issuer", "masked", "issuedAfterReadiness", "removed", "removalObserved"],
       "properties": {
-        "env": { "const": "DIENE_VENDOR_CREDENTIAL" },
+        "issuer": { "const": "host-owned-broker" },
         "masked": { "type": "boolean" },
-        "phaseScoped": { "type": "boolean" },
-        "removed": { "type": "boolean" }
-      }
+        "issuedAfterReadiness": { "type": "boolean" },
+        "removed": { "type": "boolean" },
+        "removalObserved": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "removed": { "const": true } }, "required": ["removed"] },
+          "then": { "properties": { "removalObserved": { "const": true } } }
+        }
+      ]
     }
   }
 }

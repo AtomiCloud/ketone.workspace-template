@@ -125,14 +125,55 @@ esac
 PLS
 chmod 0755 "$fake_pls"
 
-fake_policy=$scratch/diene-host-policy
+# A stand-in for the root-owned broker. It models the ABI only: the real
+# boundary lives in a host layer the job cannot reach, which is precisely why
+# the lane refuses when the broker is absent.
+fake_policy=$scratch/diene-host-policy-broker
 cat >"$fake_policy" <<'POLICY'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'host-policy %q ' "$@" >>"${DIENE_TEST_PLS_LOG:?}"
 printf '\n' >>"$DIENE_TEST_PLS_LOG"
+case ${1:-} in
+  routes)
+    posture=hermetic
+    while (($#)); do [[ $1 == --posture ]] && posture=$2; shift; done
+    # The receipt-assigned routes are issued by the broker, never copied from
+    # a stale constant in the template.
+    if [[ $posture == connected ]]; then
+      jq -nc '{allow:["127.0.0.0/8","10.202.0.0/24","10.203.0.0/16","ghcr.io:443","seed.internal:443"],
+               denyDns:true,denyDefaultRoute:true}'
+    else
+      jq -nc '{allow:["127.0.0.0/8","10.202.0.0/24","10.203.0.0/16"],denyDns:true,denyDefaultRoute:true}'
+    fi
+    ;;
+  verify)
+    # The host layer attests the posture was held for the lane's lifetime.
+    [[ ${DIENE_TEST_POSTURE_BROKEN:-0} != 1 ]]
+    ;;
+esac
 POLICY
 chmod 0755 "$fake_policy"
+
+fake_pull_proof=$scratch/diene-artifact-pull-proof
+cat >"$fake_pull_proof" <<'PULL'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'pull-proof %q ' "$@" >>"${DIENE_TEST_PLS_LOG:?}"
+printf '\n' >>"$DIENE_TEST_PLS_LOG"
+[[ ${DIENE_TEST_FAIL_PULL_PROOF:-} != "$1" ]]
+PULL
+chmod 0755 "$fake_pull_proof"
+
+fake_closure_verify=$scratch/diene-closure-verify
+cat >"$fake_closure_verify" <<'CLOSURE'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'closure-verify %q ' "$@" >>"${DIENE_TEST_PLS_LOG:?}"
+printf '\n' >>"$DIENE_TEST_PLS_LOG"
+[[ ${DIENE_TEST_FAIL_CLOSURE:-} != "$1" ]]
+CLOSURE
+chmod 0755 "$fake_closure_verify"
 
 producer=$work/.diene/ci/artifact-producer.sh
 cat >"$producer" <<'PRODUCER'
@@ -167,30 +208,60 @@ export GITHUB_REPOSITORY_ID=12345 GITHUB_REPOSITORY=AtomiCloud/example
 export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export GITHUB_RUN_ID=8001 GITHUB_RUN_ATTEMPT=1
 export DIENE_PLS_BIN=$fake_pls
-export DIENE_HOST_POLICY_BIN=$fake_policy
+export DIENE_HOST_POLICY_BROKER_BIN=$fake_policy
+export DIENE_PULL_PROOF_BIN=$fake_pull_proof
+export DIENE_CLOSURE_VERIFY_BIN=$fake_closure_verify
 export DIENE_BASE_WORKFLOW_REF="AtomiCloud/example/.github/workflows/environment-k3d.yaml@$GITHUB_SHA"
 export DIENE_LEAK_CANARY=canary-value-not-present
 export DIENE_PREFLIGHT_HOST_CHECKS=0
 
-lease=$scratch/lease.json
+# The runner arm exports the job-visible lease projection: exactly mode 0440
+# at the .public.json path. The fake overrides the path but models the same
+# ABI, so a drift in either arm fails here.
+lease=$scratch/diene-runner-lease.v1.public.json
 write_lease() {
   local job=$1
+  # The projection is read-only once written, so replace it rather than
+  # rewriting it in place.
+  rm -f -- "$lease"
   jq -n --arg job "diene-job-r12345-w${GITHUB_RUN_ID}-a1-j$job" --arg sha "$GITHUB_SHA" \
     --argjson runId "$GITHUB_RUN_ID" '
     {apiVersion:"diene.atomi.cloud/ci-runner-lease/v1",repositoryId:12345,
      repositoryKey:"AtomiCloud/example",runId:$runId,runAttempt:1,sourceSha:$sha,state:"Online",
      labels:["self-hosted","linux","x64","diene-k3d-isolated-v1",$job]}' >"$lease"
-  chmod 0600 "$lease"
+  chmod 0440 "$lease"
   export DIENE_EXPECTED_JOB_ID=$job
 }
 write_lease environment-ditto-build-local
 export DIENE_RUNNER_LEASE_FILE=$lease
 
+printf '== runner lease cross-arm ABI ==\n'
+./scripts/ci/environment-runner-preflight.sh >/dev/null
+ok 'the 0440 job-visible lease projection is accepted'
+
+# A private-lease mode is not the job-visible projection and must refuse, so
+# the two arms cannot silently disagree about which file a job reads.
+chmod 0600 "$lease"
+expect_refusal RunnerIsolationUnavailable ./scripts/ci/environment-runner-preflight.sh
+chmod 0440 "$lease"
+
+grep -Fq '/run/diene-runner-lease.v1.public.json' ./scripts/ci/environment-runner-preflight.sh ||
+  fail 'the preflight does not default to the job-visible lease projection path'
+ok 'the default lease path is the job-visible projection'
+
+# The job identity holds CAP_NET_ADMIN and is denied CAP_SYS_ADMIN, so a
+# successful `unshare --net` is a failure signal, never a requirement.
+grep -Fq 'job identity holds CAP_SYS_ADMIN' ./scripts/ci/environment-runner-preflight.sh ||
+  fail 'the preflight does not refuse a job that holds CAP_SYS_ADMIN'
+! grep -Eq '^ *unshare --net true \|\| diene_die' ./scripts/ci/environment-runner-preflight.sh ||
+  fail 'the preflight still requires CAP_SYS_ADMIN via unshare'
+ok 'capability proof is CAP_NET_ADMIN present and CAP_SYS_ADMIN absent'
+
 # The lease is bound to this exact job, not merely to the run: a lease minted
 # for a sibling lane of the same run is refused.
-printf '== runner lease binds the exact job ==\n'
 DIENE_EXPECTED_JOB_ID=environment-absol \
   expect_refusal RunnerIsolationUnavailable ./scripts/ci/environment-runner-preflight.sh
+export DIENE_EXPECTED_JOB_ID=environment-ditto-build-local
 ./scripts/ci/environment-runner-preflight.sh >/dev/null
 ok 'a sibling lane lease is refused, the matching one is accepted'
 
@@ -254,6 +325,112 @@ ok 'a same-run producer output is accepted'
 # A checked-in declaration goes stale: its producer run cannot bind this run.
 jq '.artifact.producer.runId = "7"' "$subject" >"$scratch/stale.json"
 expect_refusal UntrustedSubject ./scripts/ci/environment-profile-contract.sh --validate-subject "$scratch/stale.json"
+
+# An absent subject is a stable refusal, never a quiet pass.
+expect_refusal ArtifactProducerUnavailable \
+  ./scripts/ci/environment-profile-contract.sh --validate-subject "$scratch/no-such-subject.json"
+
+# A non-executable producer refuses before anything else.
+chmod -x .diene/ci/artifact-producer.sh
+expect_refusal ArtifactProducerUnavailable ./scripts/ci/environment-profile-contract.sh --validate-prerequisites
+chmod +x .diene/ci/artifact-producer.sh
+
+printf '== one subject rail, no quiet pass ==\n'
+ci_workflow=$repo_root/.github/workflows/ci.yaml
+grep -Fq 'ArtifactProducerUnavailable' "$ci_workflow" ||
+  fail 'ci.yaml artifact-build does not refuse a missing producer with a stable reason'
+! grep -Fq 'NoDeclaration: ' "$ci_workflow" ||
+  fail 'ci.yaml artifact-build still passes quietly when the producer is absent'
+ok 'artifact-build refuses ArtifactProducerUnavailable instead of passing quietly'
+
+# artifact-build must publish, and every same-run consumer must download, the
+# one immutable subject. A consumer that re-derives one is a second rail.
+grep -Fq "name: diene-artifact-subject-\${{ github.run_id }}-\${{ github.run_attempt }}" "$ci_workflow" ||
+  fail 'ci.yaml does not publish/consume the same-run subject handoff'
+for workflow in "$ci_workflow" "$repo_root/.github/workflows/environment-k3d.yaml"; do
+  uploads=$(grep -c 'actions/upload-artifact' "$workflow" || true)
+  producer_runs=$(grep -c 'artifact-producer.sh --source-sha' "$workflow" || true)
+  ((producer_runs <= 1)) ||
+    fail "$(basename "$workflow") invokes the producer more than once; that is a second subject rail"
+  ((uploads >= 1)) || fail "$(basename "$workflow") publishes no evidence"
+done
+ok 'the subject is produced once per run and consumed as a published handoff'
+
+printf '== caller ABI: never skip green ==\n'
+k3d_workflow=$repo_root/.github/workflows/environment-k3d.yaml
+vendor_workflow=$repo_root/.github/workflows/environment-vendor.yaml
+
+# Only a missing journey declaration may disable the runtime callers. Every
+# other prerequisite must refuse in a runtime-free job, never skip green.
+for declaration in environment-lock runner-pin artifact-producer; do
+  ! grep -A6 'enabled=true' "$k3d_workflow" | grep -Fq "$declaration" ||
+    fail "a missing $declaration still disables the runtime callers instead of refusing"
+done
+grep -Fq 'journeys.v1.yaml' "$k3d_workflow" || fail 'the journey declaration gate is gone'
+ok 'only an absent journey declaration disables the callers; the rest refuse'
+
+# Absol must not be silently omitted when the closure is incomplete.
+! grep -Fq 'absol_ready' "$k3d_workflow" ||
+  fail 'environment-absol is still skipped on an incomplete closure'
+ok 'Absol is gated by the trigger matrix alone, never by closure presence'
+
+# Declaring the Absol lane without a complete signed closure refuses in the
+# runtime-free gate rather than dropping environment-absol from the build.
+write_subject
+jq -n '{apiVersion:"diene.atomi.cloud/ci-journeys/v1",journeys:[{
+  id:"absol-demo",componentClass:"K1",required:true,
+  appliesTo:[{lane:"absol",profile:"absol",buildMode:"build-local"}],
+  fixturePack:{id:"demo",version:"1.0.0",digest:"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+  setup:["/bin/true"],probe:["/bin/true"],cleanup:["/bin/true"],
+  workingDirectory:".",timeoutSeconds:60,poll:{intervalSeconds:5,attempts:12},
+  readinessLeaves:["EnvironmentReady"],assertions:["a"],safeReportFields:["id"]}]}' \
+  >"$scratch/absol-journeys.json"
+DIENE_JOURNEY_MANIFEST="$scratch/absol-journeys.json" \
+  expect_refusal RequiredCoverageUnavailable \
+  ./scripts/ci/environment-profile-contract.sh --validate-subject "$DIENE_ARTIFACT_SUBJECT"
+
+# Fleet independence accepts an authorized rerun; the schedule reaches it alone.
+grep -Fq "github.event_name == 'workflow_dispatch'" "$k3d_workflow" ||
+  fail 'no lane accepts an authorized dispatch'
+schedule_lanes=$(grep -c "github.event_name == 'schedule'" "$k3d_workflow" || true)
+((schedule_lanes == 1)) || fail "the schedule reaches $schedule_lanes lanes, expected exactly fleet independence"
+ok 'the schedule reaches fleet independence alone, which also accepts an authorized rerun'
+
+# Both profile gates carry the exact timeout and concurrency group.
+for workflow in "$ci_workflow" "$k3d_workflow" "$vendor_workflow"; do
+  grep -Fq 'timeout-minutes: 20' "$workflow" ||
+    fail "$(basename "$workflow") profile gate lacks the exact 20-minute timeout"
+  grep -Fq 'group: profile-' "$workflow" ||
+    fail "$(basename "$workflow") profile gate lacks its profile concurrency group"
+done
+ok 'every profile gate carries the 20-minute timeout and profile concurrency group'
+
+# The vendor caller keeps the stable prerequisite job IDs.
+for job in 'artifact-build:' 'environment-profile-contract:' 'environment-ditto-vendor:'; do
+  grep -Fq "  $job" "$vendor_workflow" || fail "the vendor caller lost the stable $job job"
+done
+grep -Fq 'needs: [authorize-vendor, artifact-build, environment-profile-contract]' "$vendor_workflow" ||
+  fail 'the vendor lane does not need both stable prerequisites'
+ok 'the vendor caller preserves the stable artifact-build and profile-contract prerequisites'
+
+# A 40-character ref name must never pass as a commit SHA.
+for workflow in "$k3d_workflow" "$vendor_workflow"; do
+  grep -Fq '=~ ^[0-9a-f]{40}$' "$workflow" ||
+    fail "$(basename "$workflow") accepts any 40-character string as a commit"
+  grep -Fq 'git cat-file -e' "$workflow" ||
+    fail "$(basename "$workflow") does not prove the commit resolves"
+  grep -Fq 'merge-base --is-ancestor' "$workflow" ||
+    fail "$(basename "$workflow") does not prove reachability from the protected branch"
+done
+ok 'dispatch guards require a full lowercase 40-hex reachable commit'
+
+# The empty top-level default is preserved everywhere.
+for workflow in "$ci_workflow" "$k3d_workflow" "$vendor_workflow" \
+  "$repo_root/.github/workflows/⚡reusable-environment-k3d.yaml"; do
+  grep -Fq 'permissions: {}' "$workflow" ||
+    fail "$(basename "$workflow") lost its empty top-level permissions default"
+done
+ok 'every workflow keeps the empty top-level permissions default'
 
 printf '== input contract ==\n'
 
@@ -374,10 +551,16 @@ jq -e '.outcome == "Pass" and .teardown.outcome == "Pass" and
        (.readiness.readiness | length) == 17 and
        .evidence.leakageScan.outcome == "Pass" and
        (.evidence.leakageScan.encodings | length) == 6 and
-       .evidence.egressCanary.mode == "allowlist" and
+       (.evidence.leakageScan.scannedPaths | length) >= 3 and
+       .evidence.egressCanary.mode == "connected" and
+       .evidence.egressCanary.reasonCode == "HostAttestedPostureSustained" and
        .subject.imageRef != null and .timings.substrateSeconds >= 0' \
   "$DIENE_CORE_REPORT" >/dev/null || fail 'happy-path report is incomplete'
 ok 'happy path emits a complete, schema-valid report'
+# Later refusal cases rewrite DIENE_CORE_REPORT with their own Fail evidence,
+# so keep the passing report for the assertions that need one.
+pass_report=$scratch/pass-report.json
+cp -- "$DIENE_CORE_REPORT" "$pass_report"
 
 grep -Fq -- 'env up --profile ditto --build-mode build-local --artifact' "$DIENE_TEST_PLS_LOG" ||
   fail 'env up was called without the mandatory --artifact'
@@ -385,8 +568,17 @@ ok 'env up carries the mandatory --artifact'
 grep -Fq -- 'env down --profile ditto' "$DIENE_TEST_PLS_LOG" || fail 'exact teardown was not driven'
 ok 'exact teardown is driven through the ratified down'
 grep -Fq 'host-policy apply' "$DIENE_TEST_PLS_LOG" || fail 'host policy was never applied'
-grep -Fq 'host-policy release' "$DIENE_TEST_PLS_LOG" || fail 'host policy was never released'
-ok 'egress posture is applied before and released after teardown'
+grep -Fq 'host-policy verify' "$DIENE_TEST_PLS_LOG" ||
+  fail 'the posture was never re-attested from the host side'
+grep -Fq 'host-policy request-release' "$DIENE_TEST_PLS_LOG" ||
+  fail 'no deferred cleanup was requested'
+# A job that knows its own receipt must not be able to delete the enforcement
+# containing it, so the job side never invokes a real release verb.
+! grep -Eq 'host-policy .release' "$DIENE_TEST_PLS_LOG" ||
+  fail 'the job invoked a destructive host-policy release'
+! grep -Fq 'diene_host_policy_release' ./scripts/ci/environment-lib.sh ||
+  fail 'a job-side destructive release verb still exists'
+ok 'the job requests deferred cleanup and cannot dissolve its own enforcement'
 
 # The ratified surface is the only surface. The fake exits 127 on anything
 # else, so a reintroduced `pls env status|render|artifact|network` would have
@@ -430,12 +622,58 @@ grep -Fq EvidenceLeakDetected "$scratch/stderr" || fail 'a missing canary was no
 ok 'an absent canary fails closed and suppresses the artifact'
 
 leak_raw=$scratch/leak-raw.json
+leak_staging=$scratch/leak-staging
+mkdir -p "$leak_staging"
+for surface in stdout stderr argv environ; do : >"$leak_staging/$surface"; done
+
+# An uncaptured surface can never be reported as scanned: runtime output that
+# already streamed to the live log cannot be suppressed retroactively.
+DIENE_LEAK_CANARY=leaky-canary-token DIENE_EVIDENCE_STAGING='' \
+  expect_refusal EvidenceLeakageInterfaceUnavailable ./scripts/ci/environment-report.sh \
+  --kind core --input "$DIENE_CORE_REPORT" --output "$scratch/unstaged.json"
+[[ ! -e $scratch/unstaged.json ]] || fail 'an unstaged report survived'
+
+rm -f "$leak_staging/stderr"
+DIENE_LEAK_CANARY=leaky-canary-token DIENE_EVIDENCE_STAGING="$leak_staging" \
+  expect_refusal EvidenceLeakageInterfaceUnavailable ./scripts/ci/environment-report.sh \
+  --kind core --input "$DIENE_CORE_REPORT" --output "$scratch/partial.json"
+: >"$leak_staging/stderr"
+ok 'a partially captured surface set refuses instead of claiming a scan'
+
+# One negative per surface, and a leak printed by a child command.
 jq '.evidence.egressCanary.reasonCode = "leaky-canary-token"' "$DIENE_CORE_REPORT" >"$leak_raw"
-DIENE_LEAK_CANARY=leaky-canary-token \
+DIENE_LEAK_CANARY=leaky-canary-token DIENE_EVIDENCE_STAGING="$leak_staging" \
   expect_refusal EvidenceLeakDetected ./scripts/ci/environment-report.sh \
   --kind core --input "$leak_raw" --output "$scratch/leak.json"
 [[ ! -e $scratch/leak.json ]] || fail 'a leaking report survived'
-ok 'a positive canary suppresses the artifact'
+ok 'a positive canary in the report suppresses the artifact'
+
+for surface in stdout stderr argv environ; do
+  : >"$leak_staging/$surface"
+  # A child command printing the tracer is caught because its output was
+  # staged rather than streamed straight to the published log.
+  printf 'child said %s\n' leaky-canary-token >"$leak_staging/$surface"
+  DIENE_LEAK_CANARY=leaky-canary-token DIENE_EVIDENCE_STAGING="$leak_staging" \
+    ./scripts/ci/environment-report.sh --kind core --input "$DIENE_CORE_REPORT" \
+    --output "$scratch/leak-$surface.json" >/dev/null 2>&1 &&
+    fail "a canary on the $surface surface was not detected"
+  [[ ! -e $scratch/leak-$surface.json ]] || fail "a report leaking via $surface survived"
+  : >"$leak_staging/$surface"
+done
+ok 'a canary on stdout, stderr, argv or environ suppresses the artifact'
+
+for encoded in \
+  "$(printf '%s' leaky-canary-token | base64 | tr -d '\n')" \
+  "$(direnv_unused=1 jq -rn '"leaky-canary-token" | @uri')" \
+  "$(printf '%s' leaky-canary-token | base64 | tr -d '\n' | base64 | tr -d '\n')"; do
+  printf '%s\n' "$encoded" >"$leak_staging/stdout"
+  DIENE_LEAK_CANARY=leaky-canary-token DIENE_EVIDENCE_STAGING="$leak_staging" \
+    ./scripts/ci/environment-report.sh --kind core --input "$DIENE_CORE_REPORT" \
+    --output "$scratch/leak-enc.json" >/dev/null 2>&1 &&
+    fail 'an encoded canary was not detected'
+  : >"$leak_staging/stdout"
+done
+ok 'base64, URL-encoded and kubeconfig-embedded encodings are all detected'
 
 printf '== report namespaces are disjoint ==\n'
 
@@ -539,9 +777,9 @@ ok 'posture and receipt are armed before the substrate mutation'
 kill -TERM -"$sig_pid" 2>/dev/null || kill -TERM "$sig_pid" 2>/dev/null || true
 wait "$sig_pid" 2>/dev/null || true
 
-grep -Fq 'host-policy release' "$DIENE_TEST_PLS_LOG" ||
-  fail 'a cancelled run left its host egress posture applied'
-ok 'cancellation inside env up still releases the egress posture'
+grep -Fq 'host-policy request-release' "$DIENE_TEST_PLS_LOG" ||
+  fail 'a cancelled run never requested deferred cleanup of its egress posture'
+ok 'cancellation inside env up still requests deferred cleanup of the posture'
 
 # The receipt was written before the mutation, so the cancelled run is
 # recoverable by owner tuple and its debt is visible rather than silent.
@@ -550,6 +788,79 @@ sig_receipt=$(find "$sig_temp/diene-receipts" -name '*.json' -print -quit 2>/dev
 jq -e '.owner.allocationKey == "r12345-w8001-a1-lditto-build-local" and .cleanup.outcome != "Pass"' \
   "$sig_receipt" >/dev/null || fail 'the cancelled run receipt is not exact or was falsely marked destroyed'
 ok 'a cancelled run leaves an exact, lane-scoped receipt carrying visible debt'
+
+printf '== enforcement boundary is host-owned, not job-owned ==\n'
+
+# Without a root-owned broker the lane refuses. A table this job installs in
+# its own namespace is a cooperative setting it can flush, not a boundary.
+: >"$DIENE_TEST_PLS_LOG"
+DIENE_HOST_POLICY_BROKER_BIN=/nonexistent/diene-host-policy-broker \
+  expect_refusal HostPolicyInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
+[[ ! -s $DIENE_TEST_PLS_LOG ]] || fail 'a lane without an enforcement boundary still mutated the substrate'
+ok 'no host-owned broker means the lane refuses before any mutation'
+
+# The job holds CAP_NET_ADMIN, so it can flush any table it can see. The
+# posture must still be attested from the host side afterwards.
+if command -v nft >/dev/null 2>&1; then
+  nft delete table inet diene_ci_egress 2>/dev/null || true
+  nft flush ruleset 2>/dev/null || true
+fi
+: >"$DIENE_TEST_PLS_LOG"
+DIENE_TEST_POSTURE_BROKEN=1 DIENE_CORE_REPORT=$scratch/broken-posture.json \
+  ./scripts/ci/environment-k3d-run.sh >/dev/null 2>&1 &&
+  fail 'a lane whose egress posture was not sustained still went green'
+jq -e '.outcome == "Fail" and .evidence.egressCanary.outcome == "Fail" and
+       .evidence.egressCanary.reasonCode == "PostureNotSustainedForLaneLifetime"' \
+  "$scratch/broken-posture.json" >/dev/null ||
+  fail 'a broken posture was not recorded as a failed egress canary'
+ok 'a posture the host cannot attest fails the lane, whatever the job did to its own tables'
+
+printf '== mandatory lane proofs are not optional coverage ==\n'
+
+# target-pull obligations are required results, so a missing interface refuses.
+write_subject "$(jq -nc --arg attest "$attest" --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" \
+  '{predicateType:"https://slsa.dev/provenance/v1",provenanceRef:"https://example/prov",
+    attestationDigest:$attest,workflowRef:$workflowRef,runId:"8001",runAttempt:"1",
+    pullIdentity:"ghcr-reader-identity"}')"
+: >"$DIENE_TEST_PLS_LOG"
+DIENE_LANE=ditto-target-pull DIENE_PULL_PROOF_BIN=/nonexistent/pull-proof \
+  DIENE_ARTIFACT_ATTESTATION_DIGEST="$attest" DIENE_ARTIFACT_PROVENANCE_REF="https://example/prov" \
+  expect_refusal RequiredCoverageUnavailable ./scripts/ci/environment-k3d-run.sh
+! grep -Fq 'env up' "$DIENE_TEST_PLS_LOG" ||
+  fail 'target-pull mutated the substrate without its required proofs'
+write_subject
+
+# Absol signature verification and exact-set equality are mandatory too.
+: >"$DIENE_TEST_PLS_LOG"
+DIENE_LANE=absol DIENE_CLOSURE_VERIFY_BIN=/nonexistent/closure-verify \
+  DIENE_CLOSURE_DIGEST="sha256:$(printf c1 | sha256sum | cut -d' ' -f1)" \
+  DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST="sha256:$(printf c2 | sha256sum | cut -d' ' -f1)" \
+  DIENE_CLOSURE_TRUST_ROOT_DIGEST="sha256:$(printf c3 | sha256sum | cut -d' ' -f1)" \
+  DIENE_CLOSURE_BUNDLE_REF="https://example/closure/$GITHUB_SHA.tar" \
+  expect_refusal ClosureAttestationInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
+! grep -Fq 'env up' "$DIENE_TEST_PLS_LOG" ||
+  fail 'Absol mutated the substrate without closure verification'
+ok 'target-pull and Absol obligations refuse rather than becoming optional coverage'
+
+# A passing report may not carry a load-bearing obligation as unavailable.
+# Asserted against the schema directly, so the rule itself is under test.
+validator=${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}
+schema_dir=$work/schemas/ci
+"$validator" --base-uri "file://$schema_dir/" \
+  --schemafile "$schema_dir/diene-environment-report-v1.schema.json" "$pass_report" >/dev/null ||
+  fail 'the happy-path report is not schema-valid to begin with'
+jq -e '.outcome == "Pass"' "$pass_report" >/dev/null || fail 'the retained report is not a passing one'
+for obligation in closure-exact-set-equality artifact-evict-repull artifact-credential-removal; do
+  jq --arg id "$obligation" \
+    '.coverage += [{id:$id,outcome:"Unavailable",reasonCode:"InterfaceUnavailable",required:false}]' \
+    "$pass_report" >"$scratch/smuggled.json"
+  if "$validator" --base-uri "file://$schema_dir/" \
+    --schemafile "$schema_dir/diene-environment-report-v1.schema.json" \
+    "$scratch/smuggled.json" >/dev/null 2>&1; then
+    fail "a Pass report smuggled $obligation in as unavailable coverage"
+  fi
+done
+ok 'a Pass report cannot smuggle a load-bearing obligation in as unavailable coverage'
 
 printf '== vendor class admission ==\n'
 

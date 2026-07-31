@@ -27,18 +27,25 @@ jobs:
         env:
           DIENE_BASE_WORKFLOW_REF: ${{ github.repository }}/.github/workflows/ci.yaml@${{ github.sha }}
         run: |
-          # The subject is produced by the repository's own publisher. This
-          # job never derives a digest from a source tree and never fabricates
-          # provenance; a repository that has declared no publisher simply has
-          # no artifact yet, which is explicit rather than implied.
+          # The subject is produced by the repository's own publisher. This job
+          # never derives a digest from a source tree and never fabricates
+          # provenance, and a missing publisher is a stable refusal rather than
+          # a quiet pass: an absent artifact must not read as a green build.
           producer=.diene/ci/artifact-producer.sh
           if [[ ! -x $producer ]]; then
-            printf 'NoDeclaration: %s is absent; no application artifact is produced\n' "$producer"
-            exit 0
+            printf 'ArtifactProducerUnavailable: %s is absent or not executable\n' "$producer" >&2
+            exit 1
           fi
           "$producer" --source-sha "$GITHUB_SHA" --output "$RUNNER_TEMP/artifact.v1.json"
           nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh \
             --validate-subject "$RUNNER_TEMP/artifact.v1.json"
+      - name: Publish the immutable same-run subject
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/artifact.v1.json
+          if-no-files-found: error
+          retention-days: 1
   environment-contract-tests:
     name: Environment Contract Tests
     needs: precommit
@@ -55,11 +62,27 @@ jobs:
     if: github.event_name == 'pull_request' || github.ref_protected == true
     needs: [precommit, artifact-build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: profile-${{ fromJSON(github.repository_id) }}-${{ github.sha }}
+      cancel-in-progress: false
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: AtomiCloud/actions.setup-nix@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
+      - name: Validate the exact same-run subject artifact-build published
+        env:
+          DIENE_BASE_WORKFLOW_REF: ${{ github.repository }}/.github/workflows/ci.yaml@${{ github.sha }}
+        run: |
+          # The one subject rail: this consumes artifact-build's published
+          # output, never a second or re-derived one.
+          nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh \
+            --validate-subject "$RUNNER_TEMP/subject/artifact.v1.json"
       - name: Validate runtime-free profile, corpus, and parity
         run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh
       - name: Upload safe profile contract report

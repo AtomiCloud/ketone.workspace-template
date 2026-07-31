@@ -84,6 +84,21 @@ if [[ ${1:-} == --validate-subject ]]; then
       ' "$subject" >/dev/null ||
       diene_die UntrustedSubject 'attestation provenance does not bind this workflow, run and attempt'
   fi
+  # A repository whose journeys declare the Absol lane must also declare a
+  # complete signed closure. Omitting it would silently drop environment-absol
+  # from a protected build, so it refuses here, runtime-free, instead.
+  journeys=${DIENE_JOURNEY_MANIFEST:-.diene/ci/journeys.v1.yaml}
+  if [[ -f $journeys ]] && jq -e 'any(.journeys[].appliesTo[]; .lane == "absol")' "$journeys" >/dev/null; then
+    jq -e '
+      (.closure | type == "object") and
+      (.closure.bundleRef | type == "string") and
+      (.closure.digest | type == "string") and
+      (.closure.signatureBundleDigest | type == "string") and
+      (.closure.trustRootDigest | type == "string")
+    ' "$subject" >/dev/null ||
+      diene_die RequiredCoverageUnavailable 'journeys declare the Absol lane but the subject carries no complete signed closure'
+  fi
+
   printf 'ArtifactSubjectAccepted\n'
   exit 0
 fi
