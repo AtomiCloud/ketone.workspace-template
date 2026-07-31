@@ -16,10 +16,7 @@ jobs:
       contents: read
     outputs:
       artifact_digest: ${{ steps.guard.outputs.artifact_digest }}
-      artifact_image_ref: ${{ steps.guard.outputs.artifact_image_ref }}
-      artifact_producer_workflow_ref: ${{ steps.guard.outputs.artifact_producer_workflow_ref }}
       garden_lock_digest: ${{ steps.guard.outputs.garden_lock_digest }}
-      base_workflow_ref: ${{ steps.guard.outputs.base_workflow_ref }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0, ref: '${{ inputs.source_sha }}' }
@@ -58,17 +55,20 @@ jobs:
 
           lock=$(sha256sum .diene/ci/environment-lock.v1.json | cut -d' ' -f1)
           {
-            printf 'garden_lock_digest=sha256:%s\nbase_workflow_ref=%s\n' "$lock" "$base_workflow_ref"
-            nix develop .#ci -c jq -r '
-              "artifact_digest=" + .artifact.digest,
-              "artifact_image_ref=" + .artifact.imageRef,
-              "artifact_producer_workflow_ref=" + .artifact.producer.workflowRef
-            ' "$subject"
+            printf 'garden_lock_digest=sha256:%s\n' "$lock"
+            nix develop .#ci -c jq -r '"artifact_digest=" + .artifact.digest' "$subject"
           } >>"$GITHUB_OUTPUT"
+      - name: Hand the immutable subject to the same-run gates
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/artifact.v1.json
+          if-no-files-found: error
+          retention-days: 1
 
   environment-ditto-vendor:
     needs: authorize-vendor
-    permissions: { contents: read }
+    permissions: { contents: read, id-token: write }
     uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
     secrets: inherit
     with:
@@ -76,10 +76,7 @@ jobs:
       repository_id: ${{ fromJSON(github.repository_id) }}
       repository_key: ${{ github.repository }}
       source_sha: ${{ inputs.source_sha }}
-      base_workflow_ref: ${{ needs.authorize-vendor.outputs.base_workflow_ref }}
       garden_lock_digest: ${{ needs.authorize-vendor.outputs.garden_lock_digest }}
       artifact_digest: ${{ needs.authorize-vendor.outputs.artifact_digest }}
-      artifact_image_ref: ${{ needs.authorize-vendor.outputs.artifact_image_ref }}
-      artifact_producer_workflow_ref: ${{ needs.authorize-vendor.outputs.artifact_producer_workflow_ref }}
       vendor_manifest: .diene/ci/vendors.v1.yaml
       action_id: ${{ inputs.action_id }}

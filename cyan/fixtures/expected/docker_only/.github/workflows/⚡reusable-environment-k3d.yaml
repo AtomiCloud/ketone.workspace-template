@@ -1,5 +1,10 @@
 name: ⚡ Reusable Environment k3d
 
+# The public surface is exactly the ratified diene-ci-k3d/v1 input set. Image
+# ref, producer identity and pull identity are deliberately NOT inputs: they
+# live inside the same-run subject document the repository's own artifact-build
+# emitted, so a caller cannot substitute a subject the producer never made. The
+# Fleet fixture is fixed, not a selector, so it is hard-coded below.
 on:
   workflow_call:
     inputs:
@@ -7,17 +12,13 @@ on:
       repository_id: { required: true, type: number }
       repository_key: { required: true, type: string }
       source_sha: { required: true, type: string }
-      base_workflow_ref: { required: true, type: string }
       garden_lock_digest: { required: true, type: string }
       artifact_digest: { required: true, type: string }
-      artifact_image_ref: { required: true, type: string }
-      artifact_producer_workflow_ref: { required: true, type: string }
+      artifact_provenance_ref: { required: false, type: string, default: '' }
       artifact_attestation_digest: { required: false, type: string, default: '' }
-      artifact_pull_identity: { required: false, type: string, default: '' }
       journey_manifest: { required: false, type: string, default: '' }
       vendor_manifest: { required: false, type: string, default: '' }
       action_id: { required: false, type: string, default: '' }
-      fixture_id: { required: false, type: string, default: '' }
       closure_digest: { required: false, type: string, default: '' }
       closure_bundle_ref: { required: false, type: string, default: '' }
       closure_signature_bundle_digest: { required: false, type: string, default: '' }
@@ -34,19 +35,10 @@ on:
 
 permissions: {}
 
-# Lane-scoped: two runs of the same lane serialise on the shared runner pool
-# while different lanes of one run stay independent. Receipt identity is lane
-# scoped too, so parallel lanes never share a cleanup selector.
-concurrency:
-  group: k3d-${{ inputs.repository_id }}-${{ inputs.lane }}-${{ inputs.action_id }}
-  cancel-in-progress: false
-
 jobs:
   # Every refusal decidable without a cluster is decided here, on a
   # GitHub-hosted runner, before any lane job can select a disposable
-  # self-hosted runner. An untrusted selector, a missing controller/image pin,
-  # an unaccepted RunnerProvisionerReady proof, or an absent repository-owned
-  # artifact subject never reaches runner allocation.
+  # self-hosted runner.
   contract:
     name: Input Contract
     runs-on: ubuntu-24.04
@@ -57,17 +49,13 @@ jobs:
       GITHUB_REPOSITORY_ID: ${{ inputs.repository_id }}
       GITHUB_REPOSITORY: ${{ inputs.repository_key }}
       GITHUB_SHA: ${{ inputs.source_sha }}
-      DIENE_BASE_WORKFLOW_REF: ${{ inputs.base_workflow_ref }}
       DIENE_GARDEN_LOCK_DIGEST: ${{ inputs.garden_lock_digest }}
       DIENE_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
-      DIENE_ARTIFACT_IMAGE_REF: ${{ inputs.artifact_image_ref }}
-      DIENE_ARTIFACT_PRODUCER_WORKFLOW_REF: ${{ inputs.artifact_producer_workflow_ref }}
+      DIENE_ARTIFACT_PROVENANCE_REF: ${{ inputs.artifact_provenance_ref }}
       DIENE_ARTIFACT_ATTESTATION_DIGEST: ${{ inputs.artifact_attestation_digest }}
-      DIENE_ARTIFACT_PULL_IDENTITY: ${{ inputs.artifact_pull_identity }}
       DIENE_JOURNEY_MANIFEST: ${{ inputs.journey_manifest }}
       DIENE_VENDOR_MANIFEST: ${{ inputs.vendor_manifest }}
       DIENE_ACTION_ID: ${{ inputs.action_id }}
-      DIENE_FIXTURE_ID: ${{ inputs.fixture_id }}
       DIENE_CLOSURE_DIGEST: ${{ inputs.closure_digest }}
       DIENE_CLOSURE_BUNDLE_REF: ${{ inputs.closure_bundle_ref }}
       DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST: ${{ inputs.closure_signature_bundle_digest }}
@@ -77,7 +65,26 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
       - uses: AtomiCloud/actions.setup-nix@v3
+      - &derive-identity
+        name: Derive the trusted workflow identity and subject handoff
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          # The base workflow identity comes from trusted GitHub context, never
+          # from a caller input, and must bind the revision under test.
+          test "$WORKFLOW_SHA" = "$SOURCE_SHA"
+          {
+            printf 'DIENE_BASE_WORKFLOW_REF=%s@%s\n' "${WORKFLOW_REF%@*}" "$WORKFLOW_SHA"
+            printf 'DIENE_ARTIFACT_SUBJECT=%s\n' "$RUNNER_TEMP/subject/artifact.v1.json"
+          } >>"$GITHUB_ENV"
+      - uses: &subject-download actions/download-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
       - name: Refuse untrusted selectors and subjects before runner selection
+        env: { DIENE_FIXTURE_ID: '' }
         run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-inputs
       - name: Refuse missing runner pin or artifact producer before runner selection
         run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-prerequisites
@@ -88,8 +95,12 @@ jobs:
     needs: contract
     timeout-minutes: 75
     environment: ci-ditto
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-ditto-build-local
+      cancel-in-progress: false
     permissions:
       contents: read
+      id-token: write
     runs-on:
       - self-hosted
       - linux
@@ -108,6 +119,11 @@ jobs:
       - uses: actions/checkout@v4
         with: { ref: '${{ inputs.source_sha }}' }
       - uses: AtomiCloud/actions.setup-nix@v3
+      - *derive-identity
+      - uses: *subject-download
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
       - id: run
         env: { DIENE_EXPECTED_JOB_ID: environment-ditto-build-local }
         run: &lane-run |
@@ -146,6 +162,9 @@ jobs:
     needs: contract
     timeout-minutes: 75
     environment: ci-ditto-pull
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-ditto-target-pull
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: read
@@ -165,6 +184,11 @@ jobs:
       - uses: actions/checkout@v4
         with: { ref: '${{ inputs.source_sha }}' }
       - uses: AtomiCloud/actions.setup-nix@v3
+      - *derive-identity
+      - uses: *subject-download
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
       - id: run
         env: { DIENE_EXPECTED_JOB_ID: environment-ditto-target-pull }
         run: *lane-run
@@ -186,8 +210,12 @@ jobs:
     needs: contract
     timeout-minutes: 90
     environment: ci-ditto-vendor
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-ditto-vendor-${{ inputs.action_id }}
+      cancel-in-progress: false
     permissions:
       contents: read
+      id-token: write
     runs-on:
       - self-hosted
       - linux
@@ -206,6 +234,11 @@ jobs:
       - uses: actions/checkout@v4
         with: { ref: '${{ inputs.source_sha }}' }
       - uses: AtomiCloud/actions.setup-nix@v3
+      - *derive-identity
+      - uses: *subject-download
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
       - id: run
         # The approved demo credential is phase-scoped to this single step; no
         # other step in the job, including checkout and the sweep, can read it.
@@ -234,8 +267,12 @@ jobs:
     needs: contract
     timeout-minutes: 120
     environment: ci-absol
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-absol
+      cancel-in-progress: false
     permissions:
       contents: read
+      id-token: write
     runs-on:
       - self-hosted
       - linux
@@ -251,6 +288,11 @@ jobs:
       - uses: actions/checkout@v4
         with: { ref: '${{ inputs.source_sha }}' }
       - uses: AtomiCloud/actions.setup-nix@v3
+      - *derive-identity
+      - uses: *subject-download
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
       - id: run
         env: { DIENE_EXPECTED_JOB_ID: environment-absol }
         run: *lane-run
@@ -271,9 +313,10 @@ jobs:
     if: inputs.lane == 'fleet-independence'
     needs: contract
     timeout-minutes: 60
-    # A dedicated environment: the independence fixture must not inherit the
-    # ordinary Ditto seed-fetch identity.
-    environment: ci-ditto-independence
+    environment: ci-ditto
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-fleet-independence
+      cancel-in-progress: false
     permissions:
       contents: read
     runs-on:
@@ -291,12 +334,23 @@ jobs:
       - uses: actions/checkout@v4
         with: { ref: '${{ inputs.source_sha }}' }
       - uses: AtomiCloud/actions.setup-nix@v3
+      - *derive-identity
+      - uses: *subject-download
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
       - id: run
-        env: { DIENE_EXPECTED_JOB_ID: environment-fleet-independence }
+        # The independence fixture is fixed by the contract, not selected by a
+        # caller, so it is hard-coded here.
+        env:
+          DIENE_EXPECTED_JOB_ID: environment-fleet-independence
+          DIENE_FIXTURE_ID: bootstrap-fleet-independence-v1
         run: *lane-run
       - name: Sweep exact receipt after the runtime step
         if: always()
-        env: { DIENE_EXPECTED_JOB_ID: environment-fleet-independence }
+        env:
+          DIENE_EXPECTED_JOB_ID: environment-fleet-independence
+          DIENE_FIXTURE_ID: bootstrap-fleet-independence-v1
         run: *lane-sweep
       - if: always()
         uses: actions/upload-artifact@v4
