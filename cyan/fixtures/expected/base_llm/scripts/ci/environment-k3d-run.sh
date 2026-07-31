@@ -167,8 +167,8 @@ emit_report() {
     --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" \
     --arg lane "$DIENE_LANE" --arg profile "$profile" --arg buildMode "$build_mode" \
     --arg artifactDigest "$DIENE_ARTIFACT_DIGEST" \
-    --arg imageRef "$DIENE_ARTIFACT_IMAGE_REF" \
-    --arg producerWorkflowRef "$DIENE_ARTIFACT_PRODUCER_WORKFLOW_REF" \
+    --arg imageRef "${DIENE_SUBJECT_IMAGE_REF:-}" \
+    --arg producerWorkflowRef "${DIENE_SUBJECT_PRODUCER_WORKFLOW_REF:-}" \
     --arg attestationDigest "${DIENE_ARTIFACT_ATTESTATION_DIGEST:-}" \
     --arg closureDigest "${DIENE_CLOSURE_DIGEST:-}" \
     --arg closureSignatureDigest "${DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST:-}" \

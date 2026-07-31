@@ -88,10 +88,8 @@ jobs:
       id-token: write
     outputs:
       artifact_digest: ${{ steps.subject.outputs.artifact_digest }}
-      artifact_image_ref: ${{ steps.subject.outputs.artifact_image_ref }}
-      artifact_producer_workflow_ref: ${{ steps.subject.outputs.artifact_producer_workflow_ref }}
+      artifact_provenance_ref: ${{ steps.subject.outputs.artifact_provenance_ref }}
       artifact_attestation_digest: ${{ steps.subject.outputs.artifact_attestation_digest }}
-      artifact_pull_identity: ${{ steps.subject.outputs.artifact_pull_identity }}
       garden_lock_digest: ${{ steps.subject.outputs.garden_lock_digest }}
       closure_digest: ${{ steps.subject.outputs.closure_digest }}
       closure_bundle_ref: ${{ steps.subject.outputs.closure_bundle_ref }}
@@ -123,10 +121,8 @@ jobs:
             printf 'garden_lock_digest=sha256:%s\n' "$lock"
             nix develop .#ci -c jq -r '
               "artifact_digest=" + .artifact.digest,
-              "artifact_image_ref=" + .artifact.imageRef,
-              "artifact_producer_workflow_ref=" + .artifact.producer.workflowRef,
+              "artifact_provenance_ref=" + (.provenance.provenanceRef // ""),
               "artifact_attestation_digest=" + (.provenance.attestationDigest // ""),
-              "artifact_pull_identity=" + (.provenance.pullIdentity // ""),
               "closure_digest=" + (.closure.digest // ""),
               "closure_bundle_ref=" + (.closure.bundleRef // ""),
               "closure_signature_bundle_digest=" + (.closure.signatureBundleDigest // ""),
@@ -134,27 +130,77 @@ jobs:
               "absol_ready=" + (if .closure then "true" else "false" end)
             ' "$subject"
           } >>"$GITHUB_OUTPUT"
+      - name: Hand the immutable subject to the same-run gates
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/artifact.v1.json
+          if-no-files-found: error
+          retention-days: 1
 
-  environment-ditto-build-local:
+  # The blocking runtime-free gate, in this run. It validates the exact subject
+  # artifact-build already produced — it never invokes the producer a second
+  # time — and mutates no cluster, so every runtime lane can depend on it
+  # before any disposable runner is selected.
+  environment-profile-contract:
+    name: Environment Profile Contract
     if: needs.authorize-runtime.outputs.enabled == 'true'
     needs: [authorize-runtime, artifact-build]
-    permissions: { contents: read }
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ needs.authorize-runtime.outputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
+      - name: Validate the same-run subject handoff
+        env:
+          GITHUB_SHA: ${{ needs.authorize-runtime.outputs.source_sha }}
+          DIENE_BASE_WORKFLOW_REF: ${{ needs.authorize-runtime.outputs.base_workflow_ref }}
+        run: |
+          nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh \
+            --validate-subject "$RUNNER_TEMP/subject/artifact.v1.json"
+      - name: Validate runtime-free profile, corpus, and parity
+        run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh
+      - name: Upload safe profile contract report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-profile-contract-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-profile-contract.json
+          if-no-files-found: error
+          retention-days: 7
+
+
+  # Trigger matrix per the goal's lane table. Build-local and target-pull run
+  # on protected push or authorized dispatch only; Absol adds the
+  # release-candidate dispatch; the weekly schedule reaches fleet-independence
+  # and nothing else.
+  environment-ditto-build-local:
+    if: >-
+      needs.authorize-runtime.outputs.enabled == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [authorize-runtime, artifact-build, environment-profile-contract]
+    permissions: { contents: read, id-token: write }
     uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
     with:
       lane: ditto-build-local
       repository_id: ${{ fromJSON(github.repository_id) }}
       repository_key: ${{ github.repository }}
       source_sha: ${{ needs.authorize-runtime.outputs.source_sha }}
-      base_workflow_ref: ${{ needs.authorize-runtime.outputs.base_workflow_ref }}
       garden_lock_digest: ${{ needs.artifact-build.outputs.garden_lock_digest }}
       artifact_digest: ${{ needs.artifact-build.outputs.artifact_digest }}
-      artifact_image_ref: ${{ needs.artifact-build.outputs.artifact_image_ref }}
-      artifact_producer_workflow_ref: ${{ needs.artifact-build.outputs.artifact_producer_workflow_ref }}
       journey_manifest: .diene/ci/journeys.v1.yaml
 
   environment-ditto-target-pull:
-    if: needs.authorize-runtime.outputs.enabled == 'true'
-    needs: [authorize-runtime, artifact-build]
+    if: >-
+      needs.authorize-runtime.outputs.enabled == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [authorize-runtime, artifact-build, environment-profile-contract]
     permissions: { contents: read, packages: read, id-token: write }
     uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
     with:
@@ -162,33 +208,28 @@ jobs:
       repository_id: ${{ fromJSON(github.repository_id) }}
       repository_key: ${{ github.repository }}
       source_sha: ${{ needs.authorize-runtime.outputs.source_sha }}
-      base_workflow_ref: ${{ needs.authorize-runtime.outputs.base_workflow_ref }}
       garden_lock_digest: ${{ needs.artifact-build.outputs.garden_lock_digest }}
       artifact_digest: ${{ needs.artifact-build.outputs.artifact_digest }}
-      artifact_image_ref: ${{ needs.artifact-build.outputs.artifact_image_ref }}
-      artifact_producer_workflow_ref: ${{ needs.artifact-build.outputs.artifact_producer_workflow_ref }}
+      artifact_provenance_ref: ${{ needs.artifact-build.outputs.artifact_provenance_ref }}
       artifact_attestation_digest: ${{ needs.artifact-build.outputs.artifact_attestation_digest }}
-      artifact_pull_identity: ${{ needs.artifact-build.outputs.artifact_pull_identity }}
       journey_manifest: .diene/ci/journeys.v1.yaml
 
   environment-absol:
     if: >-
       needs.authorize-runtime.outputs.enabled == 'true' &&
       needs.artifact-build.outputs.absol_ready == 'true' &&
-      (github.event_name == 'push' || inputs.release_candidate == true)
-    needs: [authorize-runtime, artifact-build]
-    permissions: { contents: read }
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.release_candidate == true))
+    needs: [authorize-runtime, artifact-build, environment-profile-contract]
+    permissions: { contents: read, id-token: write }
     uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
     with:
       lane: absol
       repository_id: ${{ fromJSON(github.repository_id) }}
       repository_key: ${{ github.repository }}
       source_sha: ${{ needs.authorize-runtime.outputs.source_sha }}
-      base_workflow_ref: ${{ needs.authorize-runtime.outputs.base_workflow_ref }}
       garden_lock_digest: ${{ needs.artifact-build.outputs.garden_lock_digest }}
       artifact_digest: ${{ needs.artifact-build.outputs.artifact_digest }}
-      artifact_image_ref: ${{ needs.artifact-build.outputs.artifact_image_ref }}
-      artifact_producer_workflow_ref: ${{ needs.artifact-build.outputs.artifact_producer_workflow_ref }}
       journey_manifest: .diene/ci/journeys.v1.yaml
       closure_digest: ${{ needs.artifact-build.outputs.closure_digest }}
       closure_bundle_ref: ${{ needs.artifact-build.outputs.closure_bundle_ref }}
@@ -199,7 +240,7 @@ jobs:
     if: >-
       needs.authorize-runtime.outputs.enabled == 'true' &&
       (github.event_name == 'push' || github.event_name == 'schedule')
-    needs: [authorize-runtime, artifact-build]
+    needs: [authorize-runtime, artifact-build, environment-profile-contract]
     permissions: { contents: read }
     uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
     with:
@@ -207,10 +248,6 @@ jobs:
       repository_id: ${{ fromJSON(github.repository_id) }}
       repository_key: ${{ github.repository }}
       source_sha: ${{ needs.authorize-runtime.outputs.source_sha }}
-      base_workflow_ref: ${{ needs.authorize-runtime.outputs.base_workflow_ref }}
       garden_lock_digest: ${{ needs.artifact-build.outputs.garden_lock_digest }}
       artifact_digest: ${{ needs.artifact-build.outputs.artifact_digest }}
-      artifact_image_ref: ${{ needs.artifact-build.outputs.artifact_image_ref }}
-      artifact_producer_workflow_ref: ${{ needs.artifact-build.outputs.artifact_producer_workflow_ref }}
       journey_manifest: .diene/ci/journeys.v1.yaml
-      fixture_id: bootstrap-fleet-independence-v1
