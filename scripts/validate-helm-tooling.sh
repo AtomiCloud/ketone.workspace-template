@@ -21,6 +21,8 @@ readonly NON_HELM_FIXTURES=(
   secret_only
 )
 
+declare -A FIXTURE_KIND=()
+
 fail() {
   printf 'helm-tooling validation failed: %s\n' "$*" >&2
   exit 1
@@ -32,7 +34,7 @@ require_exactly_once() {
   local count
 
   [[ -f "${file}" ]] || fail "missing ${file}"
-  count="$(grep -Ec "^[[:space:]]*${tool}[[:space:]]*$" "${file}" || true)"
+  count="$(grep -Ec "^[[:space:]]*${tool}([[:space:]]*#.*)?[[:space:]]*$" "${file}" || true)"
   [[ "${count}" == 1 ]] || fail "expected ${tool} exactly once in ${file}, found ${count}"
 }
 
@@ -41,10 +43,24 @@ require_absent() {
   local tool="$2"
 
   [[ -f "${file}" ]] || fail "missing ${file}"
-  if grep -Eq "^[[:space:]]*${tool}[[:space:]]*$" "${file}"; then
+  if grep -Eq "^[[:space:]]*${tool}([[:space:]]*#.*)?[[:space:]]*$" "${file}"; then
     fail "unexpected ${tool} in non-Helm fixture ${file}"
   fi
 }
+
+for fixture in "${HELM_FIXTURES[@]}"; do
+  [[ -z "${FIXTURE_KIND[${fixture}]:-}" ]] || fail "duplicate fixture classification: ${fixture}"
+  FIXTURE_KIND["${fixture}"]=helm
+done
+for fixture in "${NON_HELM_FIXTURES[@]}"; do
+  [[ -z "${FIXTURE_KIND[${fixture}]:-}" ]] || fail "duplicate fixture classification: ${fixture}"
+  FIXTURE_KIND["${fixture}"]=non-helm
+done
+for fixture_dir in cyan/fixtures/expected/*; do
+  [[ -d "${fixture_dir}" ]] || continue
+  fixture="${fixture_dir##*/}"
+  [[ -n "${FIXTURE_KIND[${fixture}]:-}" ]] || fail "unclassified fixture directory: ${fixture}"
+done
 
 require_in_block() {
   local file="$1"
@@ -97,17 +113,16 @@ for fixture in "${HELM_FIXTURES[@]}"; do
   require_merged_package_set "cyan/fixtures/expected/${fixture}/nix/packages.nix" nix-2605
 done
 
-if command -v nix-instantiate >/dev/null 2>&1; then
-  nix_files=("${SOURCE_FILES[@]}")
-  for fixture in "${HELM_FIXTURES[@]}" "${NON_HELM_FIXTURES[@]}"; do
-    nix_files+=(
-      "cyan/fixtures/expected/${fixture}/nix/env.nix"
-      "cyan/fixtures/expected/${fixture}/nix/packages.nix"
-    )
-  done
-  for file in "${nix_files[@]}"; do
-    nix-instantiate --parse "${file}" >/dev/null
-  done
-fi
+command -v nix-instantiate >/dev/null 2>&1 || fail 'nix-instantiate is required'
+nix_files=("${SOURCE_FILES[@]}")
+for fixture in "${HELM_FIXTURES[@]}" "${NON_HELM_FIXTURES[@]}"; do
+  nix_files+=(
+    "cyan/fixtures/expected/${fixture}/nix/env.nix"
+    "cyan/fixtures/expected/${fixture}/nix/packages.nix"
+  )
+done
+for file in "${nix_files[@]}"; do
+  nix-instantiate --parse "${file}" >/dev/null
+done
 
 printf 'helm-tooling validation passed\n'
