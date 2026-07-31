@@ -230,6 +230,11 @@ diene_validate_inputs() {
     [[ ${DIENE_CLOSURE_BUNDLE_REF:-} =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]]+$ &&
       $DIENE_CLOSURE_BUNDLE_REF == *"$GITHUB_SHA"* ]] ||
       diene_die UntrustedSubject 'closure bundle does not bind source_sha'
+    [[ $DIENE_CLOSURE_DIGEST == "$DIENE_SUBJECT_CLOSURE_DIGEST" &&
+      $DIENE_CLOSURE_BUNDLE_REF == "$DIENE_SUBJECT_CLOSURE_BUNDLE_REF" &&
+      $DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST == "$DIENE_SUBJECT_CLOSURE_SIGNATURE_DIGEST" &&
+      $DIENE_CLOSURE_TRUST_ROOT_DIGEST == "$DIENE_SUBJECT_CLOSURE_TRUST_ROOT_DIGEST" ]] ||
+      diene_die UntrustedSubject 'Absol closure inputs do not match the immutable artifact subject'
   else
     [[ -z ${DIENE_CLOSURE_DIGEST:-} && -z ${DIENE_CLOSURE_BUNDLE_REF:-} &&
       -z ${DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST:-} && -z ${DIENE_CLOSURE_TRUST_ROOT_DIGEST:-} ]] ||
@@ -264,8 +269,14 @@ diene_load_subject() {
   DIENE_SUBJECT_PROVENANCE_REF=$(jq -r '.provenance.provenanceRef // ""' "$subject")
   DIENE_SUBJECT_ATTESTATION_DIGEST=$(jq -r '.provenance.attestationDigest // ""' "$subject")
   DIENE_SUBJECT_PULL_IDENTITY=$(jq -r '.provenance.pullIdentity // ""' "$subject")
+  DIENE_SUBJECT_CLOSURE_DIGEST=$(jq -r '.closure.digest // ""' "$subject")
+  DIENE_SUBJECT_CLOSURE_BUNDLE_REF=$(jq -r '.closure.bundleRef // ""' "$subject")
+  DIENE_SUBJECT_CLOSURE_SIGNATURE_DIGEST=$(jq -r '.closure.signatureBundleDigest // ""' "$subject")
+  DIENE_SUBJECT_CLOSURE_TRUST_ROOT_DIGEST=$(jq -r '.closure.trustRootDigest // ""' "$subject")
   export DIENE_SUBJECT_IMAGE_REF DIENE_SUBJECT_PRODUCER_WORKFLOW_REF \
-    DIENE_SUBJECT_PROVENANCE_REF DIENE_SUBJECT_ATTESTATION_DIGEST DIENE_SUBJECT_PULL_IDENTITY
+    DIENE_SUBJECT_PROVENANCE_REF DIENE_SUBJECT_ATTESTATION_DIGEST DIENE_SUBJECT_PULL_IDENTITY \
+    DIENE_SUBJECT_CLOSURE_DIGEST DIENE_SUBJECT_CLOSURE_BUNDLE_REF \
+    DIENE_SUBJECT_CLOSURE_SIGNATURE_DIGEST DIENE_SUBJECT_CLOSURE_TRUST_ROOT_DIGEST
   [[ $DIENE_SUBJECT_IMAGE_REF =~ @sha256:[0-9a-f]{64}$ && ${DIENE_SUBJECT_IMAGE_REF##*@} == "$DIENE_ARTIFACT_DIGEST" ]] ||
     diene_die UntrustedSubject 'artifact image ref is not the declared immutable digest'
 }
@@ -670,6 +681,19 @@ diene_policy_mode() {
   esac
 }
 
+diene_require_source_executable() {
+  local label=${1:?capability label required}
+  local path=${2:-}
+  local reason=${3:-ConnectedEgressInterfaceUnavailable}
+  [[ -n $path && $path != /* && $path != *'..'* &&
+    $path =~ ^[A-Za-z0-9._/-]+$ ]] ||
+    diene_die "$reason" \
+      "$label must be a safe repository-relative executable copied with the pinned source"
+  [[ -f $path && -x $path && ! -L $path ]] ||
+    diene_die "$reason" \
+      "$label $path is absent, non-executable, or a link before nsc create"
+}
+
 diene_prepare_egress_contract() {
   local target=${1:?egress contract target required}
   local profile mode entries
@@ -687,6 +711,8 @@ diene_prepare_egress_contract() {
       [[ -n ${DIENE_VENDOR_CREDENTIAL_BROKER_BIN:-} ]] ||
         diene_die VendorBrokerInterfaceUnavailable \
           'vendor lane requires an approved phase broker; credential bytes never cross the orchestrator boundary'
+      diene_require_source_executable 'vendor credential broker' \
+        "$DIENE_VENDOR_CREDENTIAL_BROKER_BIN" VendorBrokerInterfaceUnavailable
     else
       [[ -n ${DIENE_CONNECTED_EGRESS_JSON:-} ]] ||
         diene_die ConnectedEgressInterfaceUnavailable \
@@ -711,6 +737,7 @@ diene_prepare_egress_contract() {
     [[ -n ${DIENE_EGRESS_L7_ENFORCER_BIN:-} ]] ||
       diene_die ConnectedEgressInterfaceUnavailable \
         'connected profiles require an L7 enforcer for declared DNS, SNI and method boundaries'
+    diene_require_source_executable 'connected L7 enforcer' "$DIENE_EGRESS_L7_ENFORCER_BIN"
     if [[ $DIENE_LANE == ditto-target-pull ]]; then
       local registry
       registry=$(jq -er '.artifact.registry' "${DIENE_ARTIFACT_SUBJECT:?}")
@@ -722,6 +749,9 @@ diene_prepare_egress_contract() {
   [[ ${DIENE_EGRESS_CANARY_IMAGE:-} =~ @sha256:[0-9a-f]{64}$ ]] ||
     diene_die InterimPolicyUnavailable \
       'a preloaded immutable host/pod egress-canary image is required before instance creation'
+  if [[ -n ${DIENE_EGRESS_PROBE_BIN:-} ]]; then
+    diene_require_source_executable 'hostile egress probe adapter' "$DIENE_EGRESS_PROBE_BIN"
+  fi
   jq -n --arg profile "$profile" --arg mode "$mode" --argjson entries "$entries" '
     {apiVersion:"diene.atomi.cloud/ci-egress-contract/v1",profileId:$profile,
      mode:$mode,entries:$entries,
@@ -750,7 +780,8 @@ diene_resolve_egress_contract() {
       diene_die ConnectedEgressInterfaceUnavailable "resolver returned an invalid IPv4 address for $dns"
     jq -e 'all(.[]; contains(":"))' <<<"$ipv6" >/dev/null ||
       diene_die ConnectedEgressInterfaceUnavailable "resolver returned an invalid IPv6 address for $dns"
-    jq -e --argjson v4 "$ipv4" --argjson v6 "$ipv6" '$v4 | length > 0 or $v6 | length > 0' <<<null >/dev/null ||
+    jq -e --argjson v4 "$ipv4" --argjson v6 "$ipv6" \
+      '(($v4 | length) > 0) or (($v6 | length) > 0)' <<<null >/dev/null ||
       diene_die ConnectedEgressInterfaceUnavailable "declared endpoint $dns did not resolve before policy activation"
     resolved=$(jq -cn --argjson old "$resolved" --argjson entry "$entry" \
       --argjson v4 "$ipv4" --argjson v6 "$ipv6" \
@@ -856,9 +887,14 @@ diene_apply_interim_policy() {
   out6_chain="DI6O_$hash"
   forward6_chain="DI6F_$hash"
   local kubectl_bin=${DIENE_KUBECTL_BIN:-kubectl}
-  local pod_cidr service_cidr
-  pod_cidr=$($kubectl_bin get nodes -o json | jq -er '.items | select(length == 1) | .[0].spec.podCIDR') ||
+  local pod_cidr pod6_cidrs service_cidr nodes_json
+  nodes_json=$($kubectl_bin get nodes -o json) ||
+    diene_die InterimPolicyUnavailable 'built-in k3s node topology is unavailable'
+  pod_cidr=$(jq -er '.items | select(length == 1) | .[0].spec.podCIDR |
+    select(type == "string" and contains(":") == false)' <<<"$nodes_json") ||
     diene_die InterimPolicyUnavailable 'one observed IPv4 pod CIDR is required'
+  pod6_cidrs=$(jq -c '[.items[0].spec.podCIDRs[]? | select(type == "string" and contains(":"))]' \
+    <<<"$nodes_json")
   [[ -f ${DIENE_PREFLIGHT_EVIDENCE:-} ]] ||
     diene_die InterimPolicyUnavailable 'runner preflight evidence is required before policy activation'
   service_cidr=$(jq -er '.network.serviceCidrs | select(length == 1) | .[0]' "$DIENE_PREFLIGHT_EVIDENCE") ||
@@ -927,10 +963,26 @@ diene_apply_interim_policy() {
       while IFS= read -r address; do
         [[ -n $address ]] || continue
         "$ip6tables_bin" -w 5 -A "$out6_chain" -p tcp -d "$address" --dport "$port" -j ACCEPT
+        while IFS= read -r pod6_cidr; do
+          [[ -n $pod6_cidr ]] || continue
+          "$ip6tables_bin" -w 5 -A "$forward6_chain" -s "$pod6_cidr" \
+            -p tcp -d "$address" --dport "$port" -j ACCEPT
+        done < <(jq -r '.[]' <<<"$pod6_cidrs")
       done < <(jq -r '.addresses.ipv6[]' <<<"$entry")
     done < <(jq -c '.resolvedEntries[]' "$resolved")
     "$ip6tables_bin" -w 5 -A "$out6_chain" -j REJECT
-    "$ip6tables_bin" -w 5 -A "$forward6_chain" -j REJECT
+    local pod6_cidr
+    while IFS= read -r pod6_cidr; do
+      [[ -n $pod6_cidr ]] || continue
+      while IFS= read -r route; do
+        [[ -n $route && $route != default ]] || continue
+        "$ip6tables_bin" -w 5 -A "$forward6_chain" -s "$pod6_cidr" -d "$route" -j ACCEPT
+      done < <(ip -o -6 route show | awk '$1 != "default" {print $1}' | sort -u)
+      "$ip6tables_bin" -w 5 -A "$forward6_chain" -s "$pod6_cidr" -j REJECT
+    done < <(jq -r '.[]' <<<"$pod6_cidrs")
+    # No observed IPv6 pod CIDR means no IPv6 pod traffic is claimed. Return
+    # unrelated forwarded traffic instead of installing a host-wide reject.
+    "$ip6tables_bin" -w 5 -A "$forward6_chain" -j RETURN
     if ! "$ip6tables_bin" -w 5 -I OUTPUT 1 -j "$out6_chain" ||
       ! "$ip6tables_bin" -w 5 -I FORWARD 1 -j "$forward6_chain"; then
       diene_die InterimPolicyUnavailable 'could not hook receipt-scoped IPv6 OUTPUT/FORWARD chains'
@@ -963,12 +1015,12 @@ diene_apply_interim_policy() {
     --arg mode "$(diene_policy_mode "$DIENE_LANE")" \
     --arg profile "$(diene_egress_profile "$DIENE_LANE")" --arg clusterId "$DIENE_NSC_CLUSTER_ID" \
     --arg podCidr "$pod_cidr" --arg serviceCidr "$service_cidr" --arg rulesDigest "$rules_digest" \
-    --argjson ipv6Armed "$ipv6_armed" '
+    --argjson ipv6Armed "$ipv6_armed" --argjson pod6Cidrs "$pod6_cidrs" '
       {mechanism:"interim-in-guest-iptables-nft",backend:"nf_tables",
        platformStatus:"platform per-instance policy pending (support ask #4)",
        trustBoundary:"trusted-generated-content",outputChain:$outputChain,forwardChain:$forwardChain,
        output6Chain:$output6Chain,forward6Chain:$forward6Chain,ipv6Armed:$ipv6Armed,
-       mode:$mode,profileId:$profile,clusterId:$clusterId,podCidr:$podCidr,
+       mode:$mode,profileId:$profile,clusterId:$clusterId,podCidr:$podCidr,pod6Cidrs:$pod6Cidrs,
        serviceCidr:$serviceCidr,rulesDigest:$rulesDigest,applied:true,
        orchestrationException:"exact-ssh-4-tuple"}' | diene_write_json "$transcript"
   DIENE_INTERIM_POLICY_OUTPUT_CHAIN=$out_chain
@@ -999,10 +1051,15 @@ diene_remove_interim_policy() {
     "$ip6tables_bin" -w 5 -F "$DIENE_INTERIM_POLICY_FORWARD6_CHAIN" || failed=1
     "$ip6tables_bin" -w 5 -X "$DIENE_INTERIM_POLICY_OUTPUT6_CHAIN" || failed=1
     "$ip6tables_bin" -w 5 -X "$DIENE_INTERIM_POLICY_FORWARD6_CHAIN" || failed=1
+    "$ip6tables_bin" -w 5 -S OUTPUT | grep -Fq -- "-j $DIENE_INTERIM_POLICY_OUTPUT6_CHAIN" && failed=1
+    "$ip6tables_bin" -w 5 -S FORWARD | grep -Fq -- "-j $DIENE_INTERIM_POLICY_FORWARD6_CHAIN" && failed=1
+    "$ip6tables_bin" -w 5 -S "$DIENE_INTERIM_POLICY_OUTPUT6_CHAIN" >/dev/null 2>&1 && failed=1
+    "$ip6tables_bin" -w 5 -S "$DIENE_INTERIM_POLICY_FORWARD6_CHAIN" >/dev/null 2>&1 && failed=1
   fi
   if [[ ${DIENE_L7_EGRESS_ARMED:-false} == true ]]; then
     "$DIENE_EGRESS_L7_ENFORCER_BIN" remove --profile "$(diene_egress_profile "$DIENE_LANE")" \
       --receipt "$(diene_receipt_id)" || failed=1
+    [[ -n ${DIENE_L7_EGRESS_EVIDENCE:-} ]] || failed=1
   fi
   "$iptables_bin" -w 5 -S OUTPUT | grep -Fq -- "-j $DIENE_INTERIM_POLICY_OUTPUT_CHAIN" && failed=1
   "$iptables_bin" -w 5 -S FORWARD | grep -Fq -- "-j $DIENE_INTERIM_POLICY_FORWARD_CHAIN" && failed=1

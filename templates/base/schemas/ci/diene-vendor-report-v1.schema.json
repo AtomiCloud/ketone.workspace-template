@@ -80,7 +80,7 @@
     },
     {
       "if": {
-        "properties": { "outcome": { "const": "Pass" } },
+        "properties": { "outcome": { "enum": ["Pass", "Unavailable"] } },
         "required": ["outcome", "namespaceLifecycle"]
       },
       "then": {
@@ -117,6 +117,22 @@
                 "properties": { "outcome": { "const": "Pass" }, "collectedBeforeDestroy": { "const": true } }
               },
               "egressCanary": { "properties": { "outcome": { "const": "Pass" } } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "Unavailable" } },
+        "required": ["outcome", "namespaceLifecycle"]
+      },
+      "then": {
+        "properties": {
+          "vendorOutcome": {
+            "properties": {
+              "outcome": { "const": "Unavailable" },
+              "required": { "const": false }
             }
           }
         }

@@ -239,7 +239,11 @@ vendor_finalize() {
   if ((result == 0)); then
     diene_checkpoint_append "$checkpoint" final-clean-pass Pass "$evidence_digest" false
     diene_checkpoint_seal "$checkpoint" true
-    vendor_emit_report "$vendor_outcome" ''
+    if [[ $vendor_outcome == Unavailable && $action_required == false ]]; then
+      vendor_emit_report Unavailable "$vendor_reason"
+    else
+      vendor_emit_report "$vendor_outcome" ''
+    fi
   else
     diene_checkpoint_append "$checkpoint" driver-failure Fail "$evidence_digest" false
     diene_checkpoint_seal "$checkpoint" false
@@ -329,10 +333,29 @@ credential_issued=1
 action_started=$SECONDS
 vendor_outcome=Pass
 vendor_reason=AssertionsSatisfied
-if ! diene_run_argv "$action" . setup; then vendor_outcome=Fail; vendor_reason=SetupFailed; fi
-if [[ $vendor_outcome == Pass ]] && ! diene_run_argv "$action" . probe; then
+action_rc=0
+if diene_run_argv "$action" . setup; then
+  :
+else
+  action_rc=$?
   vendor_outcome=Fail
-  vendor_reason=ProbeFailed
+  vendor_reason=SetupFailed
+fi
+if [[ $vendor_outcome == Pass ]]; then
+  if diene_run_argv "$action" . probe; then
+    :
+  else
+    action_rc=$?
+    vendor_outcome=Fail
+    vendor_reason=ProbeFailed
+  fi
+fi
+# Exit 69 is the declared adapter signal for an unavailable sandbox. It is
+# nonblocking only for an explicitly optional action; every other failure is
+# still a real vendor failure.
+if [[ $action_rc == 69 && $action_required == false ]]; then
+  vendor_outcome=Unavailable
+  vendor_reason=ProviderUnavailable
 fi
 action_seconds=$((SECONDS - action_started))
 diene_checkpoint_append "$checkpoint" vendor-action \
