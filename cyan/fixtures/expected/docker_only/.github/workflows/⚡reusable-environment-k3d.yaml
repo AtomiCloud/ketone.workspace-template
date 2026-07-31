@@ -1,0 +1,307 @@
+name: ⚡ Reusable Environment k3d
+
+on:
+  workflow_call:
+    inputs:
+      lane: { required: true, type: string }
+      repository_id: { required: true, type: number }
+      repository_key: { required: true, type: string }
+      source_sha: { required: true, type: string }
+      base_workflow_ref: { required: true, type: string }
+      garden_lock_digest: { required: true, type: string }
+      artifact_digest: { required: true, type: string }
+      artifact_image_ref: { required: true, type: string }
+      artifact_producer_workflow_ref: { required: true, type: string }
+      artifact_attestation_digest: { required: false, type: string, default: '' }
+      artifact_pull_identity: { required: false, type: string, default: '' }
+      journey_manifest: { required: false, type: string, default: '' }
+      vendor_manifest: { required: false, type: string, default: '' }
+      action_id: { required: false, type: string, default: '' }
+      fixture_id: { required: false, type: string, default: '' }
+      closure_digest: { required: false, type: string, default: '' }
+      closure_bundle_ref: { required: false, type: string, default: '' }
+      closure_signature_bundle_digest: { required: false, type: string, default: '' }
+      closure_trust_root_digest: { required: false, type: string, default: '' }
+    outputs:
+      subject_digest:
+        value: ${{ jobs.environment-ditto-build-local.outputs.subject_digest || jobs.environment-ditto-target-pull.outputs.subject_digest || jobs.environment-ditto-vendor.outputs.subject_digest || jobs.environment-absol.outputs.subject_digest || jobs.environment-fleet-independence.outputs.subject_digest }}
+      receipt_id:
+        value: ${{ jobs.environment-ditto-build-local.outputs.receipt_id || jobs.environment-ditto-target-pull.outputs.receipt_id || jobs.environment-ditto-vendor.outputs.receipt_id || jobs.environment-absol.outputs.receipt_id || jobs.environment-fleet-independence.outputs.receipt_id }}
+      core_report_digest:
+        value: ${{ jobs.environment-ditto-build-local.outputs.core_report_digest || jobs.environment-ditto-target-pull.outputs.core_report_digest || jobs.environment-absol.outputs.core_report_digest || jobs.environment-fleet-independence.outputs.core_report_digest }}
+      vendor_report_digest:
+        value: ${{ jobs.environment-ditto-vendor.outputs.vendor_report_digest }}
+
+permissions: {}
+
+# Lane-scoped: two runs of the same lane serialise on the shared runner pool
+# while different lanes of one run stay independent. Receipt identity is lane
+# scoped too, so parallel lanes never share a cleanup selector.
+concurrency:
+  group: k3d-${{ inputs.repository_id }}-${{ inputs.lane }}-${{ inputs.action_id }}
+  cancel-in-progress: false
+
+jobs:
+  # Every refusal decidable without a cluster is decided here, on a
+  # GitHub-hosted runner, before any lane job can select a disposable
+  # self-hosted runner. An untrusted selector, a missing controller/image pin,
+  # an unaccepted RunnerProvisionerReady proof, or an absent repository-owned
+  # artifact subject never reaches runner allocation.
+  contract:
+    name: Input Contract
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env: &contract-env
+      DIENE_LANE: ${{ inputs.lane }}
+      GITHUB_REPOSITORY_ID: ${{ inputs.repository_id }}
+      GITHUB_REPOSITORY: ${{ inputs.repository_key }}
+      GITHUB_SHA: ${{ inputs.source_sha }}
+      DIENE_BASE_WORKFLOW_REF: ${{ inputs.base_workflow_ref }}
+      DIENE_GARDEN_LOCK_DIGEST: ${{ inputs.garden_lock_digest }}
+      DIENE_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      DIENE_ARTIFACT_IMAGE_REF: ${{ inputs.artifact_image_ref }}
+      DIENE_ARTIFACT_PRODUCER_WORKFLOW_REF: ${{ inputs.artifact_producer_workflow_ref }}
+      DIENE_ARTIFACT_ATTESTATION_DIGEST: ${{ inputs.artifact_attestation_digest }}
+      DIENE_ARTIFACT_PULL_IDENTITY: ${{ inputs.artifact_pull_identity }}
+      DIENE_JOURNEY_MANIFEST: ${{ inputs.journey_manifest }}
+      DIENE_VENDOR_MANIFEST: ${{ inputs.vendor_manifest }}
+      DIENE_ACTION_ID: ${{ inputs.action_id }}
+      DIENE_FIXTURE_ID: ${{ inputs.fixture_id }}
+      DIENE_CLOSURE_DIGEST: ${{ inputs.closure_digest }}
+      DIENE_CLOSURE_BUNDLE_REF: ${{ inputs.closure_bundle_ref }}
+      DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST: ${{ inputs.closure_signature_bundle_digest }}
+      DIENE_CLOSURE_TRUST_ROOT_DIGEST: ${{ inputs.closure_trust_root_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - name: Refuse untrusted selectors and subjects before runner selection
+        run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-inputs
+      - name: Refuse missing runner pin or artifact producer before runner selection
+        run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-prerequisites
+
+  environment-ditto-build-local:
+    name: environment-ditto-build-local
+    if: inputs.lane == 'ditto-build-local'
+    needs: contract
+    timeout-minutes: 75
+    environment: ci-ditto
+    permissions:
+      contents: read
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - diene-k3d-isolated-v1
+      - diene-job-r${{ inputs.repository_id }}-w${{ github.run_id }}-a${{ github.run_attempt }}-jenvironment-ditto-build-local
+    env: *contract-env
+    outputs: &core-outputs
+      subject_digest: ${{ steps.run.outputs.subject_digest }}
+      receipt_id: ${{ steps.run.outputs.receipt_id }}
+      core_report_digest: ${{ steps.run.outputs.core_report_digest }}
+    steps:
+      - name: Verify immutable runner before checkout
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-build-local }
+        run: /opt/diene/bin/diene-runner-preflight
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - id: run
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-build-local }
+        run: &lane-run |
+          # A per-job tracer that only ever lives in process memory: it is never
+          # written to GITHUB_ENV, so finding it on any evidence surface means
+          # something really did leak its environment.
+          DIENE_LEAK_CANARY="diene-canary-$(head -c 18 /dev/urandom | base64 | tr -d '=+/')"
+          export DIENE_LEAK_CANARY
+          nix develop .#ci -c ./scripts/ci/environment-k3d-run.sh
+      - name: Sweep exact receipt after the runtime step
+        if: always()
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-build-local }
+        run: &lane-sweep |
+          # The sweeper's destructive interface is exactly the four owner
+          # selectors. The lane-scoped receipt ID comes from the one shared
+          # formula in the library, so the workflow reimplements no receipt
+          # ownership of its own.
+          # shellcheck source=/dev/null
+          . ./scripts/ci/environment-lib.sh
+          nix develop .#ci -c ./scripts/ci/environment-receipt-sweep.sh \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --receipt-id "$(diene_receipt_id)"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-environment-report-ditto-build-local-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-environment-report.v1.json
+          if-no-files-found: error
+          retention-days: 7
+
+  environment-ditto-target-pull:
+    name: environment-ditto-target-pull
+    if: inputs.lane == 'ditto-target-pull'
+    needs: contract
+    timeout-minutes: 75
+    environment: ci-ditto-pull
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - diene-k3d-isolated-v1
+      - diene-job-r${{ inputs.repository_id }}-w${{ github.run_id }}-a${{ github.run_attempt }}-jenvironment-ditto-target-pull
+    env: *contract-env
+    outputs: *core-outputs
+    steps:
+      - name: Verify immutable runner before checkout
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-target-pull }
+        run: /opt/diene/bin/diene-runner-preflight
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - id: run
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-target-pull }
+        run: *lane-run
+      - name: Sweep exact receipt after the runtime step
+        if: always()
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-target-pull }
+        run: *lane-sweep
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-environment-report-ditto-target-pull-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-environment-report.v1.json
+          if-no-files-found: error
+          retention-days: 7
+
+  environment-ditto-vendor:
+    name: environment-ditto-vendor
+    if: inputs.lane == 'ditto-vendor'
+    needs: contract
+    timeout-minutes: 90
+    environment: ci-ditto-vendor
+    permissions:
+      contents: read
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - diene-k3d-isolated-v1
+      - diene-job-r${{ inputs.repository_id }}-w${{ github.run_id }}-a${{ github.run_attempt }}-jenvironment-ditto-vendor
+    env: *contract-env
+    outputs:
+      subject_digest: ${{ steps.run.outputs.subject_digest }}
+      receipt_id: ${{ steps.run.outputs.receipt_id }}
+      vendor_report_digest: ${{ steps.run.outputs.vendor_report_digest }}
+    steps:
+      - name: Verify immutable runner before checkout
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-vendor }
+        run: /opt/diene/bin/diene-runner-preflight
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - id: run
+        # The approved demo credential is phase-scoped to this single step; no
+        # other step in the job, including checkout and the sweep, can read it.
+        env:
+          DIENE_EXPECTED_JOB_ID: environment-ditto-vendor
+          DIENE_VENDOR_CREDENTIAL: ${{ secrets.DIENE_VENDOR_CREDENTIAL }}
+        run: |
+          DIENE_LEAK_CANARY="diene-canary-$(head -c 18 /dev/urandom | base64 | tr -d '=+/')"
+          export DIENE_LEAK_CANARY
+          nix develop .#ci -c ./scripts/ci/environment-vendor-run.sh
+      - name: Sweep exact receipt after the vendor step
+        if: always()
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-vendor }
+        run: *lane-sweep
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-vendor-report-${{ inputs.action_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-vendor-report.v1.json
+          if-no-files-found: error
+          retention-days: 7
+
+  environment-absol:
+    name: environment-absol
+    if: inputs.lane == 'absol'
+    needs: contract
+    timeout-minutes: 120
+    environment: ci-absol
+    permissions:
+      contents: read
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - diene-k3d-isolated-v1
+      - diene-job-r${{ inputs.repository_id }}-w${{ github.run_id }}-a${{ github.run_attempt }}-jenvironment-absol
+    env: *contract-env
+    outputs: *core-outputs
+    steps:
+      - name: Verify immutable runner before checkout
+        env: { DIENE_EXPECTED_JOB_ID: environment-absol }
+        run: /opt/diene/bin/diene-runner-preflight
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - id: run
+        env: { DIENE_EXPECTED_JOB_ID: environment-absol }
+        run: *lane-run
+      - name: Sweep exact receipt after the runtime step
+        if: always()
+        env: { DIENE_EXPECTED_JOB_ID: environment-absol }
+        run: *lane-sweep
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-environment-report-absol-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-environment-report.v1.json
+          if-no-files-found: error
+          retention-days: 7
+
+  environment-fleet-independence:
+    name: environment-fleet-independence
+    if: inputs.lane == 'fleet-independence'
+    needs: contract
+    timeout-minutes: 60
+    # A dedicated environment: the independence fixture must not inherit the
+    # ordinary Ditto seed-fetch identity.
+    environment: ci-ditto-independence
+    permissions:
+      contents: read
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - diene-k3d-isolated-v1
+      - diene-job-r${{ inputs.repository_id }}-w${{ github.run_id }}-a${{ github.run_attempt }}-jenvironment-fleet-independence
+    env: *contract-env
+    outputs: *core-outputs
+    steps:
+      - name: Verify immutable runner before checkout
+        env: { DIENE_EXPECTED_JOB_ID: environment-fleet-independence }
+        run: /opt/diene/bin/diene-runner-preflight
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - id: run
+        env: { DIENE_EXPECTED_JOB_ID: environment-fleet-independence }
+        run: *lane-run
+      - name: Sweep exact receipt after the runtime step
+        if: always()
+        env: { DIENE_EXPECTED_JOB_ID: environment-fleet-independence }
+        run: *lane-sweep
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-environment-report-fleet-independence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-environment-report.v1.json
+          if-no-files-found: error
+          retention-days: 7

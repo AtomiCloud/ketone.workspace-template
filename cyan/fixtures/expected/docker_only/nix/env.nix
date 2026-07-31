@@ -3,12 +3,12 @@ with packages;
 {
   dev = [
     git
-    pls
     skopeo
   ];
 
   lint = [
     actionlint
+    check-jsonschema
     gitlint
     go-task
     infralint
@@ -28,5 +28,6 @@ with packages;
   system = [
     atomiutils
     infrautils
+    pls
   ];
 }

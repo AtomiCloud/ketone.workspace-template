@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.atomi.cloud/diene/diene-ci-receipt-v1.schema.json",
+  "title": "Diene CI cleanup receipt v1",
+  "description": "CI-owned cleanup selector, written before any substrate mutation so a cancelled run is still swept. It carries the full immutable owner tuple plus the lane-scoped allocation and generation keys, and it binds the Garden-emitted runtime file only once that file has actually been discovered. A receipt whose runtimeFile is null authorises no deletion; it can only become visible cleanup debt.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "owner", "lane", "profile", "buildMode", "runtimeFile", "cleanup"],
+  "properties": {
+    "apiVersion": { "const": "diene.atomi.cloud/ci-receipt/v1" },
+    "owner": { "$ref": "#/$defs/owner" },
+    "lane": { "enum": ["ditto-build-local", "ditto-target-pull", "ditto-vendor", "absol", "fleet-independence"] },
+    "profile": { "enum": ["ditto", "absol"] },
+    "buildMode": { "enum": ["build-local", "target-pull"] },
+    "actionId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,127}$" },
+    "runtimeFile": { "type": ["string", "null"], "pattern": "^/" },
+    "hostPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applied", "mode"],
+      "properties": {
+        "applied": { "type": "boolean" },
+        "mode": { "enum": ["allowlist", "closure-denied-network", "none"] },
+        "allowFile": { "type": ["string", "null"], "pattern": "^/" }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "reasonCode"],
+      "properties": {
+        "outcome": { "enum": ["Pending", "Pass", "Fail"] },
+        "reasonCode": { "type": "string", "minLength": 1 },
+        "finalizerWaitSeconds": { "type": "integer", "minimum": 0, "maximum": 900 },
+        "debt": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    }
+  },
+  "$defs": {
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryId", "repositoryKey", "sourceSha", "runId", "runAttempt", "receiptId", "allocationKey", "generationKey", "workflowRef"],
+      "properties": {
+        "repositoryId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "repositoryKey": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+$" },
+        "sourceSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "runId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "runAttempt": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "receiptId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "allocationKey": { "type": "string", "pattern": "^r[1-9][0-9]*-w[1-9][0-9]*-a[1-9][0-9]*-l[a-z-]+(-v[a-z0-9][a-z0-9-]*)?$" },
+        "generationKey": { "type": "string", "pattern": "^g[0-9a-f]{12}$" },
+        "workflowRef": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$" }
+      }
+    }
+  }
+}

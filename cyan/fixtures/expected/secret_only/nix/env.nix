@@ -4,11 +4,11 @@ with packages;
   dev = [
     git
     infisical
-    pls
   ];
 
   lint = [
     actionlint
+    check-jsonschema
     gitlint
     go-task
     pre-commit
@@ -26,5 +26,6 @@ with packages;
 
   system = [
     atomiutils
+    pls
   ];
 }
