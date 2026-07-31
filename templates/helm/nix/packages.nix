@@ -11,7 +11,16 @@ let
           ;
       }
     );
+    nix-2605 = (
+      with pkgs-2605;
+      {
+        inherit
+          kubeconform
+          kyverno
+          ;
+      }
+    );
   };
 in
 with all;
-atomipkgs
+atomipkgs // nix-2605
