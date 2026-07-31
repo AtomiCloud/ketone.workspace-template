@@ -19,6 +19,7 @@ with packages;
     check-jsonschema
     check-jsonschema
     check-jsonschema
+    check-jsonschema
     gitlint
     go-task
     infralint
@@ -38,6 +39,7 @@ with packages;
   system = [
     atomiutils
     infrautils
+    pls
     pls
     pls
     pls
