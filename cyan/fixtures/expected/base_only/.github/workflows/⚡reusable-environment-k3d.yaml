@@ -240,11 +240,14 @@ jobs:
           name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/subject
       - id: run
-        # The approved demo credential is phase-scoped to this single step; no
-        # other step in the job, including checkout and the sweep, can read it.
+        # No vendor secret is injected into this step. A secret placed here
+        # would be live during preflight, host policy, substrate creation and
+        # readiness — long before any masker call — so it would not be
+        # phase-scoped in any meaningful sense. The credential is issued by a
+        # root-owned broker after readiness and revoked once provider absence
+        # is proved; the lane refuses when that broker is absent.
         env:
           DIENE_EXPECTED_JOB_ID: environment-ditto-vendor
-          DIENE_VENDOR_CREDENTIAL: ${{ secrets.DIENE_VENDOR_CREDENTIAL }}
         run: |
           DIENE_LEAK_CANARY="diene-canary-$(head -c 18 /dev/urandom | base64 | tr -d '=+/')"
           export DIENE_LEAK_CANARY

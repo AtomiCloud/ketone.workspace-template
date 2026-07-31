@@ -10,10 +10,15 @@ source "$script_dir/environment-lib.sh"
 diene_require_command jq
 diene_require_command stat
 
-lease=${DIENE_RUNNER_LEASE_FILE:-/run/diene-runner-lease.v1.json}
-[[ -f $lease ]] || diene_die RunnerIsolationUnavailable 'signed runner lease is absent'
+# Bootstrap exports the job-visible projection of the signed lease. That
+# projection is exactly mode 0440 at the .public.json path; the private lease
+# is never readable from a job, so accepting 0400/0600 here would refuse every
+# real job.
+lease=${DIENE_RUNNER_LEASE_FILE:-/run/diene-runner-lease.v1.public.json}
+[[ -f $lease ]] || diene_die RunnerIsolationUnavailable 'signed runner lease projection is absent'
 mode=$(stat -c %a "$lease")
-[[ $mode == 400 || $mode == 600 ]] || diene_die RunnerIsolationUnavailable "lease mode is $mode"
+[[ $mode == 440 ]] ||
+  diene_die RunnerIsolationUnavailable "lease projection mode is $mode, expected the 0440 job-visible projection"
 
 # The deterministic job label is part of the trust tuple. Runtime labels are
 # the fixed four image labels plus exactly one job label.
@@ -54,8 +59,18 @@ if [[ ${DIENE_PREFLIGHT_HOST_CHECKS:-1} == 1 ]]; then
     diene_die RunnerIsolationUnavailable 'Docker pin mismatch'
   [[ -z $(docker ps -aq) && -z $(docker volume ls -q) ]] ||
     diene_die RunnerIsolationUnavailable 'Docker state is not empty'
-  nft list ruleset >/dev/null
-  unshare --net true || diene_die RunnerIsolationUnavailable 'job namespace lacks NET_ADMIN/unshare'
+  # The job identity holds CAP_NET_ADMIN and is explicitly denied
+  # CAP_SYS_ADMIN. Prove both directions: network administration must work, and
+  # the namespace-creating capabilities must NOT. Requiring `unshare` to
+  # succeed would demand CAP_SYS_ADMIN and so contradict the isolation model.
+  nft list ruleset >/dev/null ||
+    diene_die RunnerIsolationUnavailable 'job identity lacks CAP_NET_ADMIN for host policy'
+  if unshare --net true 2>/dev/null; then
+    diene_die RunnerIsolationUnavailable 'job identity holds CAP_SYS_ADMIN; isolation is not enforced'
+  fi
+  if command -v nsenter >/dev/null 2>&1 && nsenter --net=/proc/1/ns/net true 2>/dev/null; then
+    diene_die RunnerIsolationUnavailable 'job identity can enter another namespace; isolation is not enforced'
+  fi
 fi
 
 printf 'RunnerProvisionerReady\n'

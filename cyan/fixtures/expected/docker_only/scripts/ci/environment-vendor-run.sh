@@ -63,6 +63,42 @@ jq -e '.componentClass == "K9" and .permissionRule == "ditto-vendor-demo" and
 
 action_required=$(jq -r '.required' "$action_file")
 
+# ---------------------------------------------------------------------------
+# Enforcement primitives this lane cannot honestly do without.
+#
+# The declared egress is DNS + SNI + HTTP method. nft cannot express SNI or
+# methods, and a table installed inside a job that holds CAP_NET_ADMIN can be
+# flushed by that job, so neither is a boundary. The phase-scoped credential
+# likewise cannot be produced by injecting a GitHub secret into the step: it is
+# then present during preflight, substrate creation and readiness, long before
+# any masker call, and a later shell `unset` does not retract it.
+#
+# Both require root-owned brokers that do not exist yet. Until they do, this
+# required gate refuses rather than reporting a Pass it cannot support.
+vendor_proxy=${DIENE_VENDOR_PROXY_BIN:-/opt/diene/bin/diene-vendor-egress-proxy}
+command -v "$vendor_proxy" >/dev/null 2>&1 || [[ -x $vendor_proxy ]] ||
+  diene_die VendorBrokerInterfaceUnavailable \
+    'the declared DNS/SNI/method egress needs a host-owned proxy; nft can express neither SNI nor methods and a job holding CAP_NET_ADMIN can flush its own table'
+credential_broker=${DIENE_VENDOR_CREDENTIAL_BROKER_BIN:-/opt/diene/bin/diene-vendor-credential-broker}
+command -v "$credential_broker" >/dev/null 2>&1 || [[ -x $credential_broker ]] ||
+  diene_die VendorBrokerInterfaceUnavailable \
+    'the phase-scoped credential needs a root-owned broker that issues after readiness and revokes after proved absence; a step-injected secret is not phase-scoped'
+
+# Declared immutable packs are consumed, not merely declared.
+pack_id=$(jq -er '.fixturePack.id' "$action_file")
+pack_digest=$(jq -er '.fixturePack.digest' "$action_file")
+diene_require_safe_id fixture_pack_id "$pack_id"
+pack_path=".diene/ci/fixtures/$pack_id/manifest.yaml"
+[[ -f $pack_path ]] || diene_die RequiredCoverageUnavailable "vendor fixture pack $pack_id is missing"
+[[ $(diene_file_digest "$pack_path") == "$pack_digest" ]] ||
+  diene_die RequiredCoverageUnavailable "vendor fixture pack $pack_id does not match its declared digest"
+
+# An unavailable callback proof is a required-coverage failure, never a silent
+# pass behind a generic outcome.
+callback=$(jq -er '.callbackCompletion' "$action_file")
+[[ $callback != unavailable ]] ||
+  diene_die RequiredCoverageUnavailable 'the declared vendor action has no available callback completion proof'
+
 results=()
 coverage_file="$runtime_dir/coverage.json"
 : >"$coverage_file"
@@ -149,11 +185,11 @@ cleanup() {
   fi
 
   if ((policy_applied)); then
-    if diene_host_policy_release "$receipt_id"; then
-      teardown_transitions+=("PolicyRelease:Pass")
+    if diene_host_policy_request_release "$receipt_id"; then
+      teardown_transitions+=("PolicyReleaseRequested:Deferred")
     else
       failed=1
-      teardown_transitions+=("PolicyRelease:Fail")
+      teardown_transitions+=("PolicyReleaseRequested:Fail")
       record_debt "host policy release failed for $receipt_id"
     fi
   fi
@@ -218,8 +254,10 @@ emit_report() {
       providerCleanup: { outcome: $providerOutcome, reasonCode: $providerReason,
                          objectIds: $providerObjectIds, absenceProven: $providerAbsence,
                          durableDebtRecord: $durable },
-      credential: { env: "DIENE_VENDOR_CREDENTIAL", masked: ($credentialRegistered == 1),
-                    phaseScoped: true, removed: true },
+      credential: { issuer: "host-owned-broker", masked: ($credentialRegistered == 1),
+                    issuedAfterReadiness: ($credentialRegistered == 1),
+                    removed: ($providerAbsence and $credentialRegistered == 1),
+                    removalObserved: ($providerAbsence and $credentialRegistered == 1) },
       evidence: {
         leakageScan: { outcome: "Pass", reasonCode: "ScanPendingFinalisation", encodings: [], scannedPaths: [] },
         egressCanary: {
