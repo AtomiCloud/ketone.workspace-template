@@ -188,6 +188,18 @@ The lane generates the document; the runner enforces it in the host namespace.
 unchanged end to end — emitted in the document, recorded on the receipt, and
 reported in the evidence.
 
+**The lane does not choose its own posture.** `authorizedPolicyMode` is derived
+by the runner from the root lease's stable job identity and published in the
+isolation receipt; the conductor requires exact equality before it will even
+validate a document. The lane reads the authorized value and refuses when it
+disagrees with what the lane requires, naming both — rather than emitting a
+mode that would be rejected, or running under a posture it cannot work in.
+
+The first accepted policy binds `(lease, receipt)`: afterwards only a
+byte-identical replay is permitted, and a changed allow set is refused with the
+original left standing. A new posture needs a new receipt, so the lane applies
+exactly once per receipt.
+
 `release` is **deferred and non-destructive by contract**. It runs as the very
 principal the policy constrains, so if it deleted anything a lane could invoke
 it with its own known receipt at lane start and restore its own egress.
