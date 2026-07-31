@@ -436,6 +436,27 @@ diene_lane_cidrs() {
     diene_die HostPolicyInterfaceUnavailable 'the isolation receipt publishes no laneCidrs'
 }
 
+# The lane does not choose its own posture. `authorizedPolicyMode` is derived
+# from the root lease's stable job identity and published in the isolation
+# receipt; the conductor requires exact equality before it will even validate a
+# document. This reads the authorized value and refuses when it disagrees with
+# what the lane actually needs, rather than emitting a mode that would be
+# refused — or worse, running under a posture the lane cannot work in.
+diene_authorized_policy_mode() {
+  local required=${1:?required mode}
+  local isolation=${DIENE_ISOLATION_FILE:-}
+  [[ -n $isolation && -r $isolation ]] ||
+    diene_die HostPolicyInterfaceUnavailable \
+      'no isolation receipt; the lease-authorized policy mode cannot be established'
+  local authorized
+  authorized=$(jq -er '.authorizedPolicyMode' "$isolation") ||
+    diene_die HostPolicyInterfaceUnavailable 'the isolation receipt publishes no authorizedPolicyMode'
+  [[ $authorized == "$required" ]] ||
+    diene_die HostPolicyInterfaceUnavailable \
+      "the lease authorizes policy mode $authorized but this lane requires $required"
+  printf '%s\n' "$authorized"
+}
+
 # The enforcement layer admits lane CIDRs plus literal-IP host:port pairs only:
 # it rejects bare hostnames as unenforceable, and it denies DNS outright. A
 # connected lane therefore cannot be given `ghcr.io:443` or any other name — it
