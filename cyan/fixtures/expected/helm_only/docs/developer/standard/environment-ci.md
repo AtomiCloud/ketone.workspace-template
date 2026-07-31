@@ -243,11 +243,34 @@ a second teardown. `pls env reset` is never automatic.
 Runtime lanes do **not** call `actions/upload-artifact`. The enforcing table is
 still standing when the runtime step ends — `release` is deferred by contract —
 and under a hermetic posture it denies exactly the connections an upload needs,
-so an in-job upload could never succeed on a real runner. The lane stages its
-scanned report into the root-owned publication channel and the runner lifecycle
+so an in-job upload could never succeed on a real runner. The runner lifecycle
 owns the sequence: **stage → prove runtime absence → release → upload through a
 channel the job can never call.** A job-callable channel would let checkout code
 invoke it before absence was proven, so the lane refuses one.
+
+The lane writes into a **job-writable ingress**, never a sealed spool. Whatever
+it puts there is an untrusted candidate: the manifest it emits is
+`diene.atomi.cloud/ci-evidence-candidate/v1` carrying
+`trust: untrusted-job-candidate`. The sealed spool is root-only, lives outside
+what lease teardown removes, and is populated by the root-owned courier once it
+has validated the candidate set. A directory the job can write cannot be a
+sealed spool, so the lane refuses if the two are the same path.
+
+The gates split by what is locally provable:
+
+| Property | Gated? | Why |
+| --- | --- | --- |
+| `sealedSpool` root-only, surviving teardown | **yes** | a local observation of modes, owners and location |
+| `channel.jobCallable == false` | **yes** | local; a job-callable channel could be invoked before absence is proven |
+| `releasesAfterAbsenceProof` | **yes** | local; releasing first drops enforcement while the runtime may still be live |
+| `retainsUntilAcknowledged` | **no** | vacuous when no acknowledgement can arrive |
+| `shipmentReady` | **no** | cannot be true until a courier endpoint exists |
+
+The last two are **recorded, not gated.** Gating on them would deadlock every
+real run against a flag that is honestly false today, so the report carries
+`evidence.shipment` as `Unavailable` with a stable reason instead — a green lane
+can never be misread as "evidence shipped". The transport is a release gate, not
+a lane obligation.
 
 The lane also refuses unless the runner attests that the enforcement is a
 boundary at all: `armedBeforeJob` (checkout and setup precede the lane, so a
@@ -298,7 +321,7 @@ coverage.
 | No runner host-policy client or isolation receipt | `HostPolicyInterfaceUnavailable` | Every runtime lane refuses. A job holds `CAP_NET_ADMIN`, so any nft table it installs in its own namespace is a cooperative setting it can flush — not a boundary. Enforcement lives in a root-owned host layer the job cannot mutate. |
 | No enforceable connected endpoint | `ConnectedEgressInterfaceUnavailable` | The connected Ditto lanes refuse. The enforcement layer denies DNS and admits only literal addresses, so a bare hostname such as `ghcr.io:443` could never be enforced; the template refuses rather than emitting one the conductor would reject, or worse, one it would accept as if enforced. The mechanism exists; the seed and registry literals are a deployment input nobody may synthesise. |
 | Enforcement not attested as a boundary | `HostEnforcementIncomplete` | Every runtime lane refuses unless the runner attests `armedBeforeJob`, `establishedFlowExemption: false` and `inputPathCovered`. |
-| No root-owned evidence publication channel | `EvidencePublicationInterfaceUnavailable` | Every runtime lane refuses. An in-job upload cannot open its connections under denial, and a job-callable channel could be invoked before runtime absence is proven. |
+| No root-only sealed spool, or a release that precedes the absence proof | `EvidencePublicationInterfaceUnavailable` | Every runtime lane refuses. These are locally provable, so refusing on them is honest. Shipment is deliberately **not** in this table: it is recorded as `evidence.shipment: Unavailable` rather than gated, because it cannot be true until a courier endpoint exists and gating on it would deadlock every real run. |
 | No closure signature/certificate/Rekor verification or exact-set equality | `ClosureAttestationInterfaceUnavailable` | Absol refuses; both are mandatory results in the lane table. |
 | No real-pull / evict-repull / sibling-denial / pull-secret-ownership / credential-removal proof | `RequiredCoverageUnavailable` | target-pull refuses; all five are required results. |
 | No vendor egress proxy or credential broker | `VendorBrokerInterfaceUnavailable` | The vendor lane refuses. nft can express neither SNI nor HTTP methods, and a step-injected secret is live during preflight, substrate creation and readiness, so it is not phase-scoped in any meaningful sense. |

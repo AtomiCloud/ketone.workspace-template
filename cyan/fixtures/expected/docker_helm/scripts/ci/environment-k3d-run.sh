@@ -205,6 +205,8 @@ emit_report() {
     --arg absenceProof "$absence_proof" \
     --arg verdict "$verdict" --arg reason "$reason" \
     --argjson policyApplied "$policy_applied" \
+    --argjson shipmentReady "${DIENE_SHIPMENT_READY:-false}" \
+    --argjson shipmentRetained "${DIENE_SHIPMENT_RETAINED:-false}" \
     --argjson finalizerWait "$finalizer_wait" \
     --argjson setupSeconds "$setup_seconds" \
     --argjson substrateSeconds "$substrate_seconds" \
@@ -242,6 +244,12 @@ emit_report() {
                        then "OuterLayerDeniedMetadataAtApply"
                        else "PostureNeverEstablished" end),
           mode: $policyMode
+        },
+        shipment: {
+          outcome: (if ($shipmentReady and $shipmentRetained) then "Pass" else "Unavailable" end),
+          reasonCode: (if ($shipmentReady and $shipmentRetained) then "SealedAndAwaitingAcknowledgement"
+                       elif $shipmentReady then "AcknowledgementRetentionUnavailable"
+                       else "CourierEndpointUnavailable" end)
         }
       },
       teardown: {

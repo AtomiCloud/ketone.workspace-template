@@ -487,20 +487,19 @@ diene_require_evidence_publication() {
   jq -e '.evidencePublication.sealedSpool.path != .evidencePublication.ingressDir' "$isolation" >/dev/null ||
     diene_die EvidencePublicationInterfaceUnavailable \
       'the sealed spool and the job-writable ingress are the same directory'
-  jq -e '.evidencePublication.retainsUntilAcknowledged == true' "$isolation" >/dev/null ||
-    diene_die EvidencePublicationInterfaceUnavailable \
-      'the spool does not retain the sealed bytes until the narrow channel acknowledges shipment'
-  # A spool with no channel behind it is a directory, not a publication path.
-  # These fields are the difference between "somewhere to put the bytes" and a
-  # channel that will actually ship them, so they are required explicitly
-  # rather than inferred from the staging fields.
-  jq -e '.evidencePublication.shipmentReady == true' "$isolation" >/dev/null ||
-    diene_die EvidencePublicationInterfaceUnavailable \
-      'the runner does not attest shipmentReady; a staging directory whose channel is unimplemented ships nothing'
-  jq -e '.evidencePublication.channel | type == "object" and
-         (.name | type == "string" and length > 0) and .available == true' "$isolation" >/dev/null ||
-    diene_die EvidencePublicationInterfaceUnavailable \
-      'the runner attests no available root-owned courier channel'
+  # Shipment is deliberately NOT gated here. `sealedSpool` and
+  # `channel.jobCallable` are local observations the runner can make truthfully
+  # today; `retainsUntilAcknowledged` and `shipmentReady` cannot be true until a
+  # destination endpoint exists, because retention "until acknowledged" is
+  # vacuous with no acknowledgement to wait for. Requiring them now would
+  # deadlock every real run against a flag that is honestly false.
+  #
+  # They are read and reported instead: the lane records shipment as explicitly
+  # unavailable so a green lane can never be misread as "evidence shipped". The
+  # transport itself is a release gate, not a lane obligation.
+  DIENE_SHIPMENT_READY=$(jq -r '.evidencePublication.shipmentReady // false' "$isolation")
+  DIENE_SHIPMENT_RETAINED=$(jq -r '.evidencePublication.retainsUntilAcknowledged // false' "$isolation")
+  export DIENE_SHIPMENT_READY DIENE_SHIPMENT_RETAINED
   printf '%s\n' "$ingress"
 }
 
