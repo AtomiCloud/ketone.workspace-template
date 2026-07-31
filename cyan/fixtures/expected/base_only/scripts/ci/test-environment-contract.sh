@@ -209,7 +209,11 @@ write_isolation() {
       laneCidrs:["127.0.0.0/8","::1/128","10.202.0.0/24","10.203.0.0/16","10.42.0.0/16","10.43.0.0/16"],
       connectedEndpoints:$endpoints,
       enforcement:{armedBeforeJob:true,establishedFlowExemption:false,inputPathCovered:true},
-      evidencePublication:{stagingDir:$staging,jobCallable:false,releasesAfterAbsenceProof:true}}' >"$target"
+      evidencePublication:{ingressDir:$staging,ingressJobWritable:true,
+                           sealedSpool:{path:($staging+".sealed"),jobWritable:false,survivesLeaseTeardown:true},
+                           channel:{name:"diene-evidence-courier",available:true,jobCallable:false},
+                           releasesAfterAbsenceProof:true,retainsUntilAcknowledged:true,
+                           shipmentReady:true}}' >"$target"
   chmod 0440 "$target"
 }
 evidence_staging=$scratch/evidence-publication
@@ -986,16 +990,47 @@ ok 'the lane refuses unless the runner attests pre-arming, no blanket exemption,
 attest_case 'no root-owned publication channel' \
   'del(.evidencePublication)' EvidencePublicationInterfaceUnavailable
 attest_case 'a job-callable publication channel' \
-  '.evidencePublication.jobCallable = true' EvidencePublicationInterfaceUnavailable
+  '.evidencePublication.channel.jobCallable = true' EvidencePublicationInterfaceUnavailable
 attest_case 'release before runtime absence is proven' \
   '.evidencePublication.releasesAfterAbsenceProof = false' EvidencePublicationInterfaceUnavailable
-ok 'the lane refuses a job-callable channel or a release that precedes absence proof'
+# Staging under the lease run directory is deleted by teardown before anything
+# could ship, and a manifest of filenames proves nothing about content.
+attest_case 'a spool teardown would delete' \
+  '.evidencePublication.sealedSpool.survivesLeaseTeardown = false' EvidencePublicationInterfaceUnavailable
+# A directory the job can write cannot be the sealed spool, and the sealed
+# spool must not be the ingress the job writes into.
+attest_case 'a job-writable sealed spool' \
+  '.evidencePublication.sealedSpool.jobWritable = true' EvidencePublicationInterfaceUnavailable
+attest_case 'the sealed spool aliased to the job-writable ingress' \
+  '.evidencePublication.sealedSpool.path = .evidencePublication.ingressDir' \
+  EvidencePublicationInterfaceUnavailable
+attest_case 'a spool that does not retain until acknowledgement' \
+  '.evidencePublication.retainsUntilAcknowledged = false' EvidencePublicationInterfaceUnavailable
+# A staging directory whose channel is unimplemented ships nothing, so the
+# staging fields alone must never satisfy this.
+attest_case 'staging present but shipment not ready' \
+  '.evidencePublication.shipmentReady = false' EvidencePublicationInterfaceUnavailable
+attest_case 'no concrete root-owned channel identity' \
+  '.evidencePublication.channel.available = false' EvidencePublicationInterfaceUnavailable
+ok 'the lane refuses a job-callable channel, an early release, a deletable spool, or an unimplemented one'
+
+# The sealed handoff binds exact name, kind, size and content digest.
+shipment=$evidence_staging/$(basename "$DIENE_CORE_REPORT").candidate.json
+[[ -s $shipment ]] || fail "the handoff wrote no candidate manifest"
+jq -e --arg name "$(basename "$DIENE_CORE_REPORT")" \
+  --arg digest "sha256:$(sha256sum "$evidence_staging/$(basename "$DIENE_CORE_REPORT")" | awk '{print $1}')" '
+    .apiVersion == "diene.atomi.cloud/ci-evidence-candidate/v1" and .trust == "untrusted-job-candidate" and
+    (.artifacts | length == 1) and
+    .artifacts[0].name == $name and .artifacts[0].kind == "core" and
+    .artifacts[0].digest == $digest and .artifacts[0].sizeBytes > 0
+  ' "$shipment" >/dev/null || fail "the candidate manifest does not bind name, kind, size and digest"
+ok "the job stages a bounded, digest-bound candidate it explicitly marks untrusted"
 
 # The workflow must not try to upload evidence from inside the job.
 ! grep -Fq 'uses: actions/upload-artifact' \
   "$repo_root/.github/workflows/⚡reusable-environment-k3d.yaml" ||
   fail 'a runtime lane still uploads evidence from inside the job'
-jq -e --arg dir "$evidence_staging" '.evidencePublication.stagingDir == $dir' \
+jq -e --arg dir "$evidence_staging" '.evidencePublication.ingressDir == $dir' \
   "$fake_isolation" >/dev/null || fail 'the staging channel is not the attested one'
 [[ -s "$evidence_staging/$(basename "$DIENE_CORE_REPORT")" ]] ||
   fail 'the scanned report was never staged for the root-owned channel'
@@ -1009,7 +1044,7 @@ printf '== host-policy seam against the real runner client ==\n'
 real_client=${DIENE_RUNNER_HOST_POLICY_BIN:-/opt/diene/bin/diene-host-policy}
 emitted=$scratch/seam-policy.json
 (
-  export DIENE_ISOLATION_FILE=$fake_isolation
+  # DIENE_ISOLATION_FILE is already exported to the same receipt.
   # shellcheck source=/dev/null
   . ./scripts/ci/environment-lib.sh
   DIENE_SCHEMA_DIR=$work/schemas/ci diene_write_allow_file "$emitted" closure-denied-network
@@ -1021,6 +1056,32 @@ jq -e '(keys | sort) == ["allow","apiVersion","denyDefaultRoute","denyDns","mode
        (.allow | all(test("/[0-9]{1,3}$")))' "$emitted" >/dev/null ||
   fail 'the emitted host policy document is not the shape the runner client accepts'
 ok 'the emitted document matches the runner-accepted shape exactly'
+
+# Lane CIDRs are lease-local inputs, never egress permissions. A hermetic
+# posture must therefore contribute no host-forward external entry at all: a
+# job holding CAP_NET_ADMIN can reroute a permitted internal range through its
+# veth, so a host that accepted on destination CIDR alone would forward it to
+# the default egress and defeat hermetic denial.
+jq -e '[.allow[] | select(test("^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9a-fA-F:]+):[0-9]{1,5}$"))] | length == 0' \
+  "$emitted" >/dev/null ||
+  fail 'a hermetic posture carries an external endpoint'
+jq -e '.allow | all(test("/[0-9]{1,3}$"))' "$emitted" >/dev/null ||
+  fail 'a hermetic posture carries something that is not a lease-local range'
+ok 'a hermetic posture contributes only lease-local ranges, never an egress permission'
+
+# The connected posture adds exactly the root-authorized external literals and
+# nothing else; the lane never widens the external set itself.
+connected_emitted=$scratch/seam-connected.json
+(
+  # DIENE_ISOLATION_FILE is already exported to the same receipt.
+  # shellcheck source=/dev/null
+  . ./scripts/ci/environment-lib.sh
+  DIENE_SCHEMA_DIR=$work/schemas/ci diene_write_allow_file "$connected_emitted" allowlist 10.203.0.9:5000
+)
+jq -e '[.allow[] | select(test(":[0-9]{1,5}$") and (test("/") | not))] == ["10.203.0.9:5000"]' \
+  "$connected_emitted" >/dev/null ||
+  fail 'the connected posture does not carry exactly the root-authorized external literals'
+ok 'only root-authorized external literals become egress entries'
 
 if [[ -x $real_client ]]; then
   DIENE_ISOLATION_FILE=$fake_isolation "$real_client" apply \

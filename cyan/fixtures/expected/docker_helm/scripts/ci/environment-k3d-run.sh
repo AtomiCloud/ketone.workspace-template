@@ -265,11 +265,13 @@ emit_report() {
   local report=${DIENE_CORE_REPORT:-$RUNNER_TEMP/diene-environment-report.v1.json}
   "$script_dir/environment-report.sh" --kind core --input "$raw" --output "$report"
 
-  # Hand the scanned report to the root-owned publication channel. The lane
-  # cannot upload it itself: the enforcing table is still standing, denies the
-  # connections an upload needs, and `release` is deferred by contract.
-  if [[ -n ${evidence_staging_dir:-} && -d ${evidence_staging_dir:-} ]]; then
-    install -m 0600 "$report" "$evidence_staging_dir/$(basename "$report")"
+  # Place the scanned report in the job-writable ingress as an untrusted
+  # candidate, with a manifest binding its exact name, kind, size and digest.
+  # The lane neither seals nor uploads: the enforcing table is still standing
+  # and denies the connections an upload needs, `release` is deferred by
+  # contract, and the sealed spool is root-only by construction.
+  if [[ -n ${evidence_ingress_dir:-} && -d ${evidence_ingress_dir:-} ]]; then
+    diene_stage_evidence_candidate "$evidence_ingress_dir" core "$report"
   fi
 }
 
@@ -344,7 +346,7 @@ diene_authorized_policy_mode "$policy_mode" >/dev/null
 diene_require_enforcement_attestations
 # Evidence has to be publishable before the lane is worth running: under a
 # hermetic posture an in-job upload cannot open the connections it needs.
-evidence_staging_dir=$(diene_require_evidence_publication)
+evidence_ingress_dir=$(diene_require_evidence_publication)
 
 case $DIENE_LANE in
   absol)

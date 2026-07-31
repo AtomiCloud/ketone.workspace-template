@@ -159,8 +159,8 @@ jobs:
         run: &lane-handoff |
           # shellcheck source=/dev/null
           . ./scripts/ci/environment-lib.sh
-          staging=$(diene_require_evidence_publication)
-          test -s "$staging/diene-environment-report.v1.json"
+          ingress=$(diene_require_evidence_publication)
+          test -s "$ingress/diene-environment-report.v1.json"
 
   environment-ditto-target-pull:
     name: environment-ditto-target-pull
@@ -263,8 +263,8 @@ jobs:
         run: |
           # shellcheck source=/dev/null
           . ./scripts/ci/environment-lib.sh
-          staging=$(diene_require_evidence_publication)
-          test -s "$staging/diene-vendor-report.v1.json"
+          ingress=$(diene_require_evidence_publication)
+          test -s "$ingress/diene-vendor-report.v1.json"
 
   environment-absol:
     name: environment-absol
