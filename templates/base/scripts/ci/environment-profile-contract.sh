@@ -22,35 +22,80 @@ if [[ ${1:-} == --validate-inputs ]]; then
   exit 0
 fi
 
-# Release-boundary prerequisites. This runs on the GitHub-hosted authorization
-# path, before any lane job can select a disposable self-hosted runner: a
-# missing controller/image pin, an unaccepted RunnerProvisionerReady proof, or
-# an absent repository-owned artifact subject refuses here rather than after a
-# VM has already been allocated.
+# Pre-SIT prerequisites. This is deliberately runtime-free and is invoked both
+# by the workflow contract job and again by the lifecycle orchestrator before
+# `nsc create`. A missing producer, invalid selected declaration, malformed
+# production fixture, bad Promotion/Freight object, or non-canonical duration
+# refuses before Namespace authority mutates anything.
 if [[ ${1:-} == --validate-prerequisites ]]; then
   diene_require_command jq
   diene_require_command "${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}"
-
-  pin=${DIENE_RUNNER_PIN:-.diene/ci/runner-pin.v1.json}
-  [[ -f $pin ]] ||
-    diene_die RunnerIsolationUnavailable 'no accepted diene-ci-runner/v1 controller and image pin; refusing before runner selection'
-  diene_schema_validate diene-runner-pin-v1.schema.json "$pin" 'runner pin'
-
   producer=${DIENE_ARTIFACT_PRODUCER:-.diene/ci/artifact-producer.sh}
   [[ -x $producer ]] ||
-    diene_die ArtifactProducerUnavailable 'no repository-owned artifact producer; refusing before runner selection'
+    diene_die ArtifactProducerUnavailable 'no repository-owned artifact producer; refusing before nsc create'
+  [[ ${DIENE_NSC_DURATION:-2h} == 2h ]] ||
+    diene_die ProductionFixtureInvalid 'production SIT duration is exactly 2h'
+  [[ ${DIENE_PRE_SIT_NEGATIVE_CANARY:-0} == 0 ]] ||
+    diene_die ProductionFixtureInvalid 'the pre-SIT negative canary was intentionally activated'
 
-  # A vendor dispatch additionally proves its declaration and the exact
-  # requested action before a runner can be selected.
-  if [[ -n ${DIENE_VENDOR_MANIFEST:-} ]]; then
+  if [[ ${DIENE_LANE:-} == ditto-vendor ]]; then
     [[ -f ${DIENE_VENDOR_MANIFEST} ]] || diene_die InputContractInvalid 'vendor manifest missing'
     diene_schema_validate diene-vendors-v1.schema.json "$DIENE_VENDOR_MANIFEST" 'vendor manifest'
     jq -e --arg id "${DIENE_ACTION_ID:?}" '[.actions[] | select(.actionId == $id)] | length == 1' \
       "$DIENE_VENDOR_MANIFEST" >/dev/null ||
       diene_die InputContractInvalid 'vendor action is not declared exactly once'
+  else
+    journeys=${DIENE_JOURNEY_MANIFEST:-}
+    [[ $journeys == .diene/ci/journeys.v1.yaml && -f $journeys ]] ||
+      diene_die InputContractInvalid 'selected journey manifest is absent or non-canonical'
+    diene_schema_validate diene-journeys-v1.schema.json "$journeys" 'journey manifest'
+    jq -e '[.journeys[].id] | length == (unique | length)' "$journeys" >/dev/null ||
+      diene_die InputContractInvalid 'journey IDs must be globally unique'
   fi
 
-  printf 'PrerequisitesAccepted\n'
+  fixture_root=${DIENE_PRE_SIT_FIXTURE_ROOT:-.diene/ci/fixtures}
+  if [[ -d $fixture_root ]]; then
+    while IFS= read -r -d '' fixture; do
+      fixture_json=$fixture
+      converted=
+      if ! jq empty "$fixture" >/dev/null 2>&1; then
+        diene_require_command yq
+        converted=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-fixture.XXXXXX")
+        yq -o=json '.' "$fixture" >"$converted" || {
+          rm -f -- "$converted"
+          diene_die ProductionFixtureInvalid "$fixture is not valid YAML/JSON"
+        }
+        fixture_json=$converted
+      fi
+      jq -e '
+        ([.. | objects | .duration? // empty] |
+          all(type == "string" and test("^[1-9][0-9]*(s|m|h|d)$"))) and
+        ([.. | objects | select(.kind? == "Promotion" or .kind? == "Freight")] |
+          all((.apiVersion | type == "string" and length > 0) and
+              (.metadata.name | type == "string" and length > 0)))
+      ' "$fixture_json" >/dev/null || {
+        [[ -z $converted ]] || rm -f -- "$converted"
+        diene_die ProductionFixtureInvalid \
+          "$fixture carries an invalid Promotion/Freight object or duration spelling"
+      }
+      [[ -z $converted ]] || rm -f -- "$converted"
+    done < <(find "$fixture_root" -type f \( -name 'manifest.yaml' -o -name 'manifest.yml' -o -name 'manifest.json' \) -print0)
+  fi
+
+  selected_manifest=${DIENE_VENDOR_MANIFEST:-${DIENE_JOURNEY_MANIFEST:-}}
+  if [[ -f $selected_manifest ]]; then
+    while IFS=$'\t' read -r pack_id pack_digest; do
+      [[ -n $pack_id ]] || continue
+      pack_path="$fixture_root/$pack_id/manifest.yaml"
+      [[ ! -f $pack_path ]] || [[ $(diene_file_digest "$pack_path") == "$pack_digest" ]] ||
+        diene_die ProductionFixtureInvalid "present fixture $pack_id does not match its immutable digest"
+    done < <(jq -r '
+      if has("journeys") then .journeys[].fixturePack
+      else .actions[].fixturePack end | [.id,.digest] | @tsv
+    ' "$selected_manifest")
+  fi
+
+  printf 'PreSitContractAccepted\n'
   exit 0
 fi
 

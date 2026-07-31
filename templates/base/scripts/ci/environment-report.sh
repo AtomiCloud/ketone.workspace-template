@@ -119,7 +119,16 @@ else
         "the $required surface was never captured; leakageScan cannot be claimed over it"
   done
 
-  surfaces=("$input" "$staging")
+  proof_bundle_dir=${DIENE_PROOF_BUNDLE_DIR:-}
+  [[ -n $proof_bundle_dir && -d $proof_bundle_dir && ! -L $proof_bundle_dir ]] ||
+    diene_die EvidenceLeakageInterfaceUnavailable \
+      'the final outer proof-bundle directory is absent; a guest-only scan cannot authorize publication'
+
+  # The outer directory is first and mandatory: it contains collected guest
+  # proof, create metadata, lifecycle receipts, checkpoint chain and the raw
+  # final report. Scanning only a guest report would miss collection-time or
+  # orchestrator-time leaks.
+  surfaces=("$proof_bundle_dir" "$input" "$staging")
   [[ -z ${RUNNER_TEMP:-} ]] || surfaces+=("$RUNNER_TEMP")
   [[ -z ${GITHUB_WORKSPACE:-} || ! -d ${GITHUB_WORKSPACE:-} ]] || surfaces+=("$GITHUB_WORKSPACE")
   [[ -z ${GITHUB_ENV:-} || ! -f ${GITHUB_ENV:-} ]] || surfaces+=("$GITHUB_ENV")
