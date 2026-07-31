@@ -212,6 +212,18 @@ receipt at `$DIENE_ISOLATION_FILE`, never copied into this template as
 constants and never re-derived from the runner's path layout. A duplicated
 constant is exactly how two arms drift apart.
 
+**Lane CIDRs are local-only inputs, not egress permissions.** The Docker
+bridge/pool and the k3s pod/service ranges are validated as lane-local
+addresses; they must never become host-forward `accept` rules. A job holds
+`CAP_NET_ADMIN`, so it can delete the namespace-local route for a permitted
+range and route it through its veth instead — a host that accepted on
+destination CIDR alone would then forward it to the default egress, and any
+address overlapping an allowed internal range becomes reachable from a
+`closure-denied-network` lane. Authorising a CIDR is not the same as proving it
+is still the lease-local path it names. Host forwarding therefore admits only
+the exact root-authorized external literal endpoints, constrained to the real
+egress path; everything else is local by construction or denied.
+
 Lifetime attestation is likewise not the lane's to claim. `apply` proves the
 metadata endpoint denied from outside the lane namespace at apply time, which
 the lane cannot defeat; that the posture held for the whole lane is evidence

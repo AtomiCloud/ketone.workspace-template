@@ -284,8 +284,8 @@ emit_report() {
 
   local report=${DIENE_VENDOR_REPORT:-$RUNNER_TEMP/diene-vendor-report.v1.json}
   "$script_dir/environment-report.sh" --kind vendor --input "$raw" --output "$report"
-  if [[ -n ${evidence_staging_dir:-} && -d ${evidence_staging_dir:-} ]]; then
-    install -m 0600 "$report" "$evidence_staging_dir/$(basename "$report")"
+  if [[ -n ${evidence_ingress_dir:-} && -d ${evidence_ingress_dir:-} ]]; then
+    diene_stage_evidence_candidate "$evidence_ingress_dir" vendor "$report"
   fi
 }
 

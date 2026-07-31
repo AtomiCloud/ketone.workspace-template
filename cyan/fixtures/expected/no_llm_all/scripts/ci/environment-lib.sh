@@ -456,20 +456,83 @@ diene_require_evidence_publication() {
   [[ -n $isolation && -r $isolation ]] ||
     diene_die EvidencePublicationInterfaceUnavailable \
       'no isolation receipt; the evidence publication channel cannot be established'
-  local channel
-  channel=$(jq -er '.evidencePublication.stagingDir | select(startswith("/"))' "$isolation") ||
+  # Two distinct places, deliberately not one. The job writes only the
+  # job-writable INGRESS; the sealed spool is root-only, the job never touches
+  # it, and the courier copies validated candidates across. A directory the job
+  # can write cannot be the sealed spool, and anything the job puts in the
+  # ingress is an untrusted candidate until root has validated it.
+  local ingress
+  ingress=$(jq -er '.evidencePublication.ingressDir | select(startswith("/"))' "$isolation") ||
     diene_die EvidencePublicationInterfaceUnavailable \
-      'the runner attests no root-owned evidence publication channel; under a hermetic posture an in-job upload cannot open the connections it needs, and release is deferred by contract'
+      'the runner attests no evidence ingress directory; under a hermetic posture an in-job upload cannot open the connections it needs, and release is deferred by contract'
   # The ratified sequencing is: stage evidence, prove runtime absence, release,
   # then upload through a channel the job can never call. A job-callable upload
   # or release would let checkout code run it early, before absence is proven.
-  jq -e '.evidencePublication.jobCallable == false' "$isolation" >/dev/null ||
+  jq -e '.evidencePublication.channel | type == "object" and .jobCallable == false' "$isolation" >/dev/null ||
     diene_die EvidencePublicationInterfaceUnavailable \
       'the evidence publication channel is job-callable; checkout code could invoke it before runtime absence is proven'
   jq -e '.evidencePublication.releasesAfterAbsenceProof == true' "$isolation" >/dev/null ||
     diene_die EvidencePublicationInterfaceUnavailable \
       'the runner does not attest that release follows a proven runtime absence; releasing first would drop enforcement while the runtime may still be live'
-  printf '%s\n' "$channel"
+  # Staging under the lease run directory is not a handoff: teardown removes it,
+  # so the bytes are gone before any controller could ship them, and a manifest
+  # of filenames alone proves nothing about content. The sealed spool must be a
+  # root-only location outside what teardown removes — and it must not be the
+  # ingress, or "sealed" would mean "writable by the thing it contains".
+  jq -e '.evidencePublication.sealedSpool | type == "object" and
+         (.path | type == "string" and startswith("/")) and
+         .jobWritable == false and .survivesLeaseTeardown == true' "$isolation" >/dev/null ||
+    diene_die EvidencePublicationInterfaceUnavailable \
+      'the runner attests no root-only sealed spool that survives lease teardown; a job-writable directory cannot be one'
+  jq -e '.evidencePublication.sealedSpool.path != .evidencePublication.ingressDir' "$isolation" >/dev/null ||
+    diene_die EvidencePublicationInterfaceUnavailable \
+      'the sealed spool and the job-writable ingress are the same directory'
+  jq -e '.evidencePublication.retainsUntilAcknowledged == true' "$isolation" >/dev/null ||
+    diene_die EvidencePublicationInterfaceUnavailable \
+      'the spool does not retain the sealed bytes until the narrow channel acknowledges shipment'
+  # A spool with no channel behind it is a directory, not a publication path.
+  # These fields are the difference between "somewhere to put the bytes" and a
+  # channel that will actually ship them, so they are required explicitly
+  # rather than inferred from the staging fields.
+  jq -e '.evidencePublication.shipmentReady == true' "$isolation" >/dev/null ||
+    diene_die EvidencePublicationInterfaceUnavailable \
+      'the runner does not attest shipmentReady; a staging directory whose channel is unimplemented ships nothing'
+  jq -e '.evidencePublication.channel | type == "object" and
+         (.name | type == "string" and length > 0) and .available == true' "$isolation" >/dev/null ||
+    diene_die EvidencePublicationInterfaceUnavailable \
+      'the runner attests no available root-owned courier channel'
+  printf '%s\n' "$ingress"
+}
+
+# Place exactly one report in the job-writable ingress, with a candidate
+# manifest binding its exact name, kind, size and content digest.
+#
+# This does NOT seal anything. It runs as the job, so everything it writes is an
+# untrusted candidate: the root-owned courier is what validates the candidate
+# set against the lane-exact expectations, copies it into the sealed spool, and
+# ships it. Keeping the candidate set closed and bounded here is a courtesy to
+# that validator, never a substitute for it.
+diene_stage_evidence_candidate() {
+  local ingress=${1:?ingress dir required}
+  local kind=${2:?report kind required}
+  local report=${3:?report required}
+  [[ -d $ingress ]] ||
+    diene_die EvidencePublicationInterfaceUnavailable 'the evidence ingress directory is absent'
+  [[ -f $report && ! -L $report ]] ||
+    diene_die EvidencePublicationInterfaceUnavailable 'the report is not a regular file'
+  local name size digest
+  name=$(basename -- "$report")
+  size=$(stat -c %s "$report")
+  ((size > 0 && size <= 4194304)) ||
+    diene_die EvidencePublicationInterfaceUnavailable "the report size $size is outside the accepted bound"
+  digest=$(sha256sum "$report" | awk '{print $1}')
+  install -m 0600 "$report" "$ingress/$name"
+  jq -n --arg name "$name" --arg kind "$kind" --arg digest "sha256:$digest" \
+    --argjson size "$size" \
+    '{apiVersion:"diene.atomi.cloud/ci-evidence-candidate/v1",
+      trust:"untrusted-job-candidate",
+      artifacts:[{name:$name,kind:$kind,sizeBytes:$size,digest:$digest}]}' |
+    diene_write_json "$ingress/$name.candidate.json"
 }
 
 diene_require_host_broker() {
