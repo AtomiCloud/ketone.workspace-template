@@ -902,4 +902,211 @@ list_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.clust
 grep -Eq '^list --all -o json ' "$FAILURE_LOG" || fail 'list failure never attempted positive absence'
 ok 'all modeled lifecycle phase failures preserve exact-id cleanup semantics'
 
+printf '== identity mismatch, driver failure, and cancellation ==\n'
+
+expect_lifecycle_failure 5101 cid-mismatch NamespaceIdentityMismatch
+cid_mismatch_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ -e $FAILURE_NSC_ROOT/instances/$cid_mismatch_id/live ]] ||
+  fail 'cid mismatch did not remain visible as TTL-backed cleanup debt'
+! grep -Eq '^destroy ' "$FAILURE_LOG" ||
+  fail 'cid mismatch guessed between disagreeing identities and destroyed one'
+ok 'cidfile/metadata disagreement refuses without broad or guessed cleanup'
+
+expect_lifecycle_failure 5102 driver-fail DriverFailed
+driver_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^destroy --force ${driver_id} " "$FAILURE_LOG") == 1 ]] ||
+  fail 'driver failure did not destroy its exact cluster once'
+[[ ! -e $FAILURE_NSC_ROOT/instances/$driver_id/live ]] || fail 'driver failure left its cluster live'
+jq -e '.outcome == "Fail" and .namespaceLifecycle.destroy.outcome == "Pass" and
+  .namespaceLifecycle.absence.outcome == "Pass"' "$DIENE_CORE_REPORT" >/dev/null ||
+  fail 'driver failure was rewritten green by successful cleanup'
+ok 'driver failure remains red after exact destroy and absence both pass'
+
+cancel_lifecycle() {
+  local run_id=${1:?run id required} signal=${2:?signal required} expected=${3:?status required}
+  prepare_run "$run_id"
+  local pidfile=$scratch/cancel-$signal.pid killer rc cluster
+  (
+    local attempt pid=''
+    for ((attempt = 0; attempt < 200; attempt++)); do
+      [[ ! -s $pidfile ]] || read -r pid <"$pidfile"
+      if [[ -n $pid ]] && grep -Eq '^ssh ' "$FAKE_NSC_LOG"; then
+        kill -s "$signal" "$pid"
+        exit 0
+      fi
+      sleep 0.05
+    done
+    exit 1
+  ) &
+  killer=$!
+  if (
+    cd -- "$work"
+    printf '%s\n' "$BASHPID" >"$pidfile"
+    exec env FAKE_NSC_SCENARIO=ssh-delay ./scripts/ci/environment-k3d-run.sh orchestrate
+  ) >"$scratch/cancel-$signal.out" 2>"$scratch/cancel-$signal.err"; then
+    wait "$killer" || true
+    fail "$signal cancellation unexpectedly passed"
+  else
+    rc=$?
+  fi
+  wait "$killer" || fail "$signal cancellation was not injected during SSH"
+  [[ $rc == "$expected" ]] || fail "$signal cancellation returned $rc, expected $expected"
+  assert_contains "$scratch/cancel-$signal.err" OrchestratorCancelled
+  cluster=$(find "$FAKE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+  [[ $(grep -Ec "^destroy --force ${cluster} " "$FAKE_NSC_LOG") == 1 ]] ||
+    fail "$signal cancellation did not destroy its exact cluster once"
+  [[ ! -e $FAKE_NSC_ROOT/instances/$cluster/live ]] || fail "$signal cancellation left its cluster live"
+  jq -e '.outcome == "Fail" and .reasonCode == "OrchestratorCancelled" and
+    .namespaceLifecycle.destroy.outcome == "Pass" and .namespaceLifecycle.absence.outcome == "Pass"' \
+    "$DIENE_CORE_REPORT" >/dev/null || fail "$signal cancellation report lost its original red result"
+  ok "$signal cancellation remains red after exact cleanup"
+}
+
+cancel_lifecycle 5110 TERM 143
+cancel_lifecycle 5111 INT 130
+
+printf '== late cleanup closes debt but cannot rewrite red ==\n'
+
+expect_lifecycle_failure 5120 absence-fail NamespaceAbsenceUnproven
+late_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+late_report_digest=$(sha256sum "$DIENE_CORE_REPORT" | awk '{print $1}')
+if (cd -- "$work" && FAKE_NSC_SCENARIO=happy ./scripts/ci/environment-k3d-run.sh cleanup) \
+  >"$scratch/late-cleanup.out" 2>"$scratch/late-cleanup.err"; then
+  fail 'late cleanup rewrote a failed lifecycle green'
+fi
+assert_contains "$scratch/late-cleanup.err" LateCleanupCannotRewriteRun
+[[ $(grep -Ec "^destroy --force ${late_id} " "$FAILURE_LOG") == 2 ]] ||
+  fail 'late cleanup did not remain scoped to the same exact cluster_id'
+late_record=$(find "$RUNNER_TEMP/diene-namespace" -path '*/final-proof/late-cleanup.json' -print -quit)
+jq -e --arg cluster "$late_id" '.outcome == "Fail" and
+  .reasonCode == "LateExactCleanupCannotRewriteRun" and .clusterId == $cluster and
+  .absenceProven == true and .lateCleanupCanRewrite == false' "$late_record" >/dev/null ||
+  fail 'late cleanup did not emit durable exact-id red evidence'
+[[ $(sha256sum "$DIENE_CORE_REPORT" | awk '{print $1}') == "$late_report_digest" ]] ||
+  fail 'late cleanup mutated the original failed report'
+ok 'late exact cleanup can close debt but never rewrite the failed run green'
+
+printf '== receipt sweep refuses malformed, cross-run, empty, and prefix selectors ==\n'
+
+fake_pls=$scratch/fake-pls
+cat >"$fake_pls" <<'PLS'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%q ' "$@" >>"${FAKE_PLS_LOG:?}"
+printf '\n' >>"${FAKE_PLS_LOG:?}"
+exit 0
+PLS
+chmod 0755 "$fake_pls"
+fake_pls_log=$scratch/fake-pls.log
+: >"$fake_pls_log"
+
+valid_receipt=$(find "$RUNNER_TEMP/diene-receipts" -maxdepth 1 -type f -name '*.json' -print -quit)
+receipt_id=$(jq -er '.owner.receiptId' "$valid_receipt")
+
+expect_sweep_refusal() {
+  local reason=${1:?reason required} receipt_dir=${2:?receipt dir required}
+  local repository_id=${3:?repository id required} run_id=${4:?run id required}
+  local run_attempt=${5:?run attempt required} selected_receipt=${6-}
+  if (cd -- "$work" && DIENE_RECEIPT_DIR="$receipt_dir" DIENE_PLS_BIN="$fake_pls" \
+    FAKE_PLS_LOG="$fake_pls_log" ./scripts/ci/environment-receipt-sweep.sh \
+      --repository-id "$repository_id" --run-id "$run_id" --run-attempt "$run_attempt" \
+      --receipt-id "$selected_receipt") >"$scratch/sweep.out" 2>"$scratch/sweep.err"; then
+    fail "receipt sweep unexpectedly accepted $reason case"
+  fi
+  grep -Fq -- "$reason" "$scratch/sweep.err" || {
+    sed -n '1,120p' "$scratch/sweep.err" >&2
+    fail "receipt sweep did not report $reason"
+  }
+  ok "receipt sweep refuses $reason"
+}
+
+malformed_dir=$scratch/receipts-malformed
+install -d -m 0700 "$malformed_dir"
+jq 'del(.namespace.duration)' "$valid_receipt" >"$malformed_dir/receipt.json"
+expect_sweep_refusal SchemaValidationFailed "$malformed_dir" 12345 5120 1 "$receipt_id"
+
+cross_run_dir=$scratch/receipts-cross-run
+install -d -m 0700 "$cross_run_dir"
+cp "$valid_receipt" "$cross_run_dir/receipt.json"
+expect_sweep_refusal CleanupDebt "$cross_run_dir" 12345 999999 1 "$receipt_id"
+
+empty_dir=$scratch/receipts-empty
+install -d -m 0700 "$empty_dir"
+expect_sweep_refusal CleanupDebt "$empty_dir" 12345 5120 1 "$receipt_id"
+
+receipt_prefix=${receipt_id%-*}
+expect_sweep_refusal CleanupDebt "$cross_run_dir" 12345 5120 1 "$receipt_prefix"
+expect_sweep_refusal InputContractInvalid "$cross_run_dir" 12345 5120 1 ''
+[[ ! -s $fake_pls_log ]] || fail 'a refused receipt selector invoked Garden teardown'
+ok 'every refused receipt selector performs zero deletion'
+
+printf '== two parallel tuples cannot cross read, write, or destroy ==\n'
+
+parallel_runner_a=$scratch/parallel-runner-6101
+parallel_runner_b=$scratch/parallel-runner-6102
+parallel_nsc_a=$scratch/parallel-nsc-6101
+parallel_nsc_b=$scratch/parallel-nsc-6102
+
+parallel_run() {
+  local run_id=${1:?run id required} runner=${2:?runner required} nsc_root=${3:?nsc root required}
+  prepare_run "$run_id" ditto-build-local "$runner" "$nsc_root"
+  run_orchestrator ssh-delay
+}
+
+parallel_run 6101 "$parallel_runner_a" "$parallel_nsc_a" \
+  >"$scratch/parallel-a.out" 2>"$scratch/parallel-a.err" &
+parallel_pid_a=$!
+parallel_run 6102 "$parallel_runner_b" "$parallel_nsc_b" \
+  >"$scratch/parallel-b.out" 2>"$scratch/parallel-b.err" &
+parallel_pid_b=$!
+if ! wait "$parallel_pid_a"; then
+  sed -n '1,160p' "$scratch/parallel-a.err" >&2
+  fail 'parallel tuple A failed'
+fi
+if ! wait "$parallel_pid_b"; then
+  sed -n '1,160p' "$scratch/parallel-b.err" >&2
+  fail 'parallel tuple B failed'
+fi
+
+parallel_id_a=$(find "$parallel_nsc_a/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+parallel_id_b=$(find "$parallel_nsc_b/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ -n $parallel_id_a && -n $parallel_id_b && $parallel_id_a != "$parallel_id_b" ]] ||
+  fail 'parallel tuples did not receive distinct exact cluster IDs'
+[[ $(find "$parallel_nsc_a/instances" -name meta.json | wc -l) == 1 &&
+  $(find "$parallel_nsc_b/instances" -name meta.json | wc -l) == 1 ]] ||
+  fail 'a parallel fake Namespace root observed another tuple instance'
+
+assert_parallel_log_scope() {
+  local log=${1:?log required} exact=${2:?exact id required} other=${3:?other id required}
+  awk -v exact="$exact" '
+    $1 == "instance" && ($2 == "upload" || $2 == "download") && $3 != exact {exit 1}
+    $1 == "ssh" && $2 != exact {exit 1}
+    $1 == "destroy" && $3 != exact {exit 1}
+  ' "$log" || fail "$log contains a cross-tuple read/write/destroy selector"
+  ! grep -Fq -- "$other" "$log" || fail "$log mentions the other tuple cluster ID"
+  [[ $(grep -Ec "^destroy --force ${exact} " "$log") == 1 ]] ||
+    fail "$log does not destroy its exact tuple exactly once"
+}
+
+assert_parallel_log_scope "$parallel_nsc_a/log" "$parallel_id_a" "$parallel_id_b"
+assert_parallel_log_scope "$parallel_nsc_b/log" "$parallel_id_b" "$parallel_id_a"
+jq -e --arg run 6101 '.owner.runId == $run' \
+  "$parallel_nsc_a/instances/$parallel_id_a/fs/run/diene-ci/receipt.json" >/dev/null ||
+  fail 'parallel tuple A read or received another tuple receipt'
+jq -e --arg run 6102 '.owner.runId == $run' \
+  "$parallel_nsc_b/instances/$parallel_id_b/fs/run/diene-ci/receipt.json" >/dev/null ||
+  fail 'parallel tuple B read or received another tuple receipt'
+jq -e --arg cluster "$parallel_id_a" --arg run 6101 \
+  '.workflow.runId == $run and .instance.clusterId == $cluster' \
+  "$parallel_runner_a/diene-environment-report.v1.json" >/dev/null ||
+  fail 'parallel tuple A report crossed identity'
+jq -e --arg cluster "$parallel_id_b" --arg run 6102 \
+  '.workflow.runId == $run and .instance.clusterId == $cluster' \
+  "$parallel_runner_b/diene-environment-report.v1.json" >/dev/null ||
+  fail 'parallel tuple B report crossed identity'
+[[ ! -e $parallel_nsc_a/instances/$parallel_id_a/live &&
+  ! -e $parallel_nsc_b/instances/$parallel_id_b/live ]] ||
+  fail 'a parallel exact instance survived cleanup'
+ok 'parallel tuples have distinct IDs, receipts, reports, roots, and exact cleanup selectors'
+
 printf '\nenvironment contract checkpoint: PASS (%d checks)\n' "$passed"
