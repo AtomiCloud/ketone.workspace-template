@@ -406,7 +406,7 @@ diene_discover_runtime() {
 # and the lane refuses when that broker is absent rather than presenting a
 # self-enforced table as proof.
 diene_host_policy_bin() {
-  printf '%s\n' "${DIENE_HOST_POLICY_BROKER_BIN:-/opt/diene/bin/diene-host-policy-broker}"
+  printf '%s\n' "${DIENE_HOST_POLICY_BIN:-/opt/diene/bin/diene-host-policy}"
 }
 
 diene_require_host_broker() {
@@ -414,38 +414,111 @@ diene_require_host_broker() {
   bin=$(diene_host_policy_bin)
   command -v "$bin" >/dev/null 2>&1 || [[ -x $bin ]] ||
     diene_die HostPolicyInterfaceUnavailable \
-      "root-owned host-policy broker $bin is absent; a job-namespace table the job can flush is not an egress boundary"
+      "runner host-policy interface $bin is absent; a job-namespace table the job can flush is not an egress boundary"
 }
 
-# The receipt-assigned routes come from the broker's authenticated isolation
-# receipt. This node never duplicates bridge/pod/service constants: a stale
-# copy of the runner's CIDRs is exactly how the two arms drift apart.
+# The lane CIDRs are runner-owned. They are read from the 0440 isolation
+# receipt the runner publishes, never copied into this arm as constants and
+# never re-derived from the runner's path layout: a duplicated constant is
+# exactly how the two arms drift apart.
+diene_lane_cidrs() {
+  local isolation=${DIENE_ISOLATION_FILE:-}
+  [[ -n $isolation ]] ||
+    diene_die HostPolicyInterfaceUnavailable \
+      'the runner published no isolation receipt path; lane CIDRs cannot be consumed and must not be guessed'
+  [[ -r $isolation ]] ||
+    diene_die HostPolicyInterfaceUnavailable "the isolation receipt $isolation is not readable"
+  local mode
+  mode=$(stat -c %a "$isolation")
+  [[ $mode == 440 ]] ||
+    diene_die HostPolicyInterfaceUnavailable "the isolation receipt mode is $mode, expected the 0440 runner-owned projection"
+  jq -er '.laneCidrs | select(type == "array" and length >= 1) | .[]' "$isolation" ||
+    diene_die HostPolicyInterfaceUnavailable 'the isolation receipt publishes no laneCidrs'
+}
+
+# The enforcement layer admits lane CIDRs plus literal-IP host:port pairs only:
+# it rejects bare hostnames as unenforceable, and it denies DNS outright. A
+# connected lane therefore cannot be given `ghcr.io:443` or any other name — it
+# needs canonical literal endpoints the runner publishes, or it must refuse.
+diene_connected_endpoints() {
+  local isolation=${DIENE_ISOLATION_FILE:-}
+  [[ -n $isolation && -r $isolation ]] ||
+    diene_die ConnectedEgressInterfaceUnavailable \
+      'no isolation receipt; the connected lanes have no enforceable registry or seed endpoint'
+  local -a endpoints=()
+  mapfile -t endpoints < <(jq -r '(.connectedEndpoints // [])[]' "$isolation")
+  ((${#endpoints[@]} > 0)) ||
+    diene_die ConnectedEgressInterfaceUnavailable \
+      'the runner publishes no connectedEndpoints; a connected lane cannot reach its registry or seed through an allowlist that admits only literal IPs, and a bare hostname would be refused as unenforceable'
+  local endpoint
+  for endpoint in "${endpoints[@]}"; do
+    diene_require_literal_endpoint "$endpoint"
+  done
+  printf '%s\n' "${endpoints[@]}"
+}
+
+# A literal IPv4 or bracketless IPv6 address with a port. Anything resolvable by
+# name is refused here rather than being sent to a conductor that will reject it.
+diene_require_literal_endpoint() {
+  local endpoint=${1:?endpoint required}
+  local host=${endpoint%:*}
+  local port=${endpoint##*:}
+  [[ $port =~ ^[0-9]{1,5}$ ]] ||
+    diene_die ConnectedEgressInterfaceUnavailable "endpoint $endpoint carries no port"
+  [[ $host =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $host =~ ^[0-9a-fA-F:]+$ ]] ||
+    diene_die ConnectedEgressInterfaceUnavailable \
+      "endpoint $endpoint is a name, not a literal address; the enforcement layer refuses bare hostnames"
+}
+
+# Emits exactly the `diene.atomi.cloud/ci-host-policy/v1` document the runner
+# client accepts: the five canonical keys, DNS and the default route denied,
+# and `mode` on the canonical wire enum. `closure-denied-network` carries no
+# host:port entry at all, because a hermetic closure has no name resolution.
 diene_write_allow_file() {
   local target=${1:?target required}
-  local receipt_id=${2:?receipt id required}
-  local posture=${3:?posture required}
-  shift 3
-  local bin routes
-  bin=$(diene_host_policy_bin)
-  routes=$("$bin" routes --receipt "$receipt_id" --posture "$posture") ||
-    diene_die HostPolicyInterfaceUnavailable "the broker issued no isolation receipt for $receipt_id"
-  local extra_json='[]'
+  local wire_mode=${2:?wire mode required}
+  shift 2
+  [[ $wire_mode == allowlist || $wire_mode == closure-denied-network ]] ||
+    diene_die InputContractInvalid "host policy mode $wire_mode is not on the canonical wire enum"
+
+  # Collected through a file rather than a process substitution: a refusal
+  # inside a substituted subshell cannot exit this script, so the caller would
+  # silently proceed with an empty set.
+  local -a lane=()
+  local lane_file="${target}.lanes"
+  diene_lane_cidrs >"$lane_file"
+  mapfile -t lane <"$lane_file"
+  rm -f -- "$lane_file"
+  ((${#lane[@]} > 0)) ||
+    diene_die HostPolicyInterfaceUnavailable 'the isolation receipt publishes no laneCidrs'
+
+  local -a extra=()
   if (($#)); then
-    extra_json=$(printf '%s\n' "$@" | jq -R . | jq -sc .)
+    if [[ $wire_mode == closure-denied-network ]]; then
+      diene_die InputContractInvalid 'a hermetic closure posture admits no host:port route'
+    fi
+    local endpoint
+    for endpoint in "$@"; do
+      diene_require_literal_endpoint "$endpoint"
+    done
+    extra=("$@")
   fi
-  printf '%s' "$routes" | jq --argjson extra "$extra_json" --arg posture "$posture" \
-    '{apiVersion: "diene.atomi.cloud/ci-host-policy/v1", mode: $posture,
-      allow: ((.allow // []) + $extra), denyDns: (.denyDns // true),
-      denyDefaultRoute: (.denyDefaultRoute // true)}' | diene_write_json "$target"
+
+  printf '%s\n' "${lane[@]}" "${extra[@]}" | jq -R . | jq -sc --arg mode "$wire_mode" \
+    '{apiVersion: "diene.atomi.cloud/ci-host-policy/v1", mode: $mode,
+      allow: (map(select(. != "")) | unique), denyDns: true, denyDefaultRoute: true}' |
+    diene_write_json "$target"
   diene_schema_validate diene-host-policy-v1.schema.json "$target" 'host policy allowlist'
 
-  # A posture that denies everything the lane must actually reach is not a
-  # posture, it is a broken lane reporting readiness it cannot have.
-  if [[ $posture == connected ]]; then
-    jq -e '(.allow | length) > 0 and (.denyDns == false or ((.allow[] | select(test(":"))) | length) > 0)' \
-      "$target" >/dev/null ||
-      diene_die HostPolicyInterfaceUnavailable \
-        'the connected posture reaches no registry or seed route; readiness through it would be unprovable'
+  # A connected lane that reaches no enforceable endpoint is not a posture, it
+  # is a lane reporting readiness it could not have achieved. A lane CIDR is
+  # never mistaken for one: only entries in literal host:port form count, and a
+  # CIDR always ends in /prefix.
+  if ((${#extra[@]} > 0)); then
+    jq -e '[.allow[] | select(test("^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9a-fA-F:]+):[0-9]{1,5}$"))]
+           | length > 0' "$target" >/dev/null ||
+      diene_die ConnectedEgressInterfaceUnavailable \
+        'the connected posture carries no enforceable literal endpoint; readiness through it would be unprovable'
   fi
 }
 
@@ -459,25 +532,21 @@ diene_host_policy_apply() {
     diene_die HostPolicyInterfaceUnavailable "host policy apply failed for $receipt_id"
 }
 
-# Apply-time acknowledgement is not lifetime enforcement. The broker is asked
-# to re-attest that the posture is still held, from the host side, after the
-# lane has run.
-diene_host_policy_verify() {
-  local receipt_id=${1:?receipt id required}
-  local bin
-  bin=$(diene_host_policy_bin)
-  "$bin" verify --receipt "$receipt_id"
-}
-
-# A job that knows its own receipt could otherwise call a passwordless broker
-# to tear down the very enforcement that contains it. The job side may only
-# REQUEST deferred cleanup; the outer table persists until root-owned runner
-# teardown removes it. This never deletes anything and never reports absence.
+# The ratified `release` verb is deliberately deferred and non-destructive: it
+# runs as the very principal the policy constrains, so if it deleted anything a
+# lane could invoke it with its own known receipt and restore egress. Deletion
+# belongs exclusively to the root-owned runner teardown transition. This never
+# deletes and never proves the enforcing table absent.
+#
+# Lifetime attestation likewise is not the lane's to claim. `apply` proves the
+# posture from outside the lane namespace at apply time; that the posture held
+# for the whole lane is evidence the root-owned teardown produces and the
+# controller-owned `environment-runner-lifecycle` check carries.
 diene_host_policy_request_release() {
   local receipt_id=${1:?receipt id required}
   local bin
   bin=$(diene_host_policy_bin)
-  "$bin" request-release --receipt "$receipt_id"
+  "$bin" release --receipt "$receipt_id"
 }
 
 # Mandatory lane proofs that Garden has not ratified an interface for. They are

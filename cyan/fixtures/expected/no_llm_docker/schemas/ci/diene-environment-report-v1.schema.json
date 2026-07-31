@@ -177,7 +177,7 @@
           "properties": {
             "outcome": { "enum": ["Pass", "Fail", "NotRequired", "Unavailable"] },
             "reasonCode": { "type": "string", "minLength": 1 },
-            "mode": { "enum": ["hermetic", "connected"] }
+            "mode": { "enum": ["allowlist", "closure-denied-network"] }
           }
         }
       }

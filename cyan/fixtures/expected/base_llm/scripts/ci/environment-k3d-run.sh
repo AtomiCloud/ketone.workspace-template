@@ -97,19 +97,19 @@ record_coverage local-finalizer-window FinalizerQuiescenceInterfaceUnavailable
 # mutation, so a cancellation inside `pls env up` still converges.
 # ---------------------------------------------------------------------------
 
-# `hermetic` denies DNS and every route the isolation receipt does not name;
-# `connected` additionally carries the exact seed and registry routes the lane
-# genuinely needs. Ditto core is connected by contract, so describing it as
-# hermetic would be a posture the lane cannot actually run under.
-policy_mode=hermetic
+# The canonical wire enum the runner client and conductor validate:
+# `closure-denied-network` admits only the runner-assigned lane CIDRs, while
+# `allowlist` also admits the literal connected endpoints. It is the same value
+# end to end — emitted in the document, recorded on the receipt, reported in
+# the evidence.
+policy_mode=closure-denied-network
 case $DIENE_LANE in
-  ditto-build-local | ditto-target-pull) policy_mode=connected ;;
+  ditto-build-local | ditto-target-pull) policy_mode=allowlist ;;
 esac
 
 receipt=$(diene_arm_receipt "$receipt_id" "$DIENE_LANE" "$profile" "$build_mode" "$policy_mode")
 
 policy_applied=0
-posture_sustained=0
 cleanup_attempted=0
 cleanup_result=1
 teardown_transitions=()
@@ -150,20 +150,6 @@ cleanup() {
     absence_proof=ReceiptRetainedAsDebt
     teardown_transitions+=("ExactDown:Fail")
     record_debt "exact receipt sweep did not converge for $receipt_id"
-  fi
-
-  # Apply-time acknowledgement is not lifetime enforcement: ask the host-owned
-  # broker to re-attest that the posture was actually held for the whole lane.
-  if ((policy_applied)); then
-    if diene_host_policy_verify "$receipt_id"; then
-      posture_sustained=1
-      teardown_transitions+=("PostureSustained:Pass")
-    else
-      failed=1
-      posture_sustained=0
-      teardown_transitions+=("PostureSustained:Fail")
-      record_debt "the host-owned egress posture was not sustained for $receipt_id"
-    fi
   fi
 
   # The job may only request deferred cleanup: the outer enforcement persists
@@ -220,7 +206,6 @@ emit_report() {
     --arg absenceProof "$absence_proof" \
     --arg verdict "$verdict" --arg reason "$reason" \
     --argjson policyApplied "$policy_applied" \
-    --argjson postureSustained "$posture_sustained" \
     --argjson finalizerWait "$finalizer_wait" \
     --argjson setupSeconds "$setup_seconds" \
     --argjson substrateSeconds "$substrate_seconds" \
@@ -253,11 +238,10 @@ emit_report() {
       evidence: {
         leakageScan: { outcome: "Pass", reasonCode: "ScanPendingFinalisation", encodings: [], scannedPaths: [] },
         egressCanary: {
-          outcome: (if $policyApplied != 1 then "Fail"
-                    elif $postureSustained == 1 then "Pass" else "Fail" end),
-          reasonCode: (if $policyApplied != 1 then "PostureNeverEstablished"
-                       elif $postureSustained == 1 then "HostAttestedPostureSustained"
-                       else "PostureNotSustainedForLaneLifetime" end),
+          outcome: (if $policyApplied == 1 then "Pass" else "Fail" end),
+          reasonCode: (if $policyApplied == 1
+                       then "OuterLayerDeniedMetadataAtApply"
+                       else "PostureNeverEstablished" end),
           mode: $policyMode
         }
       },
@@ -362,7 +346,7 @@ case $DIENE_LANE in
     "$pls_bin" closure import "$DIENE_CLOSURE_BUNDLE_REF"
 
     allow_file="$runtime_dir/host-policy.json"
-    diene_write_allow_file "$allow_file" "$receipt_id" hermetic
+    diene_write_allow_file "$allow_file" closure-denied-network
     diene_host_policy_apply "$receipt_id" "$allow_file"
     policy_applied=1
     "$pls_bin" closure preflight --denied-network
@@ -371,18 +355,27 @@ case $DIENE_LANE in
       diene_die ClosureAttestationInterfaceUnavailable 'exact-set equality did not hold under denial'
     ;;
   fleet-independence)
+    # Hermetic, but not closure-backed: the fixture reaches nothing beyond the
+    # runner-assigned lane CIDRs.
     allow_file="$runtime_dir/host-policy.json"
-    diene_write_allow_file "$allow_file" "$receipt_id" hermetic
+    diene_write_allow_file "$allow_file" closure-denied-network
     diene_host_policy_apply "$receipt_id" "$allow_file"
     policy_applied=1
     ;;
   ditto-build-local | ditto-target-pull)
     # Connected Ditto is not hermetic: it must reach its scoped seed and, for
-    # target-pull, the registry. The broker issues that posture or the lane
-    # refuses; it never reports readiness through a posture that makes the
-    # required operations impossible.
+    # target-pull, the registry. Those endpoints must be literal and
+    # runner-published — the enforcement layer refuses bare hostnames and
+    # denies DNS — so the lane refuses rather than claiming a posture through
+    # which the required operations could not have succeeded.
     allow_file="$runtime_dir/host-policy.json"
-    diene_write_allow_file "$allow_file" "$receipt_id" connected
+    # Through a file, not a process substitution: a refusal inside a
+    # substituted subshell cannot exit this script, so an unenforceable
+    # connected posture would slip through as an empty endpoint set.
+    connected_file="$runtime_dir/connected-endpoints"
+    diene_connected_endpoints >"$connected_file"
+    mapfile -t connected_endpoints <"$connected_file"
+    diene_write_allow_file "$allow_file" allowlist "${connected_endpoints[@]}"
     diene_host_policy_apply "$receipt_id" "$allow_file"
     policy_applied=1
     ;;

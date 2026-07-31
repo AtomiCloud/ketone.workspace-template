@@ -125,35 +125,81 @@ esac
 PLS
 chmod 0755 "$fake_pls"
 
-# A stand-in for the root-owned broker. It models the ABI only: the real
-# boundary lives in a host layer the job cannot reach, which is precisely why
-# the lane refuses when the broker is absent.
-fake_policy=$scratch/diene-host-policy-broker
+# A stand-in for the runner-owned client. It models the RATIFIED ABI exactly —
+# `apply` and a deliberately deferred, non-destructive `release`, nothing else —
+# and applies the same document predicate the real client applies, so a
+# template that drifts from the runner's accepted shape fails here. It is a
+# stand-in for the transport only: the real boundary lives in a host layer the
+# job cannot reach, which is why the lane refuses when the client is absent.
+fake_policy=$scratch/diene-host-policy
 cat >"$fake_policy" <<'POLICY'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'host-policy %q ' "$@" >>"${DIENE_TEST_PLS_LOG:?}"
 printf '\n' >>"$DIENE_TEST_PLS_LOG"
-case ${1:-} in
-  routes)
-    posture=hermetic
-    while (($#)); do [[ $1 == --posture ]] && posture=$2; shift; done
-    # The receipt-assigned routes are issued by the broker, never copied from
-    # a stale constant in the template.
-    if [[ $posture == connected ]]; then
-      jq -nc '{allow:["127.0.0.0/8","10.202.0.0/24","10.203.0.0/16","ghcr.io:443","seed.internal:443"],
-               denyDns:true,denyDefaultRoute:true}'
-    else
-      jq -nc '{allow:["127.0.0.0/8","10.202.0.0/24","10.203.0.0/16"],denyDns:true,denyDefaultRoute:true}'
-    fi
-    ;;
-  verify)
-    # The host layer attests the posture was held for the lane's lifetime.
-    [[ ${DIENE_TEST_POSTURE_BROKEN:-0} != 1 ]]
-    ;;
-esac
+
+verb=${1-}
+shift || true
+[[ $verb == apply || $verb == release ]] || {
+  printf 'HostPolicyRefused: unratified verb %s\n' "$verb" >&2
+  exit 70
+}
+allow_file=
+while (($#)); do
+  case $1 in
+    --allow-file) allow_file=$2; shift 2 ;;
+    --receipt) shift 2 ;;
+    *) printf 'HostPolicyRefused: unknown argument %s\n' "$1" >&2; exit 70 ;;
+  esac
+done
+
+if [[ $verb == release ]]; then
+  # Deferred and non-destructive: it deletes nothing and proves nothing absent.
+  printf 'HostPolicyReleaseDeferred\n'
+  exit 0
+fi
+
+# The runner client's literal accepted-document predicate.
+jq -e '
+  type == "object" and
+  .apiVersion == "diene.atomi.cloud/ci-host-policy/v1" and
+  ((.mode == "allowlist") or (.mode == "closure-denied-network")) and
+  .denyDns == true and .denyDefaultRoute == true and
+  (.allow | type == "array" and length >= 1 and (unique | length) == length) and
+  (.allow | all(type == "string" and test("^([0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}|[0-9a-fA-F:]+/[0-9]{1,3}|[a-z0-9][a-z0-9.-]*:[0-9]{1,5})$"))) and
+  ((keys | sort) == ["allow", "apiVersion", "denyDefaultRoute", "denyDns", "mode"])
+' >/dev/null <"${allow_file:?--allow-file is required for apply}" || {
+  printf 'HostPolicyRefused: the generated allowlist is not a valid diene-host-policy/v1 document\n' >&2
+  exit 70
+}
+# Only the runner-assigned lane CIDRs and literal-IP host:port pairs are
+# admissible; a bare hostname or a broad private range is refused.
+mapfile -t admissible < <(jq -er '.laneCidrs[]' "${DIENE_ISOLATION_FILE:?}")
+while read -r entry; do
+  if [[ $entry == */* ]]; then
+    printf '%s\n' "${admissible[@]}" | grep -Fxq -- "$entry" || {
+      printf 'HostPolicyRefused: %s is not a runner-assigned lane CIDR\n' "$entry" >&2
+      exit 70
+    }
+  else
+    host=${entry%:*}
+    [[ $host =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $host =~ ^[0-9a-fA-F:]+$ ]] || {
+      printf 'HostPolicyRefused: %s is a bare hostname and is unenforceable\n' "$entry" >&2
+      exit 70
+    }
+  fi
+done < <(jq -r '.allow[]' "$allow_file")
+printf 'HostPolicyApplied mode=%s\n' "$(jq -r '.mode' "$allow_file")"
 POLICY
 chmod 0755 "$fake_policy"
+
+# The runner-owned 0440 isolation receipt. The template consumes laneCidrs and
+# connectedEndpoints from here and carries no CIDR constants of its own.
+fake_isolation=$scratch/isolation.json
+jq -n '{apiVersion:"diene.atomi.cloud/ci-runner-isolation/v1",leaseId:"00000000-0000-4000-8000-000000000000",
+        laneCidrs:["127.0.0.0/8","::1/128","10.202.0.0/24","10.203.0.0/16","10.42.0.0/16","10.43.0.0/16"],
+        connectedEndpoints:["10.203.0.9:5000"]}' >"$fake_isolation"
+chmod 0440 "$fake_isolation"
 
 fake_pull_proof=$scratch/diene-artifact-pull-proof
 cat >"$fake_pull_proof" <<'PULL'
@@ -208,7 +254,8 @@ export GITHUB_REPOSITORY_ID=12345 GITHUB_REPOSITORY=AtomiCloud/example
 export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export GITHUB_RUN_ID=8001 GITHUB_RUN_ATTEMPT=1
 export DIENE_PLS_BIN=$fake_pls
-export DIENE_HOST_POLICY_BROKER_BIN=$fake_policy
+export DIENE_HOST_POLICY_BIN=$fake_policy
+export DIENE_ISOLATION_FILE=$fake_isolation
 export DIENE_PULL_PROOF_BIN=$fake_pull_proof
 export DIENE_CLOSURE_VERIFY_BIN=$fake_closure_verify
 export DIENE_BASE_WORKFLOW_REF="AtomiCloud/example/.github/workflows/environment-k3d.yaml@$GITHUB_SHA"
@@ -552,8 +599,8 @@ jq -e '.outcome == "Pass" and .teardown.outcome == "Pass" and
        .evidence.leakageScan.outcome == "Pass" and
        (.evidence.leakageScan.encodings | length) == 6 and
        (.evidence.leakageScan.scannedPaths | length) >= 3 and
-       .evidence.egressCanary.mode == "connected" and
-       .evidence.egressCanary.reasonCode == "HostAttestedPostureSustained" and
+       .evidence.egressCanary.mode == "allowlist" and
+       .evidence.egressCanary.reasonCode == "OuterLayerDeniedMetadataAtApply" and
        .subject.imageRef != null and .timings.substrateSeconds >= 0' \
   "$DIENE_CORE_REPORT" >/dev/null || fail 'happy-path report is incomplete'
 ok 'happy path emits a complete, schema-valid report'
@@ -568,17 +615,25 @@ ok 'env up carries the mandatory --artifact'
 grep -Fq -- 'env down --profile ditto' "$DIENE_TEST_PLS_LOG" || fail 'exact teardown was not driven'
 ok 'exact teardown is driven through the ratified down'
 grep -Fq 'host-policy apply' "$DIENE_TEST_PLS_LOG" || fail 'host policy was never applied'
-grep -Fq 'host-policy verify' "$DIENE_TEST_PLS_LOG" ||
-  fail 'the posture was never re-attested from the host side'
-grep -Fq 'host-policy request-release' "$DIENE_TEST_PLS_LOG" ||
-  fail 'no deferred cleanup was requested'
-# A job that knows its own receipt must not be able to delete the enforcement
-# containing it, so the job side never invokes a real release verb.
-! grep -Eq 'host-policy .release' "$DIENE_TEST_PLS_LOG" ||
-  fail 'the job invoked a destructive host-policy release'
-! grep -Fq 'diene_host_policy_release' ./scripts/ci/environment-lib.sh ||
-  fail 'a job-side destructive release verb still exists'
-ok 'the job requests deferred cleanup and cannot dissolve its own enforcement'
+grep -Fq 'host-policy release' "$DIENE_TEST_PLS_LOG" || fail 'no deferred cleanup was requested'
+# Exactly the two ratified verbs and nothing else: the runner client rejects
+# anything further, so an invented verb would already have failed above.
+while read -r verb; do
+  [[ $verb == apply || $verb == release ]] ||
+    fail "the lane invoked the unratified host-policy verb $verb"
+done < <(grep -o "^host-policy '\?[a-z-]*" "$DIENE_TEST_PLS_LOG" | sed "s/^host-policy '\?//" | sort -u)
+ok 'only the ratified apply and release verbs are invoked'
+
+# `release` is deferred by contract, so the lane must never read it as proof
+# that the enforcing table is gone.
+grep -Fq 'PolicyReleaseRequested:Deferred' "$DIENE_CORE_REPORT" ||
+  jq -e '[.teardown.transitions[] | select(startswith("PolicyReleaseRequested"))] | length == 1' \
+    "$DIENE_CORE_REPORT" >/dev/null ||
+  fail 'the deferred cleanup request is not recorded as deferred'
+! jq -e '[.teardown.transitions[] | select(test("PolicyRemoved|PolicyAbsent"))] | length > 0' \
+  "$DIENE_CORE_REPORT" >/dev/null ||
+  fail 'the lane claimed the enforcing table was removed'
+ok 'the job requests deferred cleanup and never claims the enforcement was removed'
 
 # The ratified surface is the only surface. The fake exits 127 on anything
 # else, so a reintroduced `pls env status|render|artifact|network` would have
@@ -777,7 +832,7 @@ ok 'posture and receipt are armed before the substrate mutation'
 kill -TERM -"$sig_pid" 2>/dev/null || kill -TERM "$sig_pid" 2>/dev/null || true
 wait "$sig_pid" 2>/dev/null || true
 
-grep -Fq 'host-policy request-release' "$DIENE_TEST_PLS_LOG" ||
+grep -Fq 'host-policy release' "$DIENE_TEST_PLS_LOG" ||
   fail 'a cancelled run never requested deferred cleanup of its egress posture'
 ok 'cancellation inside env up still requests deferred cleanup of the posture'
 
@@ -794,26 +849,98 @@ printf '== enforcement boundary is host-owned, not job-owned ==\n'
 # Without a root-owned broker the lane refuses. A table this job installs in
 # its own namespace is a cooperative setting it can flush, not a boundary.
 : >"$DIENE_TEST_PLS_LOG"
-DIENE_HOST_POLICY_BROKER_BIN=/nonexistent/diene-host-policy-broker \
+DIENE_HOST_POLICY_BIN=/nonexistent/diene-host-policy \
   expect_refusal HostPolicyInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
 [[ ! -s $DIENE_TEST_PLS_LOG ]] || fail 'a lane without an enforcement boundary still mutated the substrate'
 ok 'no host-owned broker means the lane refuses before any mutation'
 
-# The job holds CAP_NET_ADMIN, so it can flush any table it can see. The
-# posture must still be attested from the host side afterwards.
+# The job holds CAP_NET_ADMIN and can flush any table it can see. That is
+# exactly why the enforcing table lives outside its namespace: nothing the job
+# does to its own tables changes the outer layer, and the job has no verb that
+# deletes it.
 if command -v nft >/dev/null 2>&1; then
   nft delete table inet diene_ci_egress 2>/dev/null || true
   nft flush ruleset 2>/dev/null || true
 fi
+ok 'the job may flush its own tables; the outer enforcement is not its to remove'
+
+# The lane CIDRs are runner-owned. A hermetic lane without the isolation
+# receipt refuses rather than guessing the runner's layout or reviving a
+# constant of its own.
 : >"$DIENE_TEST_PLS_LOG"
-DIENE_TEST_POSTURE_BROKEN=1 DIENE_CORE_REPORT=$scratch/broken-posture.json \
-  ./scripts/ci/environment-k3d-run.sh >/dev/null 2>&1 &&
-  fail 'a lane whose egress posture was not sustained still went green'
-jq -e '.outcome == "Fail" and .evidence.egressCanary.outcome == "Fail" and
-       .evidence.egressCanary.reasonCode == "PostureNotSustainedForLaneLifetime"' \
-  "$scratch/broken-posture.json" >/dev/null ||
-  fail 'a broken posture was not recorded as a failed egress canary'
-ok 'a posture the host cannot attest fails the lane, whatever the job did to its own tables'
+export DIENE_LANE=fleet-independence DIENE_FIXTURE_ID=bootstrap-fleet-independence-v1
+write_lease environment-fleet-independence
+DIENE_ISOLATION_FILE='' \
+  expect_refusal HostPolicyInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
+! grep -Fq 'env up' "$DIENE_TEST_PLS_LOG" || fail 'a lane without lane CIDRs still mutated the substrate'
+
+# A receipt that is not the 0440 runner-owned projection is refused.
+loose_isolation=$scratch/loose-isolation.json
+cp -- "$fake_isolation" "$loose_isolation"
+chmod 0644 "$loose_isolation"
+DIENE_ISOLATION_FILE="$loose_isolation" \
+  expect_refusal HostPolicyInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
+ok 'lane CIDRs come only from the 0440 runner-owned isolation receipt'
+export DIENE_ISOLATION_FILE=$fake_isolation
+unset DIENE_FIXTURE_ID
+
+# A connected lane with no runner-published enforceable endpoint refuses: the
+# enforcement layer admits only literal addresses, so a bare hostname such as
+# ghcr.io:443 could never be enforced and must never be emitted.
+#
+# An env prefix on a shell FUNCTION persists after the call, so the lane is set
+# back explicitly rather than inherited from an earlier refusal case.
+export DIENE_LANE=ditto-build-local
+export DIENE_JOURNEY_MANIFEST=.diene/ci/journeys.v1.yaml
+unset DIENE_CLOSURE_DIGEST DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST \
+  DIENE_CLOSURE_TRUST_ROOT_DIGEST DIENE_CLOSURE_BUNDLE_REF \
+  DIENE_ARTIFACT_ATTESTATION_DIGEST DIENE_ARTIFACT_PROVENANCE_REF 2>/dev/null || true
+no_endpoints=$scratch/no-endpoints.json
+jq 'del(.connectedEndpoints)' "$fake_isolation" >"$no_endpoints"
+chmod 0440 "$no_endpoints"
+: >"$DIENE_TEST_PLS_LOG"
+DIENE_ISOLATION_FILE="$no_endpoints" \
+  expect_refusal ConnectedEgressInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
+! grep -Fq 'host-policy apply' "$DIENE_TEST_PLS_LOG" ||
+  fail 'a connected lane applied a posture it could not have run under'
+
+named_endpoints=$scratch/named-endpoints.json
+jq '.connectedEndpoints = ["ghcr.io:443","seed.internal:443"]' "$fake_isolation" >"$named_endpoints"
+chmod 0440 "$named_endpoints"
+DIENE_ISOLATION_FILE="$named_endpoints" \
+  expect_refusal ConnectedEgressInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
+ok 'a connected lane refuses bare hostnames the enforcement layer would reject'
+
+printf '== host-policy seam against the real runner client ==\n'
+
+# A stand-in proves only that the template agrees with itself. When the runner
+# client is actually present, the document this template emits is fed to it, so
+# a drift between the two arms fails here rather than on a disposable runner.
+real_client=${DIENE_RUNNER_HOST_POLICY_BIN:-/opt/diene/bin/diene-host-policy}
+emitted=$scratch/seam-policy.json
+(
+  export DIENE_ISOLATION_FILE=$fake_isolation
+  # shellcheck source=/dev/null
+  . ./scripts/ci/environment-lib.sh
+  DIENE_SCHEMA_DIR=$work/schemas/ci diene_write_allow_file "$emitted" closure-denied-network
+)
+jq -e '(keys | sort) == ["allow","apiVersion","denyDefaultRoute","denyDns","mode"] and
+       .apiVersion == "diene.atomi.cloud/ci-host-policy/v1" and
+       .mode == "closure-denied-network" and .denyDns == true and .denyDefaultRoute == true and
+       (.allow | length >= 1 and (unique | length) == length) and
+       (.allow | all(test("/[0-9]{1,3}$")))' "$emitted" >/dev/null ||
+  fail 'the emitted host policy document is not the shape the runner client accepts'
+ok 'the emitted document matches the runner-accepted shape exactly'
+
+if [[ -x $real_client ]]; then
+  DIENE_ISOLATION_FILE=$fake_isolation "$real_client" apply \
+    --receipt seam-check --allow-file "$emitted" >/dev/null 2>"$scratch/seam.err" ||
+    grep -Fq 'HostPolicyRefused: the generated allowlist is not a valid' "$scratch/seam.err" &&
+    fail 'the real runner client rejected the document this template emits'
+  ok 'the real runner client accepted the emitted document'
+else
+  printf '  .. real runner client absent; seam proven against the accepted shape only\n'
+fi
 
 printf '== mandatory lane proofs are not optional coverage ==\n'
 

@@ -9,8 +9,8 @@
   "properties": {
     "apiVersion": { "const": "diene.atomi.cloud/ci-host-policy/v1" },
     "mode": {
-      "description": "hermetic denies DNS and every route the isolation receipt does not name; connected additionally carries the exact seed and registry routes the connected Ditto lanes require.",
-      "enum": ["hermetic", "connected"]
+      "description": "The canonical wire enum the runner client and conductor validate. `closure-denied-network` admits only the runner-assigned lane CIDRs and no host:port at all, because a hermetic closure has no name resolution; `allowlist` additionally admits literal-IP host:port endpoints for the connected Ditto lanes.",
+      "enum": ["allowlist", "closure-denied-network"]
     },
     "allow": {
       "type": "array",
@@ -24,5 +24,16 @@
     },
     "denyDns": { "const": true },
     "denyDefaultRoute": { "const": true }
-  }
+  },
+  "allOf": [
+    {
+      "description": "A hermetic closure posture has no name resolution, so it admits no host:port entry at all.",
+      "if": { "properties": { "mode": { "const": "closure-denied-network" } }, "required": ["mode"] },
+      "then": {
+        "properties": {
+          "allow": { "items": { "pattern": "^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9a-fA-F:]+)/[0-9]{1,3}$" } }
+        }
+      }
+    }
+  ]
 }
