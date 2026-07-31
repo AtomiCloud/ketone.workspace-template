@@ -202,14 +202,18 @@ write_isolation() {
   local target=$1 mode=$2
   local endpoints='["10.203.0.9:5000"]'
   [[ $mode == allowlist ]] || endpoints='[]'
-  jq -n --arg mode "$mode" --argjson endpoints "$endpoints" \
+  jq -n --arg mode "$mode" --argjson endpoints "$endpoints" --arg staging "$evidence_staging" \
     '{apiVersion:"diene.atomi.cloud/ci-runner-isolation/v1",
       leaseId:"00000000-0000-4000-8000-000000000000",
       authorizedPolicyMode:$mode,
       laneCidrs:["127.0.0.0/8","::1/128","10.202.0.0/24","10.203.0.0/16","10.42.0.0/16","10.43.0.0/16"],
-      connectedEndpoints:$endpoints}' >"$target"
+      connectedEndpoints:$endpoints,
+      enforcement:{armedBeforeJob:true,establishedFlowExemption:false,inputPathCovered:true},
+      evidencePublication:{stagingDir:$staging,jobCallable:false,releasesAfterAbsenceProof:true}}' >"$target"
   chmod 0440 "$target"
 }
+evidence_staging=$scratch/evidence-publication
+mkdir -p "$evidence_staging"
 fake_isolation=$scratch/isolation.json
 write_isolation "$fake_isolation" allowlist
 fake_isolation_hermetic=$scratch/isolation-hermetic.json
@@ -945,6 +949,57 @@ chmod 0440 "$named_endpoints"
 DIENE_ISOLATION_FILE="$named_endpoints" \
   expect_refusal ConnectedEgressInterfaceUnavailable ./scripts/ci/environment-k3d-run.sh
 ok 'a connected lane refuses bare hostnames the enforcement layer would reject'
+
+printf '== enforcement lifecycle attestations ==\n'
+
+# These assert that the LANE REFUSES without each attestation. They are not a
+# substitute for proving the enforcement itself: the pre-opened-flow, host
+# INPUT and early-release escape probes are privileged and live in the runner
+# arm's escape suite. What this arm can guarantee is that it never runs as if
+# the property held when the runner has not attested it.
+attest_case() {
+  local label=$1 filter=$2 reason=$3
+  local receipt=$scratch/attest.json
+  jq "$filter" "$fake_isolation" >"$receipt"
+  chmod 0440 "$receipt"
+  : >"$DIENE_TEST_PLS_LOG"
+  DIENE_ISOLATION_FILE="$receipt" \
+    expect_refusal "$reason" ./scripts/ci/environment-k3d-run.sh
+  ! grep -Fq 'env up' "$DIENE_TEST_PLS_LOG" || fail "$label still mutated the substrate"
+  rm -f -- "$receipt"
+}
+
+# A flow opened during checkout or setup outlives a policy armed later, and a
+# blanket established/related accept admits it for the table's lifetime.
+attest_case 'enforcement armed after the job began' \
+  '.enforcement.armedBeforeJob = false' HostEnforcementIncomplete
+attest_case 'a blanket established-flow exemption' \
+  '.enforcement.establishedFlowExemption = true' HostEnforcementIncomplete
+# A forward-only chain never sees packets delivered locally to the host veth.
+attest_case 'a forward-only chain with no host input coverage' \
+  '.enforcement.inputPathCovered = false' HostEnforcementIncomplete
+ok 'the lane refuses unless the runner attests pre-arming, no blanket exemption, and input coverage'
+
+# Evidence cannot be uploaded from the job: the table still stands and denies
+# the connections an upload needs. Publication is a root-owned channel the job
+# can never call, and release follows a proven runtime absence.
+attest_case 'no root-owned publication channel' \
+  'del(.evidencePublication)' EvidencePublicationInterfaceUnavailable
+attest_case 'a job-callable publication channel' \
+  '.evidencePublication.jobCallable = true' EvidencePublicationInterfaceUnavailable
+attest_case 'release before runtime absence is proven' \
+  '.evidencePublication.releasesAfterAbsenceProof = false' EvidencePublicationInterfaceUnavailable
+ok 'the lane refuses a job-callable channel or a release that precedes absence proof'
+
+# The workflow must not try to upload evidence from inside the job.
+! grep -Fq 'uses: actions/upload-artifact' \
+  "$repo_root/.github/workflows/⚡reusable-environment-k3d.yaml" ||
+  fail 'a runtime lane still uploads evidence from inside the job'
+jq -e --arg dir "$evidence_staging" '.evidencePublication.stagingDir == $dir' \
+  "$fake_isolation" >/dev/null || fail 'the staging channel is not the attested one'
+[[ -s "$evidence_staging/$(basename "$DIENE_CORE_REPORT")" ]] ||
+  fail 'the scanned report was never staged for the root-owned channel'
+ok 'evidence is staged for the root-owned channel, never uploaded from the job'
 
 printf '== host-policy seam against the real runner client ==\n'
 

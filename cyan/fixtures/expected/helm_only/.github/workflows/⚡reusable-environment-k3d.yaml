@@ -148,13 +148,19 @@ jobs:
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --receipt-id "$(diene_receipt_id)"
+      # Evidence is NOT uploaded from the job. The enforcing table is still
+      # standing at this point — `release` is deferred by contract — and it
+      # denies exactly the connections actions/upload-artifact needs, so an
+      # in-job upload cannot succeed on a real runner. The lane stages the
+      # scanned report into the root-owned publication channel instead, and the
+      # runner lifecycle forwards it after runtime absence is proven.
       - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diene-environment-report-ditto-build-local-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/diene-environment-report.v1.json
-          if-no-files-found: error
-          retention-days: 7
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-build-local }
+        run: &lane-handoff |
+          # shellcheck source=/dev/null
+          . ./scripts/ci/environment-lib.sh
+          staging=$(diene_require_evidence_publication)
+          test -s "$staging/diene-environment-report.v1.json"
 
   environment-ditto-target-pull:
     name: environment-ditto-target-pull
@@ -197,12 +203,8 @@ jobs:
         env: { DIENE_EXPECTED_JOB_ID: environment-ditto-target-pull }
         run: *lane-sweep
       - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diene-environment-report-ditto-target-pull-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/diene-environment-report.v1.json
-          if-no-files-found: error
-          retention-days: 7
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-target-pull }
+        run: *lane-handoff
 
   environment-ditto-vendor:
     name: environment-ditto-vendor
@@ -257,12 +259,12 @@ jobs:
         env: { DIENE_EXPECTED_JOB_ID: environment-ditto-vendor }
         run: *lane-sweep
       - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diene-vendor-report-${{ inputs.action_id }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/diene-vendor-report.v1.json
-          if-no-files-found: error
-          retention-days: 7
+        env: { DIENE_EXPECTED_JOB_ID: environment-ditto-vendor }
+        run: |
+          # shellcheck source=/dev/null
+          . ./scripts/ci/environment-lib.sh
+          staging=$(diene_require_evidence_publication)
+          test -s "$staging/diene-vendor-report.v1.json"
 
   environment-absol:
     name: environment-absol
@@ -304,12 +306,8 @@ jobs:
         env: { DIENE_EXPECTED_JOB_ID: environment-absol }
         run: *lane-sweep
       - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diene-environment-report-absol-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/diene-environment-report.v1.json
-          if-no-files-found: error
-          retention-days: 7
+        env: { DIENE_EXPECTED_JOB_ID: environment-absol }
+        run: *lane-handoff
 
   environment-fleet-independence:
     name: environment-fleet-independence
@@ -356,9 +354,7 @@ jobs:
           DIENE_FIXTURE_ID: bootstrap-fleet-independence-v1
         run: *lane-sweep
       - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diene-environment-report-fleet-independence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/diene-environment-report.v1.json
-          if-no-files-found: error
-          retention-days: 7
+        env:
+          DIENE_EXPECTED_JOB_ID: environment-fleet-independence
+          DIENE_FIXTURE_ID: bootstrap-fleet-independence-v1
+        run: *lane-handoff
