@@ -211,9 +211,9 @@ write_isolation() {
       enforcement:{armedBeforeJob:true,establishedFlowExemption:false,inputPathCovered:true},
       evidencePublication:{ingressDir:$staging,ingressJobWritable:true,
                            sealedSpool:{path:($staging+".sealed"),jobWritable:false,survivesLeaseTeardown:true},
-                           channel:{name:"diene-evidence-courier",available:true,jobCallable:false},
-                           releasesAfterAbsenceProof:true,retainsUntilAcknowledged:true,
-                           shipmentReady:true}}' >"$target"
+                           channel:{name:null,available:false,jobCallable:false},
+                           releasesAfterAbsenceProof:true,
+                           retainsUntilAcknowledged:false,shipmentReady:false}}' >"$target"
   chmod 0440 "$target"
 }
 evidence_staging=$scratch/evidence-publication
@@ -1004,15 +1004,56 @@ attest_case 'a job-writable sealed spool' \
 attest_case 'the sealed spool aliased to the job-writable ingress' \
   '.evidencePublication.sealedSpool.path = .evidencePublication.ingressDir' \
   EvidencePublicationInterfaceUnavailable
-attest_case 'a spool that does not retain until acknowledgement' \
-  '.evidencePublication.retainsUntilAcknowledged = false' EvidencePublicationInterfaceUnavailable
-# A staging directory whose channel is unimplemented ships nothing, so the
-# staging fields alone must never satisfy this.
-attest_case 'staging present but shipment not ready' \
-  '.evidencePublication.shipmentReady = false' EvidencePublicationInterfaceUnavailable
-attest_case 'no concrete root-owned channel identity' \
-  '.evidencePublication.channel.available = false' EvidencePublicationInterfaceUnavailable
-ok 'the lane refuses a job-callable channel, an early release, a deletable spool, or an unimplemented one'
+ok 'the lane refuses a job-callable channel, an early release, or a deletable spool'
+
+# Shipment is deliberately NOT a gate. `retainsUntilAcknowledged` and
+# `shipmentReady` cannot be true until a courier endpoint exists — retention
+# "until acknowledged" is vacuous with no acknowledgement to wait for — so
+# gating on them would deadlock every real run against an honestly false flag.
+# The lane runs and records shipment as explicitly unavailable instead, which
+# is why the fixture receipt above carries today's real false values.
+jq -e '.evidencePublication.shipmentReady == false and
+       .evidencePublication.retainsUntilAcknowledged == false' "$fake_isolation" >/dev/null ||
+  fail 'the fixture receipt does not model the honest false shipment state'
+jq -e '.evidence.shipment.outcome == "Unavailable" and
+       .evidence.shipment.reasonCode == "CourierEndpointUnavailable"' "$pass_report" >/dev/null ||
+  fail 'a passing lane did not record shipment as unavailable'
+ok 'a lane runs and passes with shipment honestly unavailable, never claiming evidence shipped'
+
+# The runner arm's live receipt, verbatim. This is the cross-arm regression
+# guard: it is the provider's real emitted values, not a stand-in shaped to
+# agree with this consumer. Every field is false or null today, and the lane
+# must refuse on a LOCALLY PROVABLE gate — never on shipment, which cannot
+# honestly be true until a courier endpoint exists.
+live_receipt=$scratch/runner-live-receipt.json
+jq -n '{apiVersion:"diene.atomi.cloud/ci-runner-isolation/v1",
+        leaseId:"00000000-0000-4000-8000-000000000000",
+        authorizedPolicyMode:"closure-denied-network",
+        laneCidrs:["127.0.0.0/8","10.202.0.0/24"],connectedEndpoints:[],
+        enforcement:{armedBeforeJob:true,establishedFlowExemption:false,inputPathCovered:true},
+        evidencePublication:{ingressDir:"/run/diene-runner/abc/evidence",ingressJobWritable:true,
+          sealedSpool:{path:null,jobWritable:false,survivesLeaseTeardown:false},
+          channel:{name:null,available:false,jobCallable:false},
+          releasesAfterAbsenceProof:false,retainsUntilAcknowledged:false,shipmentReady:false,
+          note:"NOT READY. A consumer must refuse on this."}}' >"$live_receipt"
+chmod 0440 "$live_receipt"
+
+live_refusal=$scratch/live-refusal.txt
+(
+  export DIENE_ISOLATION_FILE=$live_receipt
+  # shellcheck source=/dev/null
+  . ./scripts/ci/environment-lib.sh
+  DIENE_SCHEMA_DIR=$work/schemas/ci diene_require_evidence_publication
+) >/dev/null 2>"$live_refusal" && fail 'the runner live receipt was read as publication readiness'
+grep -Fq 'EvidencePublicationInterfaceUnavailable' "$live_refusal" ||
+  fail 'the runner live receipt did not refuse with the stable reason'
+# The refusal must cite a locally provable property, not shipment: gating on
+# shipment would deadlock every real run against an honestly false flag.
+grep -Eq 'proven runtime absence|sealed spool' "$live_refusal" ||
+  fail 'the refusal does not cite a locally provable gate'
+! grep -Fq 'shipmentReady' "$live_refusal" ||
+  fail 'the lane refused on shipment readiness, which cannot be true until a courier exists'
+ok "the runner's live all-false receipt refuses on a locally provable gate, never on shipment"
 
 # The sealed handoff binds exact name, kind, size and content digest.
 shipment=$evidence_staging/$(basename "$DIENE_CORE_REPORT").candidate.json
