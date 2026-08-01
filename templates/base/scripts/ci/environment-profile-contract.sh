@@ -17,6 +17,15 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 source "$script_dir/environment-lib.sh"
 
+profile_renderer() {
+  local renderer=${DIENE_PROFILE_RENDER_BIN:-}
+  [[ -n $renderer ]] ||
+    diene_die ProfileRenderInterfaceUnavailable 'Garden ratifies no runtime-free executable render command'
+  command -v -- "$renderer" >/dev/null 2>&1 ||
+    diene_die ProfileRenderInterfaceUnavailable 'configured profile renderer is absent or not executable'
+  printf '%s\n' "$renderer"
+}
+
 if [[ ${1:-} == --validate-inputs ]]; then
   diene_validate_inputs
   exit 0
@@ -48,9 +57,7 @@ if [[ ${1:-} == --validate-prerequisites ]]; then
     journeys=${DIENE_JOURNEY_MANIFEST:-}
     [[ $journeys == .diene/ci/journeys.v1.yaml && -f $journeys ]] ||
       diene_die InputContractInvalid 'selected journey manifest is absent or non-canonical'
-    diene_schema_validate diene-journeys-v1.schema.json "$journeys" 'journey manifest'
-    jq -e '[.journeys[].id] | length == (unique | length)' "$journeys" >/dev/null ||
-      diene_die InputContractInvalid 'journey IDs must be globally unique'
+    diene_select_journeys "$journeys"
   fi
 
   fixture_root=${DIENE_PRE_SIT_FIXTURE_ROOT:-.diene/ci/fixtures}
@@ -155,9 +162,10 @@ if [[ ${1:-} == --render-profile ]]; then
     lapras | ditto | rotom | absol) ;;
     *) diene_die InputContractInvalid "unknown profile $profile" ;;
   esac
-  [[ -n ${DIENE_PROFILE_RENDER_BIN:-} ]] ||
-    diene_die ProfileRenderInterfaceUnavailable 'Garden ratifies no runtime-free executable render command'
-  exec "$DIENE_PROFILE_RENDER_BIN" --profile "$profile"
+  renderer=$(profile_renderer)
+  "$renderer" --profile "$profile" ||
+    diene_die ProfileRenderInterfaceUnavailable "$profile executable renderer failed"
+  exit 0
 fi
 
 diene_require_command jq
@@ -166,6 +174,15 @@ diene_require_command "${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}"
 lock=${DIENE_ENVIRONMENT_LOCK:-.diene/ci/environment-lock.v1.json}
 report=${DIENE_PROFILE_REPORT:-${RUNNER_TEMP:-/tmp}/diene-profile-contract.json}
 raw=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-profile-raw.XXXXXX")
+render_dir=
+cleanup_profile_temps() {
+  rm -f -- "$raw"
+  if [[ -n $render_dir ]]; then
+    chmod -R u+rwX "$render_dir" 2>/dev/null || true
+    rm -r -- "$render_dir"
+  fi
+}
+trap cleanup_profile_temps EXIT
 
 emit() {
   "$script_dir/environment-report.sh" --kind profile --input "$raw" --output "$report"
@@ -174,7 +191,7 @@ emit() {
 
 # A repository that declares no environment lock has not opted in. That is
 # explicit NotApplicable/NoDeclaration, never an implied pass.
-if [[ ! -f $lock ]]; then
+if [[ ! -e $lock && ! -L $lock ]]; then
   jq -n '{
     apiVersion: "diene.atomi.cloud/ci-profile-report/v1",
     outcome: "NotApplicable", reasonCode: "NoDeclaration",
@@ -192,9 +209,17 @@ if [[ ! -f $lock ]]; then
   exit 0
 fi
 
+[[ -f $lock && ! -L $lock ]] ||
+  diene_die InputContractInvalid 'environment lock must be a regular file'
+jq empty "$lock" >/dev/null 2>&1 ||
+  diene_die PreviewManifestSchemaMismatch 'environment lock is not valid JSON'
+
 lock_digest=$(diene_file_digest "$lock")
 
 # --- static corpus gates over the repository-owned lock ---------------------
+
+jq -e '[.profiles | keys[]] | all(. != "porygon")' "$lock" >/dev/null ||
+  diene_die PreviewManifestSchemaMismatch 'retired profile identity porygon found'
 
 jq -e '
   . as $root |
@@ -207,9 +232,6 @@ jq -e '
   (["lapras","ditto","rotom","absol"] | all(. as $p | $root.profiles[$p].substrate == "k3d")) and
   (["eevee","castform"] | all(. as $p | $root.profiles[$p].substrate == "entei-vcluster"))
 ' "$lock" >/dev/null || diene_die PreviewManifestSchemaMismatch 'substrate parity mismatch'
-
-jq -e '[.profiles | keys[]] | all(. != "porygon")' "$lock" >/dev/null ||
-  diene_die PreviewManifestSchemaMismatch 'retired profile identity found'
 
 jq -e '
   ([.. | objects | keys[]] | all(. != "ref" and . != "operatorId" and . != "versionPin" and . != "commitPin")) and
@@ -234,9 +256,12 @@ pls_bin=${DIENE_PLS_BIN:-pls}
 diene_require_command "$pls_bin"
 # Ditto permits only build-local|target-pull; Absol only closure-backed
 # build-local. Switching validates the pair and never mutates.
-"$pls_bin" env switch --profile ditto --build-mode build-local
-"$pls_bin" env switch --profile ditto --build-mode target-pull
-"$pls_bin" env switch --profile absol --build-mode build-local
+"$pls_bin" env switch --profile ditto --build-mode build-local ||
+  diene_die PreviewManifestSchemaMismatch 'Ditto build-local profile/mode pair was refused'
+"$pls_bin" env switch --profile ditto --build-mode target-pull ||
+  diene_die PreviewManifestSchemaMismatch 'Ditto target-pull profile/mode pair was refused'
+"$pls_bin" env switch --profile absol --build-mode build-local ||
+  diene_die PreviewManifestSchemaMismatch 'Absol build-local profile/mode pair was refused'
 if "$pls_bin" env switch --profile absol --build-mode target-pull 2>/dev/null; then
   diene_die PreviewManifestSchemaMismatch 'Absol accepted a non closure-backed build mode'
 fi
@@ -247,10 +272,11 @@ rendered='[]'
 render_outcome=Unavailable
 render_reason=ProfileRenderInterfaceUnavailable
 if [[ -n ${DIENE_PROFILE_RENDER_BIN:-} ]]; then
+  renderer=$(profile_renderer)
   render_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/diene-profile.XXXXXX")
-  trap 'rm -rf -- "$render_dir"' EXIT
   for profile in lapras ditto rotom absol; do
-    "$DIENE_PROFILE_RENDER_BIN" --profile "$profile" >"$render_dir/$profile.json"
+    "$renderer" --profile "$profile" >"$render_dir/$profile.json" ||
+      diene_die ProfileRenderInterfaceUnavailable "$profile executable renderer failed"
     jq -e --arg profile "$profile" '.profile == $profile and .substrate == "k3d"' "$render_dir/$profile.json" >/dev/null ||
       diene_die ProfileRenderMismatch "$profile did not render the local k3d contract"
   done

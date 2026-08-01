@@ -36,6 +36,18 @@ expect_refusal() {
   }
   ok "refuses $reason"
 }
+expect_refusal_message() {
+  local reason=${1:?reason required} message=${2:?message required}
+  shift 2
+  if "$@" >"$scratch/stdout" 2>"$scratch/stderr"; then
+    fail "expected $reason refusal but the command succeeded"
+  fi
+  grep -Fxq -- "$reason: $message" "$scratch/stderr" || {
+    sed -n '1,160p' "$scratch/stderr" >&2
+    fail "missing exact $reason evidence: $message"
+  }
+  ok "refuses $reason ($message)"
+}
 expect_precreate_refusal() {
   local reason=${1:?reason required}
   shift
@@ -52,7 +64,7 @@ expect_precreate_refusal() {
   ok "$reason refuses before nsc create"
 }
 
-for command in jq check-jsonschema sha256sum tar grep sed awk find timeout rg base64; do
+for command in jq yq check-jsonschema sha256sum tar grep sed awk find timeout rg base64 stat; do
   command -v "$command" >/dev/null 2>&1 || fail "$command is required for the contract suite"
 done
 
@@ -112,14 +124,56 @@ set -euo pipefail
 printf '%q ' "$@" >>"${FAKE_PROBE_LOG:-/dev/null}"
 printf '\n' >>"${FAKE_PROBE_LOG:-/dev/null}"
 scope=
+profile=
+cluster=
+receipt=
+transcript=
+image=
 while (($#)); do
   case $1 in
     --scope) scope=${2:?}; shift 2 ;;
-    --profile | --cluster-id | --image) shift 2 ;;
+    --profile) profile=${2:?}; shift 2 ;;
+    --cluster-id) cluster=${2:?}; shift 2 ;;
+    --receipt) receipt=${2:?}; shift 2 ;;
+    --transcript) transcript=${2:?}; shift 2 ;;
+    --image) image=${2:?}; shift 2 ;;
     *) exit 127 ;;
   esac
 done
-[[ -n $scope && $scope != "${FAKE_PROBE_FAIL_SCOPE:-}" ]]
+[[ -n $scope && -n $profile && -n $cluster && -n $receipt && -n $transcript ]] || exit 127
+[[ $scope == pod && -n $image || $scope != pod && -z $image ]] || exit 127
+[[ $scope != "${FAKE_PROBE_FAIL_SCOPE:-}" ]] || exit 65
+[[ $scope != "${FAKE_PROBE_NO_TRANSCRIPT:-}" ]] || exit 0
+case $scope in
+  preexisting-open) ids='["preexisting-flow-established"]' ;;
+  preexisting-transition) ids='["preexisting-flow-transition-denial"]' ;;
+  host) ids='["host-metadata-denial","host-arbitrary-https-denial"]' ;;
+  pod) ids='["pod-metadata-denial","pod-arbitrary-https-denial","pod-dns-denial"]' ;;
+  *) exit 127 ;;
+esac
+install -d -m 0700 "$(dirname -- "$transcript")"
+observed_cluster=$cluster
+observed_outcome=Pass
+observed_drop=
+observed_reason=AdapterObservedDenial
+observed_required=true
+[[ $scope != preexisting-open ]] || observed_reason=AdapterObservedFlowEstablished
+if [[ -z ${FAKE_PROBE_MUTATE_SCOPE:-} || $scope == "$FAKE_PROBE_MUTATE_SCOPE" ]]; then
+  observed_cluster=${FAKE_PROBE_CLUSTER:-$cluster}
+  observed_outcome=${FAKE_PROBE_OUTCOME:-Pass}
+  observed_drop=${FAKE_PROBE_DROP_ID:-}
+  observed_reason=${FAKE_PROBE_REASON:-$observed_reason}
+  observed_required=${FAKE_PROBE_REQUIRED:-true}
+fi
+jq -n --arg scope "$scope" --arg profile "$profile" \
+  --arg cluster "$observed_cluster" --arg receipt "$receipt" \
+  --arg outcome "$observed_outcome" --arg drop "$observed_drop" \
+  --arg reason "$observed_reason" --argjson required "$observed_required" --argjson ids "$ids" '
+  {apiVersion:"diene.atomi.cloud/ci-egress-probe/v1",scope:$scope,profileId:$profile,
+   clusterId:$cluster,receiptId:$receipt,
+   observations:[$ids[] | select(. != $drop) |
+     {id:.,outcome:$outcome,reasonCode:$reason,required:$required}]}
+' >"$transcript"
 SH
 cat >"$work/.diene/ci/vendor-broker" <<'SH'
 #!/usr/bin/env bash
@@ -259,9 +313,10 @@ write_subject() {
   chmod 0600 "$target"
 }
 
-# The fake guest does not bypass the outer contract. It produces the fixed
-# archive the real orchestrator downloads, and the real outer code validates,
-# augments, leakage-scans, schemas, destroys, proves absence, and seals it.
+# The synthetic fake guest proves only the outer Namespace lifecycle. It
+# produces the fixed archive the real orchestrator downloads, and the real
+# outer code validates, augments, leakage-scans, schemas, destroys, proves
+# absence, and seals it. It is deliberately not inner-driver evidence.
 fake_guest=$scratch/fake-guest
 cat >"$fake_guest" <<'GUEST'
 #!/usr/bin/env bash
@@ -447,8 +502,14 @@ fi
 
 if [[ $scenario == receipt-mismatch ]]; then
   jq '.owner.runId = "999999"' "$receipt" >"$evidence/ci-receipt.json"
-else
+elif [[ $scenario == receipt-unpatched ]]; then
   cp "$receipt" "$evidence/ci-receipt.json"
+else
+  jq '
+    .namespace.policy.applied = true |
+    .namespace.policy.hostileProbes = "Pass" |
+    .cleanup = {outcome:"Pass",reasonCode:"ExactReceiptDestroyed",debt:[]}
+  ' "$receipt" >"$evidence/ci-receipt.json"
 fi
 if [[ $scenario == proof-fifo ]]; then
   mkfifo "$evidence/hostile-fifo"
@@ -640,8 +701,12 @@ prepare_run() {
   unset DIENE_NAMESPACE_INGRESS DIENE_PUBLIC_ENDPOINT DIENE_NSC_CACHE_TAG DIENE_CACHE_DIR
   unset DIENE_SEED_IDENTITY DIENE_VENDOR_CREDENTIAL DIENE_NSC_MACHINE_TYPE GITHUB_WORKSPACE
   unset DIENE_PRE_SIT_NEGATIVE_CANARY DIENE_PRE_SIT_FIXTURE_ROOT
-  unset FAKE_L7_COMPLETE FAKE_PROBE_FAIL_SCOPE FAKE_L7_LOG FAKE_PROBE_LOG FAKE_BROKER_LOG
+  unset FAKE_L7_COMPLETE FAKE_PROBE_FAIL_SCOPE FAKE_PROBE_NO_TRANSCRIPT FAKE_PROBE_DROP_ID
+  unset FAKE_PROBE_OUTCOME FAKE_PROBE_CLUSTER FAKE_PROBE_REQUIRED FAKE_PROBE_REASON
+  unset FAKE_PROBE_MUTATE_SCOPE
+  unset FAKE_L7_LOG FAKE_PROBE_LOG FAKE_BROKER_LOG
   unset FAKE_TABLE_FAIL_REGEX FAKE_RESOLVER_IPV4 FAKE_BROKER_FAIL_COMMAND
+  unset FAKE_NODE_POD_CIDRS DIENE_IPV6_DISABLE_PATH DIENE_EVIDENCE_STAGING
   unset FAKE_HOSTILE_SOURCE_ARCHIVE
   unset DIENE_GREP_BIN
   if [[ $lane == ditto-target-pull ]]; then
@@ -686,6 +751,8 @@ assert_not_contains() {
 printf '== static workflow and compatibility ABI ==\n'
 
 workflow=$template_root/.github/workflows/⚡reusable-environment-k3d.yaml
+workflow_json=$scratch/reusable-environment-k3d.json
+yq -o=json '.' "$workflow" >"$workflow_json"
 for job in environment-ditto-build-local environment-ditto-target-pull environment-ditto-vendor \
   environment-absol environment-fleet-independence environment-runner-lifecycle; do
   grep -Eq "^  ${job}:" "$workflow" || fail "stable workflow job $job is absent"
@@ -708,14 +775,36 @@ jq -e '.properties.substrate.properties.kind.const == "k3d"' \
   fail 'the Garden-owned opaque runtime-consumption ABI changed'
 ok 'DO-only schemas are retired while the Garden k3d compatibility field remains opaque'
 
-grep -Fq 'runs-on: nscloud-ubuntu-26.04-amd64-16x32' "$workflow" ||
-  fail 'runtime jobs do not use the ratified Namespace 26.04 label'
-grep -Fq 'runs-on: ubuntu-24.04' "$workflow" ||
-  fail 'the documented GitHub-hosted 24.04 fallback is absent'
+jq -e '
+  .jobs as $jobs |
+  ["nscloud-ubuntu-26.04-amd64-16x32-with-cache",
+   "nscloud-cache-size-50gb",
+   "nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64"] as $cached |
+  (["environment-ditto-build-local","environment-ditto-target-pull","environment-ditto-vendor"] |
+    all(. as $id |
+      $jobs[$id]["runs-on"] == $cached and
+      $jobs[$id].env.DIENE_ORCHESTRATOR_VENUE == "namespace" and
+      $jobs[$id].env.DIENE_ORCHESTRATOR_LABEL == $cached[0])) and
+  (["environment-absol","environment-fleet-independence"] |
+    all(. as $id |
+      $jobs[$id]["runs-on"] == "nscloud-ubuntu-26.04-amd64-16x32" and
+      $jobs[$id].env.DIENE_ORCHESTRATOR_VENUE == "namespace" and
+      $jobs[$id].env.DIENE_ORCHESTRATOR_LABEL == $jobs[$id]["runs-on"])) and
+  (["contract","environment-runner-lifecycle"] |
+    all(. as $id |
+      $jobs[$id]["runs-on"] == "ubuntu-26.04" and
+      $jobs[$id].env.DIENE_ORCHESTRATOR_VENUE == "github-hosted" and
+      $jobs[$id].env.DIENE_ORCHESTRATOR_LABEL == $jobs[$id]["runs-on"]))
+' "$workflow_json" >/dev/null ||
+  fail 'resolved runtime/hosted workflow jobs violate the exact 26.04 cache and venue-label law'
+if rg -n 'ubuntu-24\.04' "$template_root/.github/workflows" >"$scratch/hosted-24"; then
+  sed -n '1,120p' "$scratch/hosted-24" >&2
+  fail 'a workflow still names the retired GitHub-hosted Ubuntu 24.04 venue'
+fi
 grep -Fq 'platform per-instance policy pending (support ask #4)' \
   "$template_root/scripts/ci/environment-k3d-run.sh" ||
   fail 'the interim platform-policy status is not stamped into workflow evidence'
-ok 'runner labels and the interim support-ask stamp are explicit'
+ok 'each cached, cacheless, and hosted job resolves to its exact 26.04 venue and label'
 
 if rg -n 'runs-on:.*self-hosted|digitalocean|doctl|k3d (cluster|create|delete)|k3s ctr images export|nsc ingress|actions/cache' \
   --glob '!test-environment-contract.sh' "$template_root/.github/workflows" \
@@ -750,6 +839,548 @@ for output in subject_digest receipt_id core_report_digest vendor_report_digest;
   grep -Eq "^      ${output}:" "$workflow" || fail "workflow_call output $output is absent"
 done
 ok 'workflow_call retains the complete ratified v1 input/output vocabulary'
+
+core_caller=$template_root/.github/workflows/environment-k3d.yaml
+vendor_caller=$template_root/.github/workflows/environment-vendor.yaml
+core_caller_json=$scratch/environment-k3d.json
+vendor_caller_json=$scratch/environment-vendor.json
+yq -o=json '.' "$core_caller" >"$core_caller_json"
+yq -o=json '.' "$vendor_caller" >"$vendor_caller_json"
+
+# The GitHub expression is intentionally matched literally.
+# shellcheck disable=SC2016
+artifact_handoff='diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}'
+
+jq -e --arg subject "$artifact_handoff" '
+  .jobs as $jobs |
+  {"environment-ditto-build-local":{"contents":"read","id-token":"write"},
+   "environment-ditto-target-pull":{"contents":"read","packages":"read","id-token":"write"},
+   "environment-absol":{"contents":"read","id-token":"write"},
+   "environment-fleet-independence":{"contents":"read"}} as $runtimePermissions |
+  (.on | keys | sort) == ["push","schedule","workflow_dispatch"] and
+  .on.schedule == [{"cron":"17 3 * * 1"}] and
+  (.on.workflow_dispatch.inputs | keys | sort) == ["release_candidate","source_sha"] and
+  .permissions == {} and
+  (["authorize-runtime","artifact-build","environment-profile-contract"] |
+    all(. as $id | $jobs[$id]["runs-on"] == "ubuntu-26.04")) and
+  ([ $jobs[] | select(.["runs-on"] == "ubuntu-26.04") ] | length) == 3 and
+  $jobs["authorize-runtime"].permissions == {"contents":"read"} and
+  $jobs["artifact-build"].needs == "authorize-runtime" and
+  $jobs["artifact-build"].permissions ==
+    {"contents":"read","packages":"write","id-token":"write"} and
+  $jobs["environment-profile-contract"].needs == ["authorize-runtime","artifact-build"] and
+  $jobs["environment-profile-contract"].permissions == {"contents":"read"} and
+  (["environment-ditto-build-local","environment-ditto-target-pull","environment-absol",
+    "environment-fleet-independence"] |
+    all(. as $id |
+      $jobs[$id].needs == ["authorize-runtime","artifact-build","environment-profile-contract"] and
+      $jobs[$id].permissions == $runtimePermissions[$id] and
+      $jobs[$id].uses == "./.github/workflows/⚡reusable-environment-k3d.yaml" and
+      $jobs[$id].with.journey_manifest == ".diene/ci/journeys.v1.yaml" and
+      ($jobs[$id].with | has("vendor_manifest") | not) and
+      ($jobs[$id].with | has("action_id") | not))) and
+  ($jobs["environment-ditto-target-pull"].with.artifact_provenance_ref |
+    contains("needs.artifact-build.outputs.artifact_provenance_ref")) and
+  ($jobs["environment-ditto-target-pull"].with.artifact_attestation_digest |
+    contains("needs.artifact-build.outputs.artifact_attestation_digest")) and
+  (["closure_digest","closure_bundle_ref","closure_signature_bundle_digest",
+    "closure_trust_root_digest"] |
+    all(. as $field |
+      ($jobs["environment-absol"].with[$field] |
+        contains("needs.artifact-build.outputs." + $field)))) and
+  ($jobs["environment-fleet-independence"].if | contains("schedule")) and
+  (["environment-ditto-build-local","environment-ditto-target-pull","environment-absol"] |
+    all(. as $id | ($jobs[$id].if | contains("schedule") | not))) and
+  ($jobs["environment-absol"].if | contains("inputs.release_candidate == true")) and
+  (["environment-ditto-build-local","environment-ditto-target-pull","environment-fleet-independence"] |
+    all(. as $id | ($jobs[$id].if | contains("inputs.release_candidate == true") | not))) and
+  (([ $jobs["authorize-runtime"].steps[] | .run? // empty ] | join("\n")) as $guard |
+    (["=~ ^[0-9a-f]{40}$","git rev-parse --verify","git merge-base --is-ancestor",
+      "GITHUB_REPOSITORY_OWNER\" = AtomiCloud","dependabot[bot]",
+      "permission\" == write || \"$permission\" == admin",
+      "test \"$WORKFLOW_SHA\" = \"$REQUESTED_SHA\""] |
+      all(. as $needle | $guard | contains($needle)))) and
+  ([ $jobs["artifact-build"].steps[] | select(
+    .uses == "actions/upload-artifact@v4" and
+    .with.name == $subject and .with.path == "${{ runner.temp }}/artifact.v1.json" and
+    .with["if-no-files-found"] == "error" and .with["retention-days"] == 1) ] |
+    length) == 1 and
+  ($jobs["environment-profile-contract"] as $profile |
+    ([ $profile.steps[] | select(
+      .uses == "actions/download-artifact@v4" and
+      .with.name == $subject and .with.path == "${{ runner.temp }}/subject") ] | length) == 1 and
+    ([ $profile.steps[] | select(
+      .name == "Validate runtime-free profile, corpus, and parity" and
+      (.run | contains("./scripts/ci/environment-profile-contract.sh")) and
+      (.run | contains("--validate") | not)) ] | length) == 1 and
+    ([ $profile.steps[] | select(
+      .uses == "actions/upload-artifact@v4" and .if == "always()" and
+      .with.name == ($subject | sub("^diene-artifact-subject";"diene-profile-contract-runtime")) and
+      .with.path == "${{ runner.temp }}/diene-profile-contract.json" and
+      .with["if-no-files-found"] == "error" and .with["retention-days"] == 7) ] | length) == 1)
+' "$core_caller_json" >/dev/null ||
+  fail 'the core caller lost exact triggers, permissions, selectors, subject handoff, or profile wiring'
+
+jq -e --arg subject "$artifact_handoff" '
+  .jobs as $jobs |
+  (.on | keys) == ["workflow_dispatch"] and
+  (.on.workflow_dispatch.inputs | keys | sort) == ["action_id","source_sha"] and
+  .permissions == {} and
+  (["authorize-vendor","artifact-build","environment-profile-contract"] |
+    all(. as $id | $jobs[$id]["runs-on"] == "ubuntu-26.04")) and
+  ([ $jobs[] | select(.["runs-on"] == "ubuntu-26.04") ] | length) == 3 and
+  $jobs["authorize-vendor"].permissions == {"contents":"read"} and
+  $jobs["artifact-build"].needs == "authorize-vendor" and
+  $jobs["artifact-build"].permissions ==
+    {"contents":"read","packages":"write","id-token":"write"} and
+  $jobs["environment-profile-contract"].needs == ["authorize-vendor","artifact-build"] and
+  $jobs["environment-profile-contract"].permissions == {"contents":"read"} and
+  ($jobs["environment-ditto-vendor"].needs ==
+    ["authorize-vendor","artifact-build","environment-profile-contract"]) and
+  ($jobs["environment-ditto-vendor"].permissions == {"contents":"read","id-token":"write"}) and
+  ($jobs["environment-ditto-vendor"].uses == "./.github/workflows/⚡reusable-environment-k3d.yaml") and
+  ($jobs["environment-ditto-vendor"].with.vendor_manifest == ".diene/ci/vendors.v1.yaml") and
+  ($jobs["environment-ditto-vendor"].with.action_id == "${{ inputs.action_id }}") and
+  (($jobs["environment-ditto-vendor"].with | has("journey_manifest")) | not) and
+  ($jobs["environment-ditto-vendor"].secrets == "inherit") and
+  (([ $jobs["authorize-vendor"].steps[] | .run? // empty ] | join("\n")) as $guard |
+    (["=~ ^[0-9a-f]{40}$","git rev-parse --verify","git merge-base --is-ancestor",
+      "GITHUB_REPOSITORY_OWNER\" = AtomiCloud","permission\" == write || \"$permission\" == admin",
+      "test \"$WORKFLOW_SHA\" = \"$SOURCE_SHA\""] |
+      all(. as $needle | $guard | contains($needle)))) and
+  ([ $jobs["artifact-build"].steps[] | select(
+    .uses == "actions/upload-artifact@v4" and
+    .with.name == $subject and .with.path == "${{ runner.temp }}/artifact.v1.json" and
+    .with["if-no-files-found"] == "error" and .with["retention-days"] == 1) ] |
+    length) == 1 and
+  ($jobs["environment-profile-contract"] as $profile |
+    ([ $profile.steps[] | select(
+      .uses == "actions/download-artifact@v4" and
+      .with.name == $subject and .with.path == "${{ runner.temp }}/subject") ] | length) == 1 and
+    ([ $profile.steps[] | select(
+      .name == "Validate runtime-free profile, corpus, and parity" and
+      (.run | contains("./scripts/ci/environment-profile-contract.sh")) and
+      (.run | contains("--validate") | not)) ] | length) == 1 and
+    ([ $profile.steps[] | select(
+      .uses == "actions/upload-artifact@v4" and .if == "always()" and
+      .with.name == ($subject | sub("^diene-artifact-subject";"diene-profile-contract-vendor")) and
+      .with.path == "${{ runner.temp }}/diene-profile-contract.json" and
+      .with["if-no-files-found"] == "error" and .with["retention-days"] == 7) ] | length) == 1)
+' "$vendor_caller_json" >/dev/null ||
+  fail 'the vendor caller lost exact dispatch, permissions, selectors, subject handoff, or profile wiring'
+
+jq -es '
+  ([.[0].jobs | to_entries[] | .value.with.lane? // empty] +
+   [.[1].jobs | to_entries[] | .value.with.lane? // empty] | sort) ==
+  ["absol","ditto-build-local","ditto-target-pull","ditto-vendor","fleet-independence"]
+' "$core_caller_json" "$vendor_caller_json" >/dev/null ||
+  fail 'the callers do not dispatch the exact five-lane set once each'
+
+jq -e --arg subject "$artifact_handoff" '
+  .jobs as $jobs |
+  ["environment-ditto-build-local","environment-ditto-target-pull","environment-ditto-vendor",
+   "environment-absol","environment-fleet-independence"] as $runtimeIds |
+  {"environment-ditto-build-local":{"contents":"read","id-token":"write"},
+   "environment-ditto-target-pull":{"contents":"read","packages":"read","id-token":"write"},
+   "environment-ditto-vendor":{"contents":"read","id-token":"write"},
+   "environment-absol":{"contents":"read","id-token":"write"},
+   "environment-fleet-independence":{"contents":"read"}} as $runtimePermissions |
+  ($subject | sub("^diene-artifact-subject-";"diene-namespace-proof-${{ inputs.lane }}-")) as $proof |
+  .permissions == {} and
+  $jobs.contract.permissions == {"contents":"read"} and
+  ([ $jobs.contract.steps[] | select(
+    .uses == "actions/download-artifact@v4" and
+    .with.name == $subject and .with.path == "${{ runner.temp }}/subject") ] | length) == 1 and
+  ($runtimeIds | all(. as $id |
+    $jobs[$id].needs == "contract" and
+    $jobs[$id].permissions == $runtimePermissions[$id] and
+    ([ $jobs[$id].steps[] | select(
+      .uses == "actions/download-artifact@v4" and
+      .with.name == $subject and .with.path == "${{ runner.temp }}/subject") ] | length) == 1 and
+    ([ $jobs[$id].steps[] | select(
+      .id == "run" and .["continue-on-error"] == true and
+      (.run | contains("./scripts/ci/environment-k3d-run.sh orchestrate"))) ] | length) == 1 and
+    ([ $jobs[$id].steps[] | select(
+      .id == "lifecycle" and .if == "always()" and
+      (.run | contains("./scripts/ci/environment-k3d-run.sh cleanup"))) ] | length) == 1 and
+    ([ $jobs[$id].steps[] | select(
+      .uses == "actions/upload-artifact@v4" and .if == "always()" and
+      .with.name == $proof and .with.path == "${{ runner.temp }}/diene-proof-bundle.tar" and
+      .with["if-no-files-found"] == "error" and .with["retention-days"] == 7) ] | length) == 1 and
+    ([ $jobs[$id].steps[] | select(
+      .if == "always() && (steps.run.outcome != '\''success'\'' || steps.lifecycle.outcome != '\''success'\'')" and
+      (.run | contains("exit 1"))) ] | length) == 1)) and
+  ($jobs["environment-runner-lifecycle"] as $lifecycle |
+    $lifecycle.if == "always()" and $lifecycle.permissions == {"contents":"read"} and
+    $lifecycle.needs == ["contract","environment-ditto-build-local","environment-ditto-target-pull",
+      "environment-ditto-vendor","environment-absol","environment-fleet-independence"] and
+    ([ $lifecycle.steps[] | select(
+      .uses == "actions/download-artifact@v4" and
+      .with.name == $subject and .with.path == "${{ runner.temp }}/subject") ] | length) == 1 and
+    ([ $lifecycle.steps[] | select(
+      .uses == "actions/download-artifact@v4" and
+      .with.name == $proof and .with.path == "${{ runner.temp }}/namespace-proof") ] | length) == 1 and
+    ([ $lifecycle.steps[] | select(
+      . as $step |
+      $step.name == "Verify the exact terminal lifecycle evidence" and
+      (["needs.environment-ditto-build-local.result","needs.environment-ditto-target-pull.result",
+        "needs.environment-ditto-vendor.result","needs.environment-absol.result",
+        "needs.environment-fleet-independence.result"] |
+        all(. as $needle | $step.env.SELECTED_RUNTIME_RESULT | contains($needle))) and
+      ($step.run | contains("test \"$SELECTED_RUNTIME_RESULT\" = success")) and
+      ($step.run | contains("./scripts/ci/environment-k3d-run.sh lifecycle")) and
+      ($step.run | contains("$RUNNER_TEMP/namespace-proof/diene-proof-bundle.tar"))) ] | length) == 1)
+' "$workflow_json" >/dev/null ||
+  fail 'the reusable subject, runtime proof, permissions, or lifecycle wiring changed'
+ok 'caller triggers, blocking needs, permissions, selectors, handoff, trust, and lifecycle wiring are structural'
+
+printf '== executable profile, corpus, and parity contract ==\n'
+
+profile_pls=$scratch/profile-pls
+profile_pls_log=$scratch/profile-pls.log
+profile_pls_accepted_log=$scratch/profile-pls-accepted.log
+cat >"$profile_pls" <<'PLS'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_PLS_LOG:?}"
+[[ $* != "${FAKE_PLS_FAIL_PAIR:-}" ]] || exit 7
+case "$*" in
+  'env switch --profile ditto --build-mode build-local' | 'env switch --profile ditto --build-mode target-pull' | 'env switch --profile absol --build-mode build-local')
+    printf '%s\n' "$*" >>"${FAKE_PLS_ACCEPTED_LOG:?}"
+    ;;
+  'env switch --profile absol --build-mode target-pull')
+    [[ ${FAKE_PLS_ACCEPT_ALL:-0} == 1 ]] || exit 64
+    printf '%s\n' "$*" >>"${FAKE_PLS_ACCEPTED_LOG:?}"
+    ;;
+  *) exit 127 ;;
+esac
+PLS
+chmod 0755 "$profile_pls"
+
+profile_renderer=$scratch/profile-renderer
+profile_renderer_log=$scratch/profile-renderer.log
+cat >"$profile_renderer" <<'RENDER'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${1:-} == --profile && $# -eq 2 ]] || exit 127
+profile=${2:?}
+printf '%s\n' "$profile" >>"${FAKE_RENDER_LOG:?}"
+[[ $profile != "${FAKE_RENDER_FAIL_PROFILE:-}" ]] || exit 65
+jq -n --arg profile "$profile" --arg substrate "${FAKE_RENDER_SUBSTRATE:-k3d}" \
+  '{profile:$profile,substrate:$substrate}'
+RENDER
+chmod 0755 "$profile_renderer"
+
+run_profile_contract() (
+  local selected_lock=${1:?lock required} selected_report=${2:?report required}
+  local renderer=${3-} accept_all=${4:-0} selected_pls=${5:-$profile_pls}
+  cd -- "$work"
+  install -d -m 0700 "$scratch/profile-temp"
+  export RUNNER_TEMP="$scratch/profile-temp"
+  export DIENE_ENVIRONMENT_LOCK="$selected_lock" DIENE_PROFILE_REPORT="$selected_report"
+  export DIENE_PLS_BIN="$selected_pls" DIENE_SCHEMA_DIR="$work/schemas/ci"
+  export FAKE_PLS_LOG="$profile_pls_log" FAKE_PLS_ACCEPTED_LOG="$profile_pls_accepted_log"
+  export FAKE_PLS_ACCEPT_ALL="$accept_all" FAKE_RENDER_LOG="$profile_renderer_log"
+  export GITHUB_SHA=$SOURCE_SHA GITHUB_OUTPUT="$scratch/profile-github-output"
+  if [[ -n $renderer ]]; then
+    export DIENE_PROFILE_RENDER_BIN="$renderer"
+  else
+    unset DIENE_PROFILE_RENDER_BIN
+  fi
+  ./scripts/ci/environment-profile-contract.sh
+)
+
+render_profile_case() (
+  local profile=${1-} renderer=${2-}
+  cd -- "$work"
+  install -d -m 0700 "$scratch/profile-temp"
+  export RUNNER_TEMP="$scratch/profile-temp"
+  export DIENE_SCHEMA_DIR="$work/schemas/ci" FAKE_RENDER_LOG="$profile_renderer_log"
+  if [[ -n $renderer ]]; then
+    export DIENE_PROFILE_RENDER_BIN="$renderer"
+  else
+    unset DIENE_PROFILE_RENDER_BIN
+  fi
+  ./scripts/ci/environment-profile-contract.sh --render-profile "$profile"
+)
+
+profile_validator=${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}
+profile_output=$scratch/profile-github-output
+profile_no_lock=$scratch/profile-no-lock.json
+: >"$profile_output"
+: >"$profile_pls_log"
+: >"$profile_pls_accepted_log"
+run_profile_contract "$scratch/absent-environment-lock.json" "$profile_no_lock"
+"$profile_validator" --base-uri "file://$work/schemas/ci/" \
+  --schemafile "$work/schemas/ci/diene-profile-report-v1.schema.json" "$profile_no_lock" >/dev/null ||
+  fail 'the explicit no-lock profile report is not schema-valid'
+jq -e '
+  .outcome == "NotApplicable" and .reasonCode == "NoDeclaration" and
+  .renderedProfiles == [] and .validatedProfiles == [] and
+  ([.staticContract[] | .outcome] | length == 6 and all(. == "NotApplicable"))
+' "$profile_no_lock" >/dev/null || fail 'an absent environment lock implied profile coverage'
+grep -Fxq "profile_report=$profile_no_lock" "$profile_output" ||
+  fail 'the no-lock profile report path was not published through GITHUB_OUTPUT'
+[[ ! -s $profile_pls_log ]] || fail 'an absent environment lock invoked pls'
+ok 'an absent environment lock is explicit schema-valid NotApplicable/NoDeclaration'
+
+profile_lock_directory=$scratch/profile-lock-directory
+install -d -m 0700 "$profile_lock_directory"
+: >"$profile_pls_log"
+expect_refusal_message InputContractInvalid 'environment lock must be a regular file' \
+  run_profile_contract "$profile_lock_directory" "$scratch/profile-lock-directory-report.json"
+[[ ! -e $scratch/profile-lock-directory-report.json ]] ||
+  fail 'a directory environment lock published a profile report'
+profile_invalid_lock=$scratch/profile-invalid-lock.json
+printf '{invalid json\n' >"$profile_invalid_lock"
+expect_refusal_message PreviewManifestSchemaMismatch 'environment lock is not valid JSON' \
+  run_profile_contract "$profile_invalid_lock" "$scratch/profile-invalid-lock-report.json"
+[[ ! -e $scratch/profile-invalid-lock-report.json ]] ||
+  fail 'an invalid-JSON environment lock published a profile report'
+[[ ! -s $profile_pls_log ]] || fail 'an invalid environment lock reached pls env switch'
+ok 'directory and invalid-JSON lock paths refuse cleanly before pls or report emission'
+
+profile_deferred=$scratch/profile-deferred.json
+: >"$profile_output"
+: >"$profile_pls_log"
+: >"$profile_pls_accepted_log"
+expect_refusal_message ProfileRenderInterfaceUnavailable \
+  'no ratified runtime-free executable render; set DIENE_PROFILE_RENDER_BIN once Garden publishes one' \
+  run_profile_contract \
+  "$work/.diene/ci/environment-lock.v1.json" "$profile_deferred"
+"$profile_validator" --base-uri "file://$work/schemas/ci/" \
+  --schemafile "$work/schemas/ci/diene-profile-report-v1.schema.json" "$profile_deferred" >/dev/null ||
+  fail 'the deliberately unavailable renderer report is not schema-valid'
+jq -e '
+  .outcome == "Fail" and .reasonCode == "ProfileRenderInterfaceUnavailable" and
+  ([.staticContract[] | .outcome] | length == 6 and all(. == "Pass")) and
+  .staticContract.profileSet.reasonCode == "ExactSixNameSet" and
+  .staticContract.substrateParity.reasonCode == "LocalK3dHostedVcluster" and
+  .staticContract.retiredNames.reasonCode == "NoRetiredIdentity" and
+  .staticContract.consumerPinAliases.reasonCode == "NoAliasFound" and
+  .staticContract.oneWriter.reasonCode == "SingleWriterPerObject" and
+  .staticContract.buildModeMatrix.reasonCode == "ProfileModePairsValidated" and
+  .castformExecutable == {outcome:"Unavailable",reasonCode:"PreviewIdentityUnavailable"} and
+  .eeveeExecutable == {outcome:"Unavailable",reasonCode:"PreviewIdentityUnavailable"} and
+  .localExecutableRender == {outcome:"Unavailable",reasonCode:"ProfileRenderInterfaceUnavailable"}
+' "$profile_deferred" >/dev/null || fail 'the deferred profile rows lost their stable unavailable reasons'
+expected_profile_switches=$'env switch --profile ditto --build-mode build-local\nenv switch --profile ditto --build-mode target-pull\nenv switch --profile absol --build-mode build-local'
+[[ $(<"$profile_pls_accepted_log") == "$expected_profile_switches" ]] ||
+  fail 'the profile gate accepted a pls env switch outside the exact three-pair set'
+if ! { [[ $(wc -l <"$profile_pls_log") == 4 ]] &&
+  tail -n 1 "$profile_pls_log" | grep -Fxq \
+    'env switch --profile absol --build-mode target-pull'; }; then
+  fail 'the profile gate did not explicitly test and reject Absol target-pull'
+fi
+if grep -Eqv '^env switch --profile (ditto|absol) --build-mode (build-local|target-pull)$' \
+  "$profile_pls_log"; then
+  fail 'the profile gate invoked a pls verb outside env switch'
+fi
+ok 'the exact three allowed pls env switches pass and Absol target-pull is actively refused'
+
+profile_mutation=$scratch/profile-lock-mutation.json
+: >"$profile_pls_log"
+: >"$profile_pls_accepted_log"
+jq 'del(.profiles.rotom)' "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch 'profile set is not the exact six-name set' \
+  run_profile_contract \
+  "$profile_mutation" "$scratch/profile-five-names.json"
+jq '.profiles.porygon = .profiles.rotom | del(.profiles.rotom)' \
+  "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch 'retired profile identity porygon found' \
+  run_profile_contract \
+  "$profile_mutation" "$scratch/profile-porygon.json"
+jq '.profiles.rotom.substrate = "entei-vcluster"' \
+  "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch 'substrate parity mismatch' \
+  run_profile_contract "$profile_mutation" "$scratch/profile-parity.json"
+jq '.profiles.ditto.ref = "refs/heads/main"' "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch 'consumer pin alias or operator shape found' \
+  run_profile_contract \
+  "$profile_mutation" "$scratch/profile-alias.json"
+jq '.garden = {kind:"garden",version:"1.0.0"}' \
+  "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch 'consumer pin alias or operator shape found' \
+  run_profile_contract "$profile_mutation" "$scratch/profile-operator-shape.json"
+jq '.operator.commitPin = "0000000000000000000000000000000000000000"' \
+  "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch 'consumer pin alias or operator shape found' \
+  run_profile_contract "$profile_mutation" "$scratch/profile-commit-pin.json"
+jq '.previewManifest.schemaVersion = "preview-manifest/v2"' \
+  "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch \
+  'imported preview-manifest lock entry is absent or aliased' run_profile_contract \
+  "$profile_mutation" "$scratch/profile-manifest-version.json"
+jq '.previewManifest.schemaDigest = "sha256:not-a-digest"' \
+  "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch \
+  'imported preview-manifest lock entry is absent or aliased' run_profile_contract \
+  "$profile_mutation" "$scratch/profile-manifest-digest.json"
+jq '.writers = [
+  {soleWriter:{objects:["apps/demo"],secrets:[]}},
+  {soleWriter:{objects:["apps/demo"],secrets:[]}}
+]' "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch 'one-writer ownership is violated' \
+  run_profile_contract \
+  "$profile_mutation" "$scratch/profile-duplicate-writer.json"
+jq '.writers = [{soleWriter:{objects:["apps/demo"],secrets:["apps/demo"]}}]' \
+  "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+expect_refusal_message PreviewManifestSchemaMismatch 'one-writer ownership is violated' \
+  run_profile_contract "$profile_mutation" "$scratch/profile-writer-overlap.json"
+[[ ! -s $profile_pls_log ]] || fail 'a static corpus refusal reached pls env switch'
+ok 'every distinct static corpus gate refuses with its exact message before pls'
+
+jq '.writers = [
+  {soleWriter:{objects:["apps/demo"],secrets:["secret/demo"]}},
+  {soleWriter:{objects:["apps/other"],secrets:["secret/other"]}}
+]' "$work/.diene/ci/environment-lock.v1.json" >"$profile_mutation"
+: >"$profile_pls_log"
+: >"$profile_pls_accepted_log"
+expect_refusal_message ProfileRenderInterfaceUnavailable \
+  'no ratified runtime-free executable render; set DIENE_PROFILE_RENDER_BIN once Garden publishes one' \
+  run_profile_contract "$profile_mutation" "$scratch/profile-distinct-writers.json"
+[[ -e $scratch/profile-distinct-writers.json ]] ||
+  fail 'distinct sole writers did not pass the one-writer gate and reach report emission'
+ok 'distinct sole writers pass the static gate and reach the deferred renderer report'
+
+: >"$profile_pls_log"
+: >"$profile_pls_accepted_log"
+expect_refusal_message PreviewManifestSchemaMismatch \
+  'Absol accepted a non closure-backed build mode' run_profile_contract \
+  "$work/.diene/ci/environment-lock.v1.json" "$scratch/profile-bad-mode.json" '' 1
+[[ ! -e $scratch/profile-bad-mode.json ]] ||
+  fail 'a refused bad-mode corpus published a report'
+
+profile_missing_pls=$scratch/profile-missing-pls
+expect_refusal_message DependencyUnavailable "$profile_missing_pls is required" \
+  run_profile_contract "$work/.diene/ci/environment-lock.v1.json" \
+  "$scratch/profile-missing-pls-report.json" '' 0 "$profile_missing_pls"
+[[ ! -e $scratch/profile-missing-pls-report.json ]] ||
+  fail 'a missing pls binary published a profile report'
+
+: >"$profile_pls_log"
+export FAKE_PLS_FAIL_PAIR='env switch --profile ditto --build-mode target-pull'
+expect_refusal_message PreviewManifestSchemaMismatch \
+  'Ditto target-pull profile/mode pair was refused' run_profile_contract \
+  "$work/.diene/ci/environment-lock.v1.json" "$scratch/profile-pls-rejected.json"
+unset FAKE_PLS_FAIL_PAIR
+[[ ! -e $scratch/profile-pls-rejected.json ]] ||
+  fail 'a refused ratified pls pair published a profile report'
+ok 'permissive bad mode, missing pls, and a refused ratified pair all fail with stable evidence and no report'
+
+for hosted_profile in castform eevee; do
+  expect_refusal_message PreviewIdentityUnavailable \
+    "$hosted_profile executable rendering is outside this node" \
+    render_profile_case "$hosted_profile"
+  expect_refusal_message PreviewIdentityUnavailable \
+    "$hosted_profile executable rendering is outside this node" \
+    render_profile_case "$hosted_profile" "$profile_renderer"
+done
+[[ ! -s $profile_renderer_log ]] || fail 'a hosted preview identity reached the executable renderer'
+for local_profile in lapras ditto rotom absol; do
+  expect_refusal_message ProfileRenderInterfaceUnavailable \
+    'Garden ratifies no runtime-free executable render command' \
+    render_profile_case "$local_profile"
+done
+expect_refusal_message InputContractInvalid 'unknown profile porygon' \
+  render_profile_case porygon
+expect_refusal_message InputContractInvalid 'unknown profile ' render_profile_case ''
+
+: >"$profile_renderer_log"
+for local_profile in lapras ditto rotom absol; do
+  render_profile_out=$scratch/profile-render-$local_profile.json
+  render_profile_case "$local_profile" "$profile_renderer" >"$render_profile_out"
+  jq -e --arg profile "$local_profile" \
+    '.profile == $profile and .substrate == "k3d"' "$render_profile_out" >/dev/null ||
+    fail "--render-profile did not pass through the $local_profile renderer result"
+done
+[[ $(<"$profile_renderer_log") == $'lapras\nditto\nrotom\nabsol' ]] ||
+  fail '--render-profile invoked the executable renderer with a wrong selector or order'
+ok 'all hosted, local, retired, and empty render-profile selectors have stable behavior'
+
+: >"$profile_renderer_log"
+export FAKE_RENDER_SUBSTRATE=entei-vcluster
+expect_refusal_message ProfileRenderMismatch 'lapras did not render the local k3d contract' \
+  run_profile_contract "$work/.diene/ci/environment-lock.v1.json" \
+  "$scratch/profile-render-mismatch.json" "$profile_renderer"
+unset FAKE_RENDER_SUBSTRATE
+[[ ! -e $scratch/profile-render-mismatch.json ]] ||
+  fail 'a mismatched executable render published a profile report'
+[[ $(<"$profile_renderer_log") == lapras ]] ||
+  fail 'render mismatch did not stop at the first local profile'
+
+: >"$profile_renderer_log"
+export FAKE_RENDER_FAIL_PROFILE=rotom
+expect_refusal_message ProfileRenderInterfaceUnavailable 'rotom executable renderer failed' \
+  run_profile_contract "$work/.diene/ci/environment-lock.v1.json" \
+  "$scratch/profile-render-failed.json" "$profile_renderer"
+unset FAKE_RENDER_FAIL_PROFILE
+[[ ! -e $scratch/profile-render-failed.json ]] ||
+  fail 'a failing executable renderer published a profile report'
+[[ $(<"$profile_renderer_log") == $'lapras\nditto\nrotom' ]] ||
+  fail 'a failing executable renderer did not stop at the failing profile'
+
+profile_missing_renderer=$scratch/profile-missing-renderer
+expect_refusal_message ProfileRenderInterfaceUnavailable \
+  'configured profile renderer is absent or not executable' run_profile_contract \
+  "$work/.diene/ci/environment-lock.v1.json" "$scratch/profile-render-missing.json" \
+  "$profile_missing_renderer"
+[[ ! -e $scratch/profile-render-missing.json ]] ||
+  fail 'a missing configured renderer published a profile report'
+ok 'mismatched, failing, and missing configured renderers refuse exactly without a report'
+
+: >"$profile_renderer_log"
+: >"$profile_pls_log"
+: >"$profile_pls_accepted_log"
+: >"$profile_output"
+profile_rendered=$scratch/profile-rendered.json
+run_profile_contract "$work/.diene/ci/environment-lock.v1.json" "$profile_rendered" "$profile_renderer"
+jq -e '
+  .outcome == "Pass" and .reasonCode == "ContractSatisfied" and
+  .renderedProfiles == ["lapras","ditto","rotom","absol"] and
+  .localExecutableRender == {outcome:"Pass",reasonCode:"ContractSatisfied"} and
+  .castformExecutable.outcome == "Unavailable" and .eeveeExecutable.outcome == "Unavailable"
+' "$profile_rendered" >/dev/null || fail 'the controlled renderer report did not bind the four local profiles'
+"$profile_validator" --base-uri "file://$work/schemas/ci/" \
+  --schemafile "$work/schemas/ci/diene-profile-report-v1.schema.json" "$profile_rendered" >/dev/null ||
+  fail 'the controlled renderer report is not schema-valid'
+jq -e '
+  (keys_unsorted | sort) == [
+    "apiVersion","castformExecutable","eeveeExecutable","localExecutableRender",
+    "outcome","previewManifest","reasonCode","renderedProfiles","repositoryRevision",
+    "staticContract","toolingDigests","validatedProfiles"
+  ] and
+  .validatedProfiles == ["eevee","castform"] and
+  (.renderedProfiles | all(. != "eevee" and . != "castform")) and
+  .castformExecutable == {outcome:"Unavailable",reasonCode:"PreviewIdentityUnavailable"} and
+  .eeveeExecutable == {outcome:"Unavailable",reasonCode:"PreviewIdentityUnavailable"} and
+  (has("rejectedAliases") | not)
+' "$profile_rendered" >/dev/null ||
+  fail 'the profile report invented a field or claimed a hosted preview render'
+profile_lock_digest="sha256:$(sha256sum "$work/.diene/ci/environment-lock.v1.json" | awk '{print $1}')"
+jq -e --arg sha "$SOURCE_SHA" --arg lockDigest "$profile_lock_digest" '
+  .repositoryRevision == $sha and
+  .toolingDigests == {environmentLockDigest:$lockDigest} and
+  .previewManifest == {
+    schemaVersion:"preview-manifest/v1",
+    schemaDigest:"sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    wordListVersion:"v1"
+  }
+' "$profile_rendered" >/dev/null ||
+  fail 'the profile report did not bind the exact revision, lock digest, and imported manifest entry'
+[[ $(<"$profile_renderer_log") == $'lapras\nditto\nrotom\nabsol' ]] ||
+  fail 'the renderer was called with something other than the exact four local profiles'
+grep -Fxq "profile_report=$profile_rendered" "$profile_output" ||
+  fail 'the controlled profile report path was not published through GITHUB_OUTPUT'
+profile_report_digest="sha256:$(sha256sum "$profile_rendered" | awk '{print $1}')"
+grep -Fxq "profile_report_digest=$profile_report_digest" "$profile_output" ||
+  fail 'the controlled profile report digest was not published exactly'
+[[ $(stat -c '%a' "$profile_rendered") == 600 ]] ||
+  fail 'the controlled profile report is not mode 0600'
+profile_temp_leftover=$(find "$scratch/profile-temp" -mindepth 1 -print -quit)
+[[ -z $profile_temp_leftover ]] ||
+  fail "profile contract left a scratch-scoped temporary object: $profile_temp_leftover"
+ok 'controlled local renders pass while hosted previews and unratified roster/pin evidence remain Unavailable'
 
 printf '== every cheap refusal precedes nsc create ==\n'
 
@@ -848,6 +1479,56 @@ jq '.actions[0].componentClass = "K10" | .actions[0].permissionRule = "off"' \
   "$vendor_backup" >"$work/.diene/ci/vendors.v1.yaml"
 expect_precreate_refusal SchemaValidationFailed ./scripts/ci/environment-k3d-run.sh orchestrate
 cp "$vendor_backup" "$work/.diene/ci/vendors.v1.yaml"
+
+journeys_backup=$scratch/journeys.backup
+cp "$work/.diene/ci/journeys.v1.yaml" "$journeys_backup"
+jq '
+  .journeys |= map(if .id == "core-demo" then
+    .appliesTo = [{lane:"absol",profile:"absol",buildMode:"build-local"}]
+  else . end)
+' "$journeys_backup" >"$work/.diene/ci/journeys.v1.yaml"
+prepare_run 3022 ditto-build-local
+expect_precreate_refusal JourneySelectorUnsatisfied ./scripts/ci/environment-k3d-run.sh orchestrate
+
+jq '
+  .journeys |= map(if .id == "core-demo" then
+    .appliesTo = [{lane:"ditto-build-local",profile:"ditto",buildMode:"build-local"}]
+  else . end)
+' "$journeys_backup" >"$work/.diene/ci/journeys.v1.yaml"
+prepare_run 3023 ditto-target-pull
+expect_precreate_refusal JourneySelectorUnsatisfied ./scripts/ci/environment-k3d-run.sh orchestrate
+
+jq '.journeys |= map(select(.id != "fleet-demo"))' \
+  "$journeys_backup" >"$work/.diene/ci/journeys.v1.yaml"
+prepare_run 3024 fleet-independence
+expect_precreate_refusal JourneySelectorUnsatisfied ./scripts/ci/environment-k3d-run.sh orchestrate
+cp "$journeys_backup" "$work/.diene/ci/journeys.v1.yaml"
+
+validate_prerequisites_case() (
+  cd -- "$work"
+  ./scripts/ci/environment-profile-contract.sh --validate-prerequisites
+)
+prerequisite_run=3030
+for lane in ditto-build-local ditto-target-pull absol fleet-independence; do
+  prepare_run "$prerequisite_run" "$lane"
+  validate_prerequisites_case >"$scratch/prerequisites-$lane.out" \
+    2>"$scratch/prerequisites-$lane.err" || {
+    sed -n '1,120p' "$scratch/prerequisites-$lane.err" >&2
+    fail "the exact $lane four-tuple did not pass the pre-create selector"
+  }
+  assert_contains "$scratch/prerequisites-$lane.out" PreSitContractAccepted
+  prerequisite_run=$((prerequisite_run + 1))
+done
+jq -e '
+  (.properties.outcome.enum | sort) == ["Fail","NotApplicable","Pass","Unavailable"] and
+  (.["$defs"].check.properties.outcome.enum | sort) == ["Fail","NotApplicable","Pass","Unavailable"]
+' "$work/schemas/ci/diene-profile-report-v1.schema.json" >/dev/null ||
+  fail 'the profile result vocabulary widened beyond Pass|Fail|NotApplicable|Unavailable'
+jq -e '
+  (.["$defs"].outcome.properties.outcome.enum | sort) == ["Fail","NotApplicable","Pass","Unavailable"]
+' "$work/schemas/ci/diene-environment-report-v1.schema.json" >/dev/null ||
+  fail 'the journey result vocabulary widened beyond Pass|Fail|NotApplicable|Unavailable'
+ok 'exact four-tuples pass while another-lane, target/build-local, and fleet-isolation mismatches refuse before create'
 ok 'trust, selectors, closure, vendor, producer, and fixture defects all stop before create'
 
 printf '== exact Namespace CLI identity refuses version drift before create ==\n'
@@ -991,6 +1672,109 @@ nsc_lines_before=$(wc -l <"$happy_log")
   fail 'the unprivileged lifecycle verifier invoked Namespace authority'
 assert_contains "$scratch/lifecycle.out" 'NamespaceLifecycleVerified:'
 ok 'workflow-owned lifecycle verification consumes proof without nsc authority'
+
+verify_lifecycle_main_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-k3d-run.sh
+  environment_k3d_main lifecycle "$happy_core_bundle"
+  [[ -z $(trap -p RETURN) ]] || fail 'lifecycle main leaked a RETURN trap past local cleanup scope'
+)
+nsc_lines_before=$(wc -l <"$happy_log")
+verify_lifecycle_main_case >"$scratch/lifecycle-main.out" 2>"$scratch/lifecycle-main.err" || {
+  sed -n '1,160p' "$scratch/lifecycle-main.err" >&2
+  fail 'the source-safe lifecycle main rejected the green proof or leaked its RETURN trap'
+}
+[[ $(wc -l <"$happy_log") == "$nsc_lines_before" ]] ||
+  fail 'the source-safe lifecycle main invoked Namespace authority'
+assert_contains "$scratch/lifecycle-main.out" 'NamespaceLifecycleVerified:'
+ok 'source-safe lifecycle main clears its local RETURN trap after a successful proof'
+
+lifecycle_extract=$scratch/lifecycle-extract
+install -d -m 0700 "$lifecycle_extract"
+tar -xf "$happy_core_bundle" -C "$lifecycle_extract"
+jq -e --slurpfile lifecycle "$lifecycle_extract/namespace-lifecycle.json" '
+  .namespace.clusterId == $lifecycle[0].clusterId and
+  .namespace.create.outcome == "Pass" and .namespace.destroy.outcome == "Pass" and
+  .namespace.absence.outcome == "Pass" and
+  .namespace.create.receiptDigest == $lifecycle[0].create.receiptDigest and
+  .namespace.destroy.receiptDigest == $lifecycle[0].destroy.receiptDigest and
+  .namespace.absence.receiptDigest == $lifecycle[0].absence.receiptDigest and
+  .namespace.policy.applied == true and .namespace.policy.hostileProbes == "Pass" and
+  .cleanup.outcome == "Pass" and (.cleanup.debt // []) == []
+' "$lifecycle_extract/ci-receipt.json" >/dev/null ||
+  fail 'the terminal receipt is not bound to every passing lifecycle phase and digest'
+ok 'mandatory receipt binds the exact cluster, create/destroy/absence Pass phases, digests, policy, and cleanup'
+
+repack_lifecycle_bundle() {
+  local source_bundle=${1:?source bundle required} target_bundle=${2:?target bundle required}
+  local label=${3:?label required} mutation=${4-}
+  local repack_dir=$scratch/repack-$label
+  install -d -m 0700 "$repack_dir"
+  tar -xf "$source_bundle" -C "$repack_dir"
+  case $label in
+    omitted-receipt) rm -f -- "$repack_dir/ci-receipt.json" ;;
+    unexpected-member) printf '%s\n' hostile >"$repack_dir/notes.txt" ;;
+    *)
+      jq "$mutation" "$repack_dir/ci-receipt.json" >"$repack_dir/ci-receipt.json.tmp"
+      mv "$repack_dir/ci-receipt.json.tmp" "$repack_dir/ci-receipt.json"
+      ;;
+  esac
+  local -a members=(diene-environment-report.v1.json namespace-lifecycle.json checkpoint-chain.json)
+  [[ $label == omitted-receipt ]] || members+=(ci-receipt.json)
+  [[ $label != unexpected-member ]] || members+=(notes.txt)
+  tar -cf "$target_bundle" -C "$repack_dir" "${members[@]}"
+}
+
+verify_lifecycle_bundle_case() (
+  local selected_bundle=${1:?bundle required}
+  cd -- "$work"
+  FAKE_NSC_SCENARIO=happy ./scripts/ci/environment-k3d-run.sh lifecycle "$selected_bundle"
+)
+
+expect_terminal_bundle_refusal() {
+  local reason=${1:?reason required} label=${2:?label required} mutation=${3-}
+  local bundle=$scratch/lifecycle-$label.tar before
+  repack_lifecycle_bundle "$happy_core_bundle" "$bundle" "$label" "$mutation"
+  before=$(wc -l <"$happy_log")
+  expect_refusal "$reason" verify_lifecycle_bundle_case "$bundle"
+  [[ $(wc -l <"$happy_log") == "$before" ]] ||
+    fail "$label terminal verifier invoked Namespace authority"
+}
+
+expect_terminal_bundle_refusal EvidenceCollectionFailed omitted-receipt
+expect_terminal_bundle_refusal ReceiptLifecycleIncomplete foreign-cluster \
+  '.namespace.clusterId = "cluster-foreign-terminal"'
+expect_terminal_bundle_refusal ReceiptLifecycleIncomplete foreign-allocation \
+  '.owner.allocationKey = "r99999-w99999-a9-lditto-build-local"'
+expect_terminal_bundle_refusal ReceiptLifecycleIncomplete foreign-generation \
+  '.owner.generationKey = "gffffffffffff"'
+expect_terminal_bundle_refusal ReceiptLifecycleIncomplete create-phase \
+  '.namespace.create.outcome = "Fail" | .namespace.create.reasonCode = "Tampered"'
+expect_terminal_bundle_refusal ReceiptLifecycleIncomplete destroy-digest \
+  '.namespace.destroy.receiptDigest = "sha256:9999999999999999999999999999999999999999999999999999999999999999"'
+expect_terminal_bundle_refusal ReceiptLifecycleIncomplete absence-phase \
+  '.namespace.absence = {outcome:"Pending",reasonCode:"AbsenceNotAttempted"}'
+expect_terminal_bundle_refusal ReceiptLifecycleIncomplete cleanup-debt \
+  '.cleanup = {outcome:"Fail",reasonCode:"ExactDownFailed",debt:["tampered debt"]}'
+expect_terminal_bundle_refusal ReceiptLifecycleIncomplete receipt-unpatched \
+  '.namespace.policy.applied = false | .namespace.policy.hostileProbes = "Pending" |
+   .cleanup = {outcome:"Pending",reasonCode:"RuntimeArmed",debt:[]}'
+expect_terminal_bundle_refusal EvidenceCollectionFailed unexpected-member
+
+terminal_receipt_link=$scratch/terminal-receipt-link.json
+ln -s "$lifecycle_extract/ci-receipt.json" "$terminal_receipt_link"
+validate_terminal_receipt_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_validate_terminal_receipt "$terminal_receipt_link" \
+    "$lifecycle_extract/namespace-lifecycle.json" \
+    "$lifecycle_extract/checkpoint-chain.json" \
+    "$lifecycle_extract/diene-environment-report.v1.json"
+)
+expect_refusal ReceiptLifecycleIncomplete validate_terminal_receipt_case
+ok 'omission, owner/allocation/generation/cluster, phase, digest, cleanup, Pending, symlink, and extra-member terminal receipts all refuse'
 
 destroy_before=$(grep -Ec '^destroy ' "$happy_log")
 (cd -- "$work" && FAKE_NSC_SCENARIO=happy ./scripts/ci/environment-k3d-run.sh cleanup) \
@@ -1433,7 +2217,8 @@ printf '%q ' "$@" >>"${FAKE_KUBECTL_LOG:?}"
 printf '\n' >>"${FAKE_KUBECTL_LOG:?}"
 case "$*" in
   'get nodes -o json')
-    jq -n '{items:[{spec:{podCIDR:"10.142.0.0/16",podCIDRs:["10.142.0.0/16","fd00:142::/64"]},
+    jq -n --argjson podCidrs "${FAKE_NODE_POD_CIDRS:-[\"10.142.0.0/16\",\"fd00:142::/64\"]}" '
+      {items:[{spec:{podCIDR:($podCidrs | map(select(contains(":" ) | not))[0]),podCIDRs:$podCidrs},
       status:{conditions:[{type:"Ready",status:"True"}],capacity:{cpu:"16",memory:"32Gi"}}}]}'
     ;;
   'get ingress -A -o json' | 'get gateway -A -o json') printf '%s\n' '{"items":[]}' ;;
@@ -1462,10 +2247,14 @@ policy_table_log=$scratch/policy-table.log
 policy_kubectl_log=$scratch/policy-kubectl.log
 policy_l7_log=$scratch/policy-l7.log
 policy_probe_log=$scratch/policy-probe.log
+ipv6_enabled_path=$scratch/ipv6-enabled
+ipv6_disabled_path=$scratch/ipv6-disabled
 : >"$policy_table_log"
 : >"$policy_kubectl_log"
 : >"$policy_l7_log"
 : >"$policy_probe_log"
+printf '0\n' >"$ipv6_enabled_path"
+printf '1\n' >"$ipv6_disabled_path"
 
 prepare_run 7001
 policy_evidence=$scratch/policy-evidence
@@ -1482,10 +2271,13 @@ jq -n '{network:{serviceCidrs:["10.143.0.0/16"]}}' >"$policy_evidence/preflight.
   export DIENE_IPTABLES_BIN="$policy_tools/iptables4"
   export DIENE_IP6TABLES_BIN="$policy_tools/iptables6"
   export DIENE_EGRESS_RESOLVER_BIN="$policy_tools/resolver"
+  export DIENE_IPV6_DISABLE_PATH="$ipv6_enabled_path"
   export FAKE_TABLE_STATE="$policy_state" FAKE_TABLE_LOG="$policy_table_log"
   export FAKE_KUBECTL_LOG="$policy_kubectl_log" FAKE_L7_LOG="$policy_l7_log"
   export FAKE_PROBE_LOG="$policy_probe_log" SSH_CONNECTION='192.0.2.10 4242 10.0.0.2 22'
   export PATH="$policy_tools:$PATH"
+  export DIENE_EVIDENCE_STAGING="$policy_evidence/staging"
+  install -d -m 0700 "$DIENE_EVIDENCE_STAGING"
   diene_prepare_egress_contract "$policy_evidence/contract.json"
   diene_resolve_egress_contract "$policy_evidence/contract.json" "$policy_evidence/resolved.json"
   diene_preflow_start
@@ -1520,7 +2312,8 @@ jq -e '.outcome == "Pass" and .defaultDenied == true and .dnsBound == true and
 jq -e 'length == 6 and
   ([.[].id] | sort) == ["host-arbitrary-https-denial","host-metadata-denial",
     "pod-arbitrary-https-denial","pod-dns-denial","pod-metadata-denial",
-    "preexisting-flow-transition-denial"] and all(.outcome == "Pass" and .required == true)' \
+    "preexisting-flow-transition-denial"] and
+  all(.outcome == "Pass" and .required == true and .reasonCode == "AdapterObservedDenial")' \
   "$policy_evidence/hostile-probes.json" >/dev/null || fail 'host and actual-pod hostile proof is incomplete'
 jq -e '.outcome == "Pass" and .reasonCode == "LoopbackOnlyNoIngress" and
   .namespaceEndpointUsed == false' "$policy_evidence/endpoint.json" >/dev/null ||
@@ -1547,6 +2340,29 @@ for scope in preexisting-open preexisting-transition host pod; do
   grep -Fq -- "--scope $scope" "$policy_probe_log" || fail "hostile probe scope $scope was not exercised"
 done
 grep -Fq -- "--image $CANARY_IMAGE" "$policy_probe_log" || fail 'pod probe did not use the immutable canary image'
+[[ $(grep -Fc -- '--image ' "$policy_probe_log") == 1 ]] ||
+  fail 'an adapter scope other than pod received the canary image argument'
+policy_receipt_id=$(
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_receipt_id
+)
+for scope in preexisting-open preexisting-transition host pod; do
+  transcript=$policy_evidence/staging/egress-probe/$scope.json
+  expected_probe_reason=AdapterObservedDenial
+  [[ $scope != preexisting-open ]] || expected_probe_reason=AdapterObservedFlowEstablished
+  jq -e --arg scope "$scope" --arg profile ditto-build-local-v1 \
+    --arg cluster cluster-policy-7001 --arg receipt "$policy_receipt_id" \
+    --arg reason "$expected_probe_reason" '
+    (keys | sort) == ["apiVersion","clusterId","observations","profileId","receiptId","scope"] and
+    .apiVersion == "diene.atomi.cloud/ci-egress-probe/v1" and .scope == $scope and
+    .profileId == $profile and .clusterId == $cluster and .receiptId == $receipt and
+    all(.observations[];
+      (keys | sort) == ["id","outcome","reasonCode","required"] and
+      .outcome == "Pass" and .required == true and .reasonCode == $reason)
+  ' "$transcript" >/dev/null || fail "$scope adapter transcript lost exact tuple/key/outcome binding"
+done
 grep -Fq -- 'apply --profile ditto-build-local-v1' "$policy_l7_log" || fail 'L7 policy did not arm'
 grep -Fq -- 'remove --profile ditto-build-local-v1' "$policy_l7_log" || fail 'L7 policy did not remove'
 output_chain=$(jq -r '.outputChain' "$policy_evidence/policy.json")
@@ -1567,7 +2383,7 @@ if rg -n '(^|[[:space:]])nsc[[:space:]]+egress|egress[[:space:]]+policy[[:space:
   sed -n '1,120p' "$scratch/tenant-policy" >&2
   fail 'active code mutates a tenant-wide Namespace egress policy'
 fi
-ok 'iptables-nft enforces exact host/pod IPv4+IPv6 rules, hostile probes, narrow SSH, and full removal'
+ok 'iptables-nft and exact machine-readable adapter transcripts bind host/pod probes, receipt, and full removal'
 
 printf '== partial policy transactions roll back completely ==\n'
 
@@ -1583,12 +2399,14 @@ assert_policy_state_absent() {
 policy_failure_case() {
   local run_id=${1:?run id required} label=${2:?label required} table_regex=${3-}
   local l7_complete=${4:-true} expected=${5:-InterimPolicyUnavailable}
+  local pod_cidrs=${6:-'["10.142.0.0/16","fd00:142::/64"]'} ipv6_disabled=${7:-0}
   prepare_run "$run_id"
   local state=$scratch/policy-failure-$label tables=$scratch/policy-failure-$label.log
   local l7_log=$scratch/policy-failure-$label-l7.log evidence=$scratch/policy-failure-$label-evidence
   install -d -m 0700 "$state" "$evidence"
   : >"$tables"
   : >"$l7_log"
+  printf '%s\n' "$ipv6_disabled" >"$evidence/ipv6-disabled"
   jq -n '{network:{serviceCidrs:["10.143.0.0/16"]}}' >"$evidence/preflight.json"
   if (
     cd -- "$work"
@@ -1601,6 +2419,7 @@ policy_failure_case() {
     export DIENE_IPTABLES_BIN="$policy_tools/iptables4"
     export DIENE_IP6TABLES_BIN="$policy_tools/iptables6"
     export DIENE_EGRESS_RESOLVER_BIN="$policy_tools/resolver"
+    export DIENE_IPV6_DISABLE_PATH="$evidence/ipv6-disabled" FAKE_NODE_POD_CIDRS="$pod_cidrs"
     export FAKE_TABLE_STATE="$state" FAKE_TABLE_LOG="$tables"
     export FAKE_TABLE_FAIL_REGEX="$table_regex" FAKE_KUBECTL_LOG="$policy_kubectl_log"
     export FAKE_L7_LOG="$l7_log" FAKE_L7_COMPLETE="$l7_complete"
@@ -1636,7 +2455,50 @@ grep -Fq -- 'apply --profile ditto-build-local-v1' "$POLICY_FAILURE_L7_LOG" ||
   fail 'L7 failure injection never reached the apply boundary'
 grep -Fq -- 'remove --profile ditto-build-local-v1' "$POLICY_FAILURE_L7_LOG" ||
   fail 'L7 failure rollback did not remove the attempted enforcer state'
-ok 'partial IPv4, partial IPv6, and L7 failures leave no receipt-scoped hook or chain'
+
+policy_failure_case 7104 ipv6-no-pod-cidr '' true InterimPolicyUnavailable \
+  '["10.142.0.0/16"]' 0
+assert_contains "$scratch/policy-failure-ipv6-no-pod-cidr.err" \
+  'host IPv6 is enabled but no IPv6 pod CIDR was observed'
+! grep -Eq -- '-A DI6F_[0-9a-f]+ -j RETURN' "$POLICY_FAILURE_TABLE_LOG" ||
+  fail 'the empty-pod6-CIDR case completed an unenforced IPv6 forwarding chain'
+ok 'partial IPv4/IPv6, L7, and enabled-host/empty-pod6 failures leave no hook or chain'
+
+prepare_run 7105
+ipv6_disabled_state=$scratch/policy-ipv6-disabled-state
+ipv6_disabled_evidence=$scratch/policy-ipv6-disabled-evidence
+ipv6_disabled_log=$scratch/policy-ipv6-disabled.log
+install -d -m 0700 "$ipv6_disabled_state" "$ipv6_disabled_evidence"
+: >"$ipv6_disabled_log"
+jq -n '{network:{serviceCidrs:["10.143.0.0/16"]}}' >"$ipv6_disabled_evidence/preflight.json"
+(
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_validate_inputs
+  export DIENE_NSC_CLUSTER_ID=cluster-ipv6-disabled-7105
+  export DIENE_PREFLIGHT_EVIDENCE="$ipv6_disabled_evidence/preflight.json"
+  export DIENE_KUBECTL_BIN="$policy_tools/kubectl" DIENE_IPTABLES_BIN="$policy_tools/iptables4"
+  export DIENE_IP6TABLES_BIN="$policy_tools/iptables6" DIENE_EGRESS_RESOLVER_BIN="$policy_tools/resolver"
+  export DIENE_IPV6_DISABLE_PATH="$ipv6_disabled_path" FAKE_NODE_POD_CIDRS='["10.142.0.0/16"]'
+  export FAKE_TABLE_STATE="$ipv6_disabled_state" FAKE_TABLE_LOG="$ipv6_disabled_log"
+  export FAKE_KUBECTL_LOG="$policy_kubectl_log" FAKE_L7_LOG="$policy_l7_log"
+  export SSH_CONNECTION='192.0.2.10 4242 10.0.0.2 22'
+  diene_prepare_egress_contract "$ipv6_disabled_evidence/contract.json"
+  diene_resolve_egress_contract "$ipv6_disabled_evidence/contract.json" \
+    "$ipv6_disabled_evidence/resolved.json"
+  diene_apply_interim_policy "$ipv6_disabled_evidence/resolved.json" \
+    "$ipv6_disabled_evidence/policy.json" "$ipv6_disabled_evidence/l7.json"
+  diene_remove_interim_policy
+) >"$scratch/policy-ipv6-disabled.out" 2>"$scratch/policy-ipv6-disabled.err" || {
+  sed -n '1,160p' "$scratch/policy-ipv6-disabled.err" >&2
+  fail 'the explicitly IPv6-disabled control refused an empty pod6 CIDR set'
+}
+jq -e '.ipv6Armed == false and .pod6Cidrs == [] and .applied == true' \
+  "$ipv6_disabled_evidence/policy.json" >/dev/null ||
+  fail 'the IPv6-disabled control transcript misreported IPv6 enforcement'
+assert_policy_state_absent "$ipv6_disabled_state" ipv6-disabled-control
+ok 'an explicitly IPv6-disabled host permits no pod6 CIDR and still proves complete removal'
 
 printf '== resolver, hostile probe, and vendor broker fail closed ==\n'
 
@@ -1655,27 +2517,206 @@ fi
 assert_contains "$scratch/resolver-invalid.err" ConnectedEgressInterfaceUnavailable
 ok 'invalid resolved addresses refuse before policy activation'
 
-prepare_run 7111
-probe_failure_log=$scratch/probe-failure.log
-: >"$probe_failure_log"
-if (
+probe_adapter_case() (
+  local label=${1:?label required}
   cd -- "$work"
   # shellcheck source=/dev/null
   source ./scripts/ci/environment-lib.sh
   diene_validate_inputs
-  export DIENE_NSC_CLUSTER_ID=cluster-probe-7111 DIENE_PREFLOW_ADAPTER=true
-  export FAKE_PROBE_LOG="$probe_failure_log" FAKE_PROBE_FAIL_SCOPE=pod
-  diene_verify_hostile_egress "$scratch/probe-invalid.json"
-) >"$scratch/probe-invalid.out" 2>"$scratch/probe-invalid.err"; then
-  fail 'a failing actual-pod hostile probe was accepted'
-fi
-assert_contains "$scratch/probe-invalid.err" InterimPolicyUnavailable
-grep -Fq -- '--scope host' "$probe_failure_log" || fail 'host negative probe was skipped before pod failure'
-grep -Fq -- '--scope pod' "$probe_failure_log" || fail 'actual-pod failure injection was not exercised'
-[[ ! -e $scratch/probe-invalid.json ]] || fail 'a failing hostile probe emitted passing evidence'
-ok 'hostile actual-pod metadata/arbitrary-HTTPS/DNS proof is mandatory'
+  export DIENE_NSC_CLUSTER_ID="cluster-probe-$label"
+  export DIENE_EVIDENCE_STAGING="$scratch/probe-$label-staging"
+  install -d -m 0700 "$DIENE_EVIDENCE_STAGING"
+  export FAKE_PROBE_LOG="$scratch/probe-$label.log"
+  : >"$FAKE_PROBE_LOG"
+  diene_preflow_start
+  diene_verify_hostile_egress "$scratch/probe-$label.json"
+)
 
-prepare_run 7112 ditto-vendor
+expect_probe_refusal() {
+  local label=${1:?label required}
+  expect_refusal InterimPolicyUnavailable probe_adapter_case "$label"
+  [[ ! -e $scratch/probe-$label.json ]] ||
+    fail "$label adapter refusal emitted passing hostile-probe evidence"
+}
+
+prepare_run 7111
+export FAKE_PROBE_FAIL_SCOPE=preexisting-open
+expect_probe_refusal preexisting-open-nonzero
+unset FAKE_PROBE_FAIL_SCOPE
+
+prepare_run 7112
+export FAKE_PROBE_MUTATE_SCOPE=preexisting-open FAKE_PROBE_DROP_ID=preexisting-flow-established
+expect_probe_refusal preexisting-open-invalid
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_DROP_ID
+
+prepare_run 7113
+export FAKE_PROBE_FAIL_SCOPE=preexisting-transition
+expect_probe_refusal preexisting-transition-nonzero
+unset FAKE_PROBE_FAIL_SCOPE
+
+prepare_run 7114
+export FAKE_PROBE_MUTATE_SCOPE=preexisting-transition \
+  FAKE_PROBE_DROP_ID=preexisting-flow-transition-denial
+expect_probe_refusal preexisting-transition-invalid
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_DROP_ID
+
+prepare_run 7115
+export FAKE_PROBE_FAIL_SCOPE=host
+expect_probe_refusal host-nonzero
+unset FAKE_PROBE_FAIL_SCOPE
+
+prepare_run 7116
+export FAKE_PROBE_MUTATE_SCOPE=host FAKE_PROBE_OUTCOME=Fail
+expect_probe_refusal host-invalid
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_OUTCOME
+
+prepare_run 7117
+export FAKE_PROBE_FAIL_SCOPE=pod
+expect_probe_refusal pod-nonzero
+grep -Fq -- '--scope host' "$scratch/probe-pod-nonzero.log" ||
+  fail 'host negative probe was skipped before pod failure'
+grep -Fq -- '--scope pod' "$scratch/probe-pod-nonzero.log" ||
+  fail 'actual-pod failure injection was not exercised'
+unset FAKE_PROBE_FAIL_SCOPE
+
+prepare_run 7118
+export FAKE_PROBE_MUTATE_SCOPE=pod FAKE_PROBE_DROP_ID=pod-dns-denial
+expect_probe_refusal pod-invalid
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_DROP_ID
+
+prepare_run 7119
+export FAKE_PROBE_NO_TRANSCRIPT=host
+expect_probe_refusal noop-exit-zero
+unset FAKE_PROBE_NO_TRANSCRIPT
+
+prepare_run 7120
+export FAKE_PROBE_MUTATE_SCOPE=host FAKE_PROBE_CLUSTER=cluster-foreign
+expect_probe_refusal foreign-cluster
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_CLUSTER
+
+prepare_run 7121
+export FAKE_PROBE_MUTATE_SCOPE=pod FAKE_PROBE_REQUIRED=false
+expect_probe_refusal optional-observation
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_REQUIRED
+
+prepare_run 7124
+export FAKE_PROBE_MUTATE_SCOPE=preexisting-open FAKE_PROBE_REASON=AdapterObservedDenial
+expect_probe_refusal preexisting-open-reason-swap
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_REASON
+
+prepare_run 7125
+export FAKE_PROBE_MUTATE_SCOPE=preexisting-transition \
+  FAKE_PROBE_REASON=AdapterObservedFlowEstablished
+expect_probe_refusal preexisting-transition-reason-swap
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_REASON
+
+prepare_run 7126
+export FAKE_PROBE_MUTATE_SCOPE=host FAKE_PROBE_REASON=AdapterObservedFlowEstablished
+expect_probe_refusal host-reason-swap
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_REASON
+
+prepare_run 7127
+export FAKE_PROBE_MUTATE_SCOPE=pod FAKE_PROBE_REASON=AdapterObservedFlowEstablished
+expect_probe_refusal pod-reason-swap
+unset FAKE_PROBE_MUTATE_SCOPE FAKE_PROBE_REASON
+ok 'nonzero, malformed, reason-swapped, exit-zero no-op, foreign, and optional adapters all refuse'
+
+fallback_tools=$scratch/fallback-tools
+fallback_log=$scratch/fallback-tools.log
+install -d -m 0700 "$fallback_tools"
+: >"$fallback_log"
+cat >"$fallback_tools/nc" <<'NC'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'nc' >>"${FAKE_FALLBACK_LOG:?}"
+printf ' %q' "$@" >>"$FAKE_FALLBACK_LOG"
+printf '\n' >>"$FAKE_FALLBACK_LOG"
+[[ $* == '-w 8 1.1.1.1 80' ]] || exit 127
+IFS= read -r _ || true
+NC
+cat >"$fallback_tools/ss" <<'SS'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'ss' >>"${FAKE_FALLBACK_LOG:?}"
+printf ' %q' "$@" >>"$FAKE_FALLBACK_LOG"
+printf '\n' >>"$FAKE_FALLBACK_LOG"
+[[ $* == '-Htn state established dst 1.1.1.1:80' ]] || exit 127
+printf '%s\n' 'ESTAB 0 0 10.0.0.2:4242 1.1.1.1:80'
+SS
+cat >"$fallback_tools/curl" <<'CURL'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl' >>"${FAKE_FALLBACK_LOG:?}"
+printf ' %q' "$@" >>"$FAKE_FALLBACK_LOG"
+printf '\n' >>"$FAKE_FALLBACK_LOG"
+case "$*" in
+  '-fsS --connect-timeout 1 --max-time 2 http://169.254.169.254/' |
+  '-kfsS --connect-timeout 1 --max-time 2 https://1.1.1.1/') exit 22 ;;
+  *) exit 127 ;;
+esac
+CURL
+cat >"$fallback_tools/kubectl" <<'KUBECTL_FALLBACK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'kubectl' >>"${FAKE_FALLBACK_LOG:?}"
+printf ' %q' "$@" >>"$FAKE_FALLBACK_LOG"
+printf '\n' >>"$FAKE_FALLBACK_LOG"
+case ${1:-} in
+  run)
+    [[ $# -eq 10 && ${2:-} == diene-egress-* && ${3:-} == --restart=Never &&
+      ${4:-} == "--image=${DIENE_EGRESS_CANARY_IMAGE:?}" &&
+      ${5:-} == --image-pull-policy=Never && ${6:-} == --command && ${7:-} == -- &&
+      ${8:-} == sh && ${9:-} == -ceu ]] || exit 127
+    ;;
+  wait)
+    [[ $# -eq 4 && ${2:-} == "--for=jsonpath={.status.phase}=Succeeded" &&
+      ${3:-} == pod/diene-egress-* && ${4:-} == --timeout=30s ]] || exit 127
+    ;;
+  delete)
+    [[ $# -eq 5 && ${2:-} == pod && ${3:-} == diene-egress-* &&
+      ${4:-} == --wait=true && ${5:-} == --timeout=30s ]] || exit 127
+    ;;
+  *) exit 127 ;;
+esac
+KUBECTL_FALLBACK
+chmod 0755 "$fallback_tools/nc" "$fallback_tools/ss" "$fallback_tools/curl" \
+  "$fallback_tools/kubectl"
+
+prepare_run 7122
+fallback_probes=$scratch/fallback-hostile-probes.json
+(
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  unset DIENE_EGRESS_PROBE_BIN
+  diene_validate_inputs
+  export DIENE_NSC_CLUSTER_ID=cluster-fallback-7122
+  export DIENE_KUBECTL_BIN="$fallback_tools/kubectl"
+  export FAKE_FALLBACK_LOG="$fallback_log"
+  export PATH="$fallback_tools:$PATH"
+  diene_preflow_start
+  diene_verify_hostile_egress "$fallback_probes"
+) >"$scratch/fallback-probe.out" 2>"$scratch/fallback-probe.err" || {
+  sed -n '1,200p' "$scratch/fallback-probe.err" >&2
+  fail 'the built-in hostile egress fallback path failed under controlled seams'
+}
+jq -e '
+  length == 6 and
+  ([.[].id] | sort) == ["host-arbitrary-https-denial","host-metadata-denial",
+    "pod-arbitrary-https-denial","pod-dns-denial","pod-metadata-denial",
+    "preexisting-flow-transition-denial"] and
+  all(.[]; .outcome == "Pass" and .required == true) and
+  ([.[] | select(.id == "host-metadata-denial" or .id == "host-arbitrary-https-denial")] |
+    length == 2 and all(.reasonCode == "ConnectionRefused"))
+' "$fallback_probes" >/dev/null ||
+  fail 'the built-in fallback did not retain the exact six required Pass observations'
+[[ $(grep -c '^curl ' "$fallback_log") == 2 && $(grep -c '^kubectl run ' "$fallback_log") == 1 &&
+  $(grep -c '^kubectl wait ' "$fallback_log") == 1 &&
+  $(grep -c '^kubectl delete ' "$fallback_log") == 1 ]] ||
+  fail 'the built-in fallback did not execute both host and the exact actual-pod negative probes'
+ok 'the no-adapter fallback preserves both host observations and all six exact Pass IDs'
+
+prepare_run 7123 ditto-vendor
 vendor_contract=$scratch/vendor-contract.json
 (
   cd -- "$work"
@@ -1708,6 +2749,478 @@ grep -Fq 'diene_die VendorBrokerInterfaceUnavailable' "$script_dir/environment-v
 grep -Fq 'if ! "$broker" revoke' "$script_dir/environment-vendor-run.sh" ||
   fail 'the vendor driver does not make broker revocation cleanup-blocking'
 ok 'vendor broker issue/revoke and exact vendor allowlist remain fail closed'
+
+printf '== hermetic direct core/vendor driver dispatch ==\n'
+
+direct_source=$scratch/direct-source
+install -d -m 0700 "$direct_source"
+cp -R "$work/." "$direct_source/"
+
+cat >"$direct_source/.diene/ci/fake-pls-direct" <<'PLS_DIRECT'
+#!/usr/bin/env bash
+set -euo pipefail
+source_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck source=/dev/null
+source "$source_root/scripts/ci/environment-lib.sh"
+printf 'pls %s\n' "$*" >>"${FAKE_DRIVER_EVENT_LOG:?}"
+case "${1:-}:${2:-}" in
+  closure:import)
+    [[ $# -eq 3 && ${3:-} == "${DIENE_CLOSURE_BUNDLE_REF:?}" ]] || exit 127
+    ;;
+  closure:preflight)
+    [[ $# -eq 3 && ${3:-} == --denied-network ]] || exit 127
+    ;;
+  env:up)
+    [[ $# -eq 8 && ${3:-} == --profile && ${5:-} == --build-mode &&
+      ${7:-} == --artifact && ${8:-} == "${DIENE_ARTIFACT_DIGEST:?}" ]] || exit 127
+    profile=${4:?}
+    build_mode=${6:?}
+    install -d -m 0700 "${DIENE_RUNTIME_SEARCH_ROOT:?}"
+    jq -n --arg profile "$profile" --arg mode "$build_mode" \
+      --arg repositoryId "$GITHUB_REPOSITORY_ID" --arg repositoryKey "$GITHUB_REPOSITORY" \
+      --arg allocation "$(diene_allocation_key)" --arg generation "$(diene_generation_key)" \
+      --arg substrate "direct-${DIENE_LANE}" --arg receipt "$(diene_receipt_id)" \
+      --arg artifact "$DIENE_ARTIFACT_DIGEST" '
+      {apiVersion:"diene-runtime/v1",profile:$profile,buildMode:$mode,
+       owner:{repositoryId:$repositoryId,repositoryKey:$repositoryKey,
+         allocationKey:$allocation,generationKey:$generation},
+       substrate:{kind:"k3d",name:$substrate,receipt:$receipt},artifact:{digest:$artifact}}
+    ' >"$DIENE_RUNTIME_SEARCH_ROOT/runtime.json"
+    chmod 0600 "$DIENE_RUNTIME_SEARCH_ROOT/runtime.json"
+    ;;
+  env:doctor)
+    [[ $# -eq 5 && ${3:-} == --profile && ${5:-} == --json ]] || exit 127
+    profile=${4:?}
+    jq -n --arg profile "$profile" --arg allocation "$(diene_allocation_key)" '
+      def leaf($id;$required):
+        if $required then {id:$id,outcome:"Pass",required:true,reasonCode:"ControlledUnitInput",
+          sourceUid:("unit-"+$id),observedGeneration:1,allocationKey:$allocation,
+          transitionTime:"2026-08-01T00:00:00Z"}
+        else {id:$id,outcome:"NotRequired",required:false,reasonCode:"NotApplicableToLane"} end;
+      {apiVersion:"diene-readiness/v1",profile:$profile,aggregate:"EnvironmentReady",outcome:"Pass",
+       readiness:[leaf("SubstrateReady";true),leaf("SeedReady";true),leaf("StoreReady";true),
+        leaf("ExternalSecretsReady";true),leaf("DependenciesReady";true),leaf("PVCsReady";true),
+        leaf("MigrationsReady";true),leaf("FixturesReady";true),leaf("LogtoReady";true),
+        leaf("ArtifactPullReady";true),leaf("ApplicationWorkloadsReady";true),
+        leaf("ExposurePrerequisitesReady";true),leaf("ExposureReady";true),
+        leaf("EnvironmentReady";true),leaf("AllocationReady";false),
+        leaf("CastformProdSafetyReady";false),leaf("CallbackReady";false)]}
+    '
+    ;;
+  env:down)
+    [[ $# -eq 4 && ${3:-} == --profile && -f ${DIENE_GARDEN_RUNTIME_FILE:-} ]] || exit 127
+    ;;
+  *) exit 127 ;;
+esac
+PLS_DIRECT
+
+cat >"$direct_source/.diene/ci/fake-pull-proof" <<'PULL_DIRECT'
+#!/usr/bin/env bash
+set -euo pipefail
+proof=${1:-}
+[[ $# -eq 5 && ${2:-} == --digest && ${3:-} == "${DIENE_ARTIFACT_DIGEST:?}" &&
+  ${4:-} == --receipt && ${5:-} == "${DIRECT_RECEIPT_ID:?}" ]] || exit 127
+case $proof in
+  real-pull | evict-repull | sibling-denial | pull-secret-ownership | credential-removal) ;;
+  *) exit 127 ;;
+esac
+printf 'pull %s\n' "$proof" >>"${FAKE_DRIVER_EVENT_LOG:?}"
+PULL_DIRECT
+
+cat >"$direct_source/.diene/ci/fake-closure-verify" <<'CLOSURE_DIRECT'
+#!/usr/bin/env bash
+set -euo pipefail
+case ${1:-} in
+  verify)
+    [[ $# -eq 9 && ${2:-} == --digest && ${3:-} == "${DIENE_CLOSURE_DIGEST:?}" &&
+      ${4:-} == --bundle && ${5:-} == "${DIENE_CLOSURE_BUNDLE_REF:?}" &&
+      ${6:-} == --signature-digest && ${7:-} == "${DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST:?}" &&
+      ${8:-} == --trust-root-digest && ${9:-} == "${DIENE_CLOSURE_TRUST_ROOT_DIGEST:?}" ]] || exit 127
+    printf 'closure verify\n' >>"${FAKE_DRIVER_EVENT_LOG:?}"
+    ;;
+  exact-set)
+    [[ $# -eq 4 && ${2:-} == --digest && ${3:-} == "${DIENE_CLOSURE_DIGEST:?}" &&
+      ${4:-} == --network-denied ]] || exit 127
+    printf 'closure exact-set\n' >>"${FAKE_DRIVER_EVENT_LOG:?}"
+    ;;
+  *) exit 127 ;;
+esac
+CLOSURE_DIRECT
+
+cat >"$direct_source/.diene/ci/fake-fleet-negative-observer" <<'FLEET_DIRECT'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $* == '--fixture bootstrap-fleet-independence-v1 --forbidden diene-fleet-controller --forbidden diene-fleet-agent' ]] ||
+  exit 127
+printf 'fleet-negative-observed bootstrap-fleet-independence-v1 diene-fleet-controller diene-fleet-agent\n' \
+  >>"${FAKE_DRIVER_EVENT_LOG:?}"
+FLEET_DIRECT
+
+cat >"$direct_source/.diene/ci/direct-driver-action" <<'ACTION_DIRECT'
+#!/usr/bin/env bash
+set -euo pipefail
+phase=${1:-}
+[[ $# -eq 1 ]] || exit 127
+case "${DIENE_LANE:?}:$phase" in
+  ditto-build-local:setup | ditto-build-local:probe | ditto-build-local:cleanup | \
+  ditto-target-pull:setup | ditto-target-pull:probe | ditto-target-pull:cleanup | \
+  absol:setup | absol:probe | absol:cleanup | \
+  fleet-independence:setup | fleet-independence:probe | fleet-independence:cleanup | \
+  ditto-vendor:setup | ditto-vendor:probe | ditto-vendor:cleanup | ditto-vendor:absence) ;;
+  *) exit 127 ;;
+esac
+printf 'journey %s %s\n' "$DIENE_LANE" "$phase" >>"${FAKE_DRIVER_EVENT_LOG:?}"
+if [[ $DIENE_LANE == ditto-vendor ]]; then
+  [[ -n ${DIENE_VENDOR_CREDENTIAL:-} ]] || exit 65
+fi
+if [[ $DIENE_LANE == fleet-independence && $phase == probe ]]; then
+  fixture=.diene/ci/fixtures/bootstrap-fleet-independence-v1/manifest.yaml
+  jq -e '
+    .id == "bootstrap-fleet-independence-v1" and
+    .forbiddenResources == ["diene-fleet-controller","diene-fleet-agent"]
+  ' "$fixture" >/dev/null || exit 66
+  .diene/ci/fake-fleet-negative-observer --fixture bootstrap-fleet-independence-v1 \
+    --forbidden diene-fleet-controller --forbidden diene-fleet-agent
+fi
+ACTION_DIRECT
+
+cat >"$direct_source/.diene/ci/direct-broker" <<'BROKER_DIRECT'
+#!/usr/bin/env bash
+set -euo pipefail
+case ${1:-} in
+  issue)
+    [[ $# -eq 7 && ${2:-} == --action && ${3:-} == demo-vendor &&
+      ${4:-} == --output && ${6:-} == --evidence ]] || exit 127
+    printf 'broker issue\n' >>"${FAKE_DRIVER_EVENT_LOG:?}"
+    printf '%s\n' controlled-unit-credential >"${5:?}"
+    chmod 0600 "${5:?}"
+    jq -n '{outcome:"Pass",masked:true,issuedAfterReadiness:true}' >"${7:?}"
+    ;;
+  revoke)
+    [[ $# -eq 7 && ${2:-} == --action && ${3:-} == demo-vendor &&
+      ${4:-} == --credential-file && ${6:-} == --absence-proven && ${7:-} == true ]] || exit 127
+    printf 'broker revoke true\n' >>"${FAKE_DRIVER_EVENT_LOG:?}"
+    ;;
+  *) exit 127 ;;
+esac
+BROKER_DIRECT
+chmod 0755 "$direct_source/.diene/ci/fake-pls-direct" \
+  "$direct_source/.diene/ci/fake-pull-proof" \
+  "$direct_source/.diene/ci/fake-closure-verify" \
+  "$direct_source/.diene/ci/fake-fleet-negative-observer" \
+  "$direct_source/.diene/ci/direct-driver-action" "$direct_source/.diene/ci/direct-broker"
+for direct_executable in \
+  "$direct_source/.diene/ci/fake-pls-direct" \
+  "$direct_source/.diene/ci/fake-pull-proof" \
+  "$direct_source/.diene/ci/fake-closure-verify" \
+  "$direct_source/.diene/ci/fake-fleet-negative-observer" \
+  "$direct_source/.diene/ci/direct-driver-action" \
+  "$direct_source/.diene/ci/direct-broker"; do
+  bash -n "$direct_executable" || fail "generated direct executable is not valid Bash: $direct_executable"
+done
+ok 'every generated direct-driver executable is Bash syntax-valid'
+
+direct_fleet_fixture=$direct_source/.diene/ci/fixtures/bootstrap-fleet-independence-v1/manifest.yaml
+jq '.forbiddenResources = ["diene-fleet-controller","diene-fleet-agent"]' \
+  "$direct_fleet_fixture" >"$direct_fleet_fixture.tmp"
+mv "$direct_fleet_fixture.tmp" "$direct_fleet_fixture"
+direct_demo_digest="sha256:$(sha256sum "$direct_source/.diene/ci/fixtures/demo/manifest.yaml" | awk '{print $1}')"
+direct_fleet_digest="sha256:$(sha256sum "$direct_fleet_fixture" | awk '{print $1}')"
+direct_journeys=$direct_source/.diene/ci/journeys.v1.yaml
+jq --arg demo "$direct_demo_digest" --arg fleet "$direct_fleet_digest" '
+  .journeys |= map(
+    .fixturePack.digest = (if .fixturePack.id == "demo" then $demo else $fleet end) |
+    .setup = [".diene/ci/direct-driver-action","setup"] |
+    .probe = [".diene/ci/direct-driver-action","probe"] |
+    .cleanup = [".diene/ci/direct-driver-action","cleanup"])
+' "$direct_journeys" >"$direct_journeys.tmp"
+mv "$direct_journeys.tmp" "$direct_journeys"
+direct_vendors=$direct_source/.diene/ci/vendors.v1.yaml
+jq '
+  .actions |= map(
+    .setup = [".diene/ci/direct-driver-action","setup"] |
+    .probe = [".diene/ci/direct-driver-action","probe"] |
+    .cleanup = [".diene/ci/direct-driver-action","cleanup"] |
+    .absence = [".diene/ci/direct-driver-action","absence"])
+' "$direct_vendors" >"$direct_vendors.tmp"
+mv "$direct_vendors.tmp" "$direct_vendors"
+if rg -n '/bin/true' "$direct_journeys" "$direct_vendors" >"$scratch/direct-noop-actions"; then
+  sed -n '1,120p' "$scratch/direct-noop-actions" >&2
+  fail 'a direct-driver journey or vendor action still uses /bin/true'
+fi
+
+direct_fake_preflight() {
+  local output=
+  while (($#)); do
+    case $1 in
+      --output) output=${2:-}; shift 2 ;;
+      *) return 127 ;;
+    esac
+  done
+  [[ -n $output ]] || return 127
+  printf 'preflight %s\n' "$DIENE_LANE" >>"${FAKE_DRIVER_EVENT_LOG:?}"
+  jq -n --arg cluster "$DIENE_NSC_CLUSTER_ID" '
+    {outcome:"Pass",reasonCode:"NamespaceWolfiBuiltInK3sReady",clusterId:$cluster,
+     identitySource:"controlled-direct-driver-unit-input",os:{id:"wolfi",version:"rolling",uid:0},
+     k3s:{version:"v1.33.1+k3s1",kubernetesVersion:"v1.33.1+k3s1",nodeCount:1,
+       capacity:{cpu:"16",memory:"32Gi"}},
+     network:{podCidrs:["10.142.0.0/16","fd00:142::/64"],serviceCidrs:["10.143.0.0/16"],
+       ipv6Disabled:false,namespaceIngress:false,publicBinding:false},
+     storage:{defaultClass:"local-path"},
+     policyBackend:{mechanism:"iptables",backend:"nf_tables",version:"iptables v1.8.13 (nf_tables)"},
+     cacheAttached:false,platformStatus:"platform per-instance policy pending (support ask #4)"}
+  ' >"$output"
+}
+
+prepare_direct_driver_case() {
+  local run_id=${1:?run id required} lane=${2:?lane required}
+  local direct_runner=$scratch/direct-runner-$run_id
+  prepare_run "$run_id" "$lane" "$direct_runner" "$scratch/direct-unused-nsc-$run_id"
+  DIRECT_STATE=$scratch/direct-state-$run_id
+  DIRECT_EVENT_LOG=$DIRECT_STATE/events.log
+  DIRECT_TABLE_STATE=$DIRECT_STATE/policy-state
+  install -d -m 0700 "$DIRECT_STATE/receipts" "$DIRECT_STATE/runtime-search" \
+    "$DIRECT_STATE/tmp" "$DIRECT_TABLE_STATE"
+  cp "$DIENE_ARTIFACT_SUBJECT" "$DIRECT_STATE/artifact-subject.json"
+  chmod 0600 "$DIRECT_STATE/artifact-subject.json"
+  export DIENE_ARTIFACT_SUBJECT="$DIRECT_STATE/artifact-subject.json"
+  export RUNNER_TEMP="$DIRECT_STATE/tmp" DIENE_SCHEMA_DIR="$direct_source/schemas/ci"
+  export DIENE_NSC_CLUSTER_ID="direct-$lane-$run_id" DIENE_NSC_VERSION=v0.0.532
+  export DIENE_NSC_ARTIFACT_DIGEST=sha256:6666666666666666666666666666666666666666666666666666666666666666
+  export DIENE_NSC_BINARY_DIGEST="$fake_nsc_binary_digest"
+  DIENE_SOURCE_ARCHIVE_DIGEST="sha256:$(sha256sum "$source_archive" | awk '{print $1}')"
+  export DIENE_SOURCE_ARCHIVE_DIGEST
+  export DIENE_CACHE_ATTACHED=false DIENE_ORCHESTRATOR_VENUE=local
+  export DIENE_ORCHESTRATOR_LABEL=local-contract-test
+  export DIENE_ORCHESTRATOR_FALLBACK_REASON=''
+  export DIENE_EGRESS_CONTRACT="$DIRECT_STATE/egress-contract.json"
+  export DIENE_PLS_BIN=.diene/ci/fake-pls-direct
+  export DIENE_PULL_PROOF_BIN=.diene/ci/fake-pull-proof
+  export DIENE_CLOSURE_VERIFY_BIN=.diene/ci/fake-closure-verify
+  export DIENE_RUNTIME_SEARCH_ROOT="$DIRECT_STATE/runtime-search"
+  export DIENE_RECEIPT_DIR="$DIRECT_STATE/receipts"
+  export DIENE_KUBECTL_BIN="$policy_tools/kubectl"
+  export DIENE_IPTABLES_BIN="$policy_tools/iptables4"
+  export DIENE_IP6TABLES_BIN="$policy_tools/iptables6"
+  export DIENE_EGRESS_RESOLVER_BIN="$policy_tools/resolver"
+  export DIENE_IPV6_DISABLE_PATH="$ipv6_enabled_path"
+  export FAKE_DRIVER_EVENT_LOG="$DIRECT_EVENT_LOG"
+  export FAKE_TABLE_STATE="$DIRECT_TABLE_STATE" FAKE_TABLE_LOG="$DIRECT_STATE/tables.log"
+  export FAKE_KUBECTL_LOG="$DIRECT_STATE/kubectl.log"
+  export FAKE_L7_LOG="$DIRECT_STATE/l7.log" FAKE_PROBE_LOG="$DIRECT_STATE/probe.log"
+  export SSH_CONNECTION='192.0.2.10 4242 10.0.0.2 22'
+  : >"$DIRECT_EVENT_LOG"
+  : >"$FAKE_TABLE_LOG"
+  : >"$FAKE_KUBECTL_LOG"
+  : >"$FAKE_L7_LOG"
+  : >"$FAKE_PROBE_LOG"
+  if [[ $lane == ditto-vendor ]]; then
+    export DIENE_VENDOR_CREDENTIAL_BROKER_BIN=.diene/ci/direct-broker
+  fi
+  (
+    cd -- "$direct_source"
+    # shellcheck source=/dev/null
+    source ./scripts/ci/environment-lib.sh
+    diene_prepare_egress_contract "$DIENE_EGRESS_CONTRACT"
+  )
+  DIRECT_RECEIPT_ID=$(
+    cd -- "$direct_source"
+    # shellcheck source=/dev/null
+    source ./scripts/ci/environment-lib.sh
+    diene_receipt_id
+  )
+  export DIRECT_RECEIPT_ID
+  local create_digest armed_receipt
+  create_digest="sha256:$(printf '%s' "$DIENE_NSC_CLUSTER_ID|controlled-create" | sha256sum | awk '{print $1}')"
+  armed_receipt=$(
+    cd -- "$direct_source"
+    # shellcheck source=/dev/null
+    source ./scripts/ci/environment-lib.sh
+    diene_arm_receipt "$DIRECT_RECEIPT_ID" "$DIENE_NSC_CLUSTER_ID" "$create_digest" 0 false \
+      "$DIENE_NSC_VERSION" "$DIENE_NSC_ARTIFACT_DIGEST" "$DIENE_NSC_BINARY_DIGEST"
+  )
+  mv "$armed_receipt" "$DIRECT_STATE/receipts/exact.json"
+  export DIRECT_STATE DIRECT_EVENT_LOG DIRECT_TABLE_STATE
+}
+
+run_direct_core_case() (
+  cd -- "$direct_source"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-k3d-run.sh
+  # The sourced driver calls both overrides indirectly.
+  # shellcheck disable=SC2329
+  diene_load_remote_inputs() {
+    [[ ${1:-} == "$DIRECT_STATE" ]] || diene_die InputContractInvalid 'unit state mismatch'
+  }
+  # shellcheck disable=SC2329
+  diene_core_driver_preflight() {
+    direct_fake_preflight "$@"
+  }
+  driver_core "$DIRECT_STATE"
+)
+
+run_direct_vendor_case() (
+  cd -- "$direct_source"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-vendor-run.sh
+  # The sourced driver calls both overrides indirectly.
+  # shellcheck disable=SC2329
+  diene_load_remote_inputs() {
+    [[ ${1:-} == "$DIRECT_STATE" ]] || diene_die InputContractInvalid 'unit state mismatch'
+  }
+  # shellcheck disable=SC2329
+  diene_vendor_driver_preflight() {
+    direct_fake_preflight "$@"
+  }
+  vendor_driver_core "$DIRECT_STATE"
+)
+
+assert_direct_vendor_main_no_return_trap() (
+  cd -- "$direct_source"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-vendor-run.sh
+  environment_vendor_main --validate-inputs
+  [[ -z $(trap -p RETURN) ]]
+)
+
+assert_direct_success() {
+  local lane=${1:?lane required} kind=${2:-core}
+  local report=$DIRECT_STATE/evidence/core-report.driver.json
+  local schema=diene-environment-report-v1.schema.json
+  local completed_reason=DriverCompleted
+  [[ $kind != vendor ]] || {
+    report=$DIRECT_STATE/evidence/vendor-report.driver.json
+    schema=diene-vendor-report-v1.schema.json
+    completed_reason=VendorCompleted
+  }
+  jq -e --arg reason "$completed_reason" \
+    '.outcome == "Pass" and .reasonCode == $reason and .exitCode == 0' \
+    "$DIRECT_STATE/evidence/driver-status.json" >/dev/null ||
+    fail "$lane direct driver did not package a green status"
+  local finalized_report=$DIRECT_STATE/final-$kind-report.json
+  (
+    cd -- "$direct_source"
+    DIENE_EVIDENCE_STAGING="$DIRECT_STATE/evidence/staging" \
+      DIENE_PROOF_BUNDLE_DIR="$DIRECT_STATE/evidence" \
+      ./scripts/ci/environment-report.sh --kind "$kind" --input "$report" \
+      --output "$finalized_report"
+  ) || fail "$lane direct driver report did not pass real leakage finalisation"
+  report=$finalized_report
+  local schema_log=$DIRECT_STATE/report-schema-validation.log
+  if ! "${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}" \
+    --base-uri "file://$direct_source/schemas/ci/" \
+    --schemafile "$direct_source/schemas/ci/$schema" "$report" >"$schema_log" 2>&1; then
+    sed -n '1,240p' "$report" >&2
+    sed -n '1,240p' "$schema_log" >&2
+    fail "$lane direct driver report is not schema-valid"
+  fi
+  jq -e '.namespace.policy.applied == true and .namespace.policy.hostileProbes == "Pass" and
+    .cleanup == {outcome:"Pass",reasonCode:"ExactReceiptDestroyed",debt:[]}' \
+    "$DIRECT_STATE/evidence/ci-receipt.json" >/dev/null ||
+    fail "$lane direct driver did not bind policy and exact cleanup into its receipt"
+  assert_policy_state_absent "$DIRECT_TABLE_STATE" "$lane-direct-driver"
+}
+
+assert_direct_events() {
+  local lane=${1:?lane required} expected=${2:?expected events required}
+  [[ $(<"$DIRECT_EVENT_LOG") == "$expected" ]] || {
+    sed -n '1,200p' "$DIRECT_EVENT_LOG" >&2
+    fail "$lane direct driver dispatch/order changed"
+  }
+}
+
+# These are controlled unit inputs to the real driver consumers. They do not
+# claim Garden product readiness or production endpoint/resource coverage.
+prepare_direct_driver_case 7201 ditto-build-local
+run_direct_core_case >"$scratch/direct-build-local.out" 2>"$scratch/direct-build-local.err" || {
+  sed -n '1,240p' "$scratch/direct-build-local.err" >&2
+  sed -n '1,240p' "$DIRECT_EVENT_LOG" >&2
+  sed -n '1,240p' "$DIRECT_STATE/evidence/staging/stderr" >&2
+  fail 'the real build-local driver_core unit dispatch failed'
+}
+assert_direct_success ditto-build-local
+expected_direct_events=$'preflight ditto-build-local\n'
+expected_direct_events+="pls env up --profile ditto --build-mode build-local --artifact $ARTIFACT_DIGEST"$'\n'
+expected_direct_events+=$'pls env doctor --profile ditto --json\n'
+expected_direct_events+=$'journey ditto-build-local setup\njourney ditto-build-local probe\njourney ditto-build-local cleanup\n'
+expected_direct_events+='pls env down --profile ditto'
+assert_direct_events ditto-build-local "$expected_direct_events"
+
+prepare_direct_driver_case 7202 ditto-target-pull
+run_direct_core_case >"$scratch/direct-target-pull.out" 2>"$scratch/direct-target-pull.err" || {
+  sed -n '1,240p' "$scratch/direct-target-pull.err" >&2
+  fail 'the real target-pull driver_core unit dispatch failed'
+}
+assert_direct_success ditto-target-pull
+expected_direct_events=$'preflight ditto-target-pull\n'
+expected_direct_events+="pls env up --profile ditto --build-mode target-pull --artifact $ARTIFACT_DIGEST"$'\n'
+expected_direct_events+=$'pls env doctor --profile ditto --json\n'
+expected_direct_events+=$'pull real-pull\npull evict-repull\npull sibling-denial\npull pull-secret-ownership\npull credential-removal\n'
+expected_direct_events+=$'journey ditto-target-pull setup\njourney ditto-target-pull probe\njourney ditto-target-pull cleanup\n'
+expected_direct_events+='pls env down --profile ditto'
+assert_direct_events ditto-target-pull "$expected_direct_events"
+
+prepare_direct_driver_case 7203 absol
+run_direct_core_case >"$scratch/direct-absol.out" 2>"$scratch/direct-absol.err" || {
+  sed -n '1,240p' "$scratch/direct-absol.err" >&2
+  fail 'the real Absol driver_core unit dispatch failed'
+}
+assert_direct_success absol
+expected_direct_events=$'preflight absol\nclosure verify\n'
+expected_direct_events+="pls closure import oci://ghcr.io/atomicloud/example/closure/$SOURCE_SHA"$'\n'
+expected_direct_events+=$'pls closure preflight --denied-network\nclosure exact-set\n'
+expected_direct_events+="pls env up --profile absol --build-mode build-local --artifact $ARTIFACT_DIGEST"$'\n'
+expected_direct_events+=$'pls env doctor --profile absol --json\n'
+expected_direct_events+=$'journey absol setup\njourney absol probe\njourney absol cleanup\n'
+expected_direct_events+='pls env down --profile absol'
+assert_direct_events absol "$expected_direct_events"
+
+prepare_direct_driver_case 7204 fleet-independence
+run_direct_core_case >"$scratch/direct-fleet.out" 2>"$scratch/direct-fleet.err" || {
+  sed -n '1,240p' "$scratch/direct-fleet.err" >&2
+  fail 'the real fleet-independence driver_core unit dispatch failed'
+}
+assert_direct_success fleet-independence
+if ! jq -e '
+  .coverage == [{id:"fleet-endpoint-resource-negative-probe",outcome:"Unavailable",
+    reasonCode:"FleetEndpointResourceNegativeProbeContractUnavailable",required:false}] and
+  (.journeys | length) == 1 and
+  (.journeys[0] as $journey |
+    ($journey | keys | sort) ==
+      ["durationSeconds","fixturePackDigest","id","outcome","reasonCode","required"] and
+    $journey.id == "fleet-demo" and $journey.outcome == "Pass" and
+    $journey.reasonCode == "AssertionsSatisfied" and $journey.required == true and
+    ($journey.durationSeconds | type == "number" and . >= 0) and
+    ($journey.fixturePackDigest | test("^sha256:[0-9a-f]{64}$")))
+' "$DIRECT_STATE/final-core-report.json" >/dev/null; then
+  sed -n '1,240p' "$DIRECT_STATE/final-core-report.json" >&2
+  fail 'fleet direct unit dispatch claimed production proof or lost the explicit Unavailable row'
+fi
+expected_direct_events=$'preflight fleet-independence\n'
+expected_direct_events+="pls env up --profile ditto --build-mode build-local --artifact $ARTIFACT_DIGEST"$'\n'
+expected_direct_events+=$'pls env doctor --profile ditto --json\n'
+expected_direct_events+=$'journey fleet-independence setup\njourney fleet-independence probe\n'
+expected_direct_events+=$'fleet-negative-observed bootstrap-fleet-independence-v1 diene-fleet-controller diene-fleet-agent\n'
+expected_direct_events+=$'journey fleet-independence cleanup\n'
+expected_direct_events+='pls env down --profile ditto'
+assert_direct_events fleet-independence "$expected_direct_events"
+
+prepare_direct_driver_case 7205 ditto-vendor
+assert_direct_vendor_main_no_return_trap ||
+  fail 'sourced environment_vendor_main leaked a RETURN cleanup trap'
+run_direct_vendor_case >"$scratch/direct-vendor.out" 2>"$scratch/direct-vendor.err" || {
+  sed -n '1,240p' "$scratch/direct-vendor.err" >&2
+  fail 'the real vendor_driver_core unit dispatch failed'
+}
+assert_direct_success ditto-vendor vendor
+expected_direct_events=$'preflight ditto-vendor\n'
+expected_direct_events+="pls env up --profile ditto --build-mode build-local --artifact $ARTIFACT_DIGEST"$'\n'
+expected_direct_events+=$'pls env doctor --profile ditto --json\nbroker issue\n'
+expected_direct_events+=$'journey ditto-vendor setup\njourney ditto-vendor probe\n'
+expected_direct_events+=$'journey ditto-vendor cleanup\njourney ditto-vendor absence\nbroker revoke true\n'
+expected_direct_events+='pls env down --profile ditto'
+assert_direct_events ditto-vendor "$expected_direct_events"
+ok 'real sourced drivers dispatch build-local, five pull proofs, Absol closure order, fleet observable, and vendor cleanup without product-readiness claims'
 
 printf '== report namespaces and additive schema compatibility ==\n'
 
@@ -1796,6 +3309,41 @@ schema_dir=$work/schemas/ci
   --schemafile "$schema_dir/diene-runtime-consumption-v1.schema.json" "$legacy_runtime" >/dev/null ||
   fail 'the Garden consumption view required CI-owned Namespace fields'
 ok 'legacy core/vendor reports and the Garden-owned runtime view remain backward compatible'
+
+cached_report_case=$scratch/cached-ditto-report
+cached_report_input=$cached_report_case/input.json
+cached_report_output=$cached_report_case/output.json
+install -d -m 0700 "$cached_report_case/staging" "$cached_report_case/proof" \
+  "$cached_report_case/runner"
+for required_surface in stdout stderr argv environ; do
+  : >"$cached_report_case/staging/$required_surface"
+done
+: >"$cached_report_case/github-output"
+: >"$cached_report_case/github-env"
+: >"$cached_report_case/summary"
+jq '
+  .namespaceLifecycle.cacheAttached = true |
+  .namespaceLifecycle.orchestratorLabel = "nscloud-ubuntu-26.04-amd64-16x32-with-cache"
+' "$happy_core_report" >"$cached_report_input"
+env DIENE_ORCHESTRATOR_LABEL=nscloud-ubuntu-26.04-amd64-16x32-with-cache \
+  DIENE_LEAK_CANARY=cached-ditto-report-canary \
+  DIENE_EVIDENCE_STAGING="$cached_report_case/staging" \
+  DIENE_PROOF_BUNDLE_DIR="$cached_report_case/proof" DIENE_SCHEMA_DIR="$schema_dir" \
+  RUNNER_TEMP="$cached_report_case/runner" GITHUB_OUTPUT="$cached_report_case/github-output" \
+  GITHUB_ENV="$cached_report_case/github-env" GITHUB_STEP_SUMMARY="$cached_report_case/summary" \
+  "$work/scripts/ci/environment-report.sh" --kind core --input "$cached_report_input" \
+  --output "$cached_report_output" >"$cached_report_case/stdout" 2>"$cached_report_case/stderr" || {
+  sed -n '1,160p' "$cached_report_case/stderr" >&2
+  fail 'the real report finalizer rejected the cached Ditto 26.04 label'
+}
+jq -e '
+  .namespaceLifecycle.cacheAttached == true and
+  .namespaceLifecycle.orchestratorLabel ==
+    "nscloud-ubuntu-26.04-amd64-16x32-with-cache" and
+  .evidence.leakageScan.outcome == "Pass"
+' "$cached_report_output" >/dev/null ||
+  fail 'the finalized cached Ditto report lost its cache/label/leakage facts'
+ok 'a cached Ditto 26.04 report passes the real closed report finalizer and schema'
 
 printf '== every leakage encoding is suppressed on every evidence surface ==\n'
 
