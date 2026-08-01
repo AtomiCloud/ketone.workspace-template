@@ -9,7 +9,11 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 template_root=$(cd -- "$script_dir/../.." && pwd)
 scratch=$(mktemp -d)
-trap 'rm -r -- "$scratch"' EXIT
+cleanup_scratch() {
+  chmod -R u+rwX "$scratch" 2>/dev/null || true
+  rm -r -- "$scratch"
+}
+trap cleanup_scratch EXIT
 
 passed=0
 fail() {
@@ -64,9 +68,11 @@ WORKFLOW_REF="AtomiCloud/example/.github/workflows/environment-k3d.yaml@$SOURCE_
 
 work=$scratch/work
 install -d -m 0700 "$work/scripts/ci" "$work/schemas" \
+  "$work/.github/workflows" \
   "$work/.diene/ci/fixtures/demo" "$work/.diene/ci/fixtures/bootstrap-fleet-independence-v1"
 cp -R "$template_root/schemas/ci" "$work/schemas/"
 cp "$script_dir"/environment-*.sh "$work/scripts/ci/"
+cp "$template_root/.github/workflows/⚡reusable-environment-k3d.yaml" "$work/.github/workflows/"
 chmod 0755 "$work/scripts/ci"/*.sh
 
 cat >"$work/.diene/ci/artifact-producer.sh" <<'SH'
@@ -208,10 +214,30 @@ JSON
 
 source_archive=$scratch/source.tar
 make_source_archive() {
-  tar -cf "$source_archive" -C "$work" scripts schemas .diene
+  tar -cf "$source_archive" -C "$work" scripts schemas .diene .github
   chmod 0600 "$source_archive"
 }
 make_source_archive
+
+hostile_archive_dir=$scratch/hostile-source-archives
+hostile_archive_stage=$scratch/hostile-source-stage
+install -d -m 0700 "$hostile_archive_dir" "$hostile_archive_stage"
+printf '%s\n' hostile >"$hostile_archive_stage/payload"
+ln -s payload "$hostile_archive_stage/symlink"
+ln "$hostile_archive_stage/payload" "$hostile_archive_stage/hardlink"
+mkfifo "$hostile_archive_stage/fifo"
+for hostile_kind in traversal absolute symlink hardlink fifo device; do
+  cp "$source_archive" "$hostile_archive_dir/$hostile_kind.tar"
+done
+tar -rf "$hostile_archive_dir/traversal.tar" --transform='s|^payload$|../escape|' \
+  -C "$hostile_archive_stage" payload 2>/dev/null
+tar -rf "$hostile_archive_dir/absolute.tar" --transform='s|^payload$|/absolute|' \
+  -C "$hostile_archive_stage" payload 2>/dev/null
+tar -rf "$hostile_archive_dir/symlink.tar" -C "$hostile_archive_stage" symlink
+tar -rf "$hostile_archive_dir/hardlink.tar" -C "$hostile_archive_stage" payload hardlink
+tar -rf "$hostile_archive_dir/fifo.tar" -C "$hostile_archive_stage" fifo
+tar -rf "$hostile_archive_dir/device.tar" -P --transform='s|^/dev/null$|device|' /dev/null
+chmod 0600 "$hostile_archive_dir"/*.tar
 
 write_subject() {
   local target=${1:?subject target required}
@@ -243,8 +269,8 @@ set -euo pipefail
 state=${1:?guest state required}
 cluster_id=${2:?cluster id required}
 scenario=${FAKE_NSC_SCENARIO:-happy}
-install -d -m 0700 "$state/source" "$state/evidence" "$state/out"
-tar -xf "$state/source.tar" -C "$state/source"
+[[ -d $state/source ]] || exit 64
+install -d -m 0700 "$state/evidence" "$state/out"
 inputs=$state/inputs.json
 receipt=$state/receipt.json
 evidence=$state/evidence
@@ -350,6 +376,9 @@ if [[ $lane == ditto-vendor ]]; then
     --arg workflow "$(jq -r '.owner.workflowRef' "$inputs")" --arg action "$(jq -r '.selectors.actionId' "$inputs")" \
     --arg receipt "$receipt_id" --arg allocation "$allocation" --arg generation "$generation" \
     --arg cluster "$cluster_id" --arg garden "$(jq -r '.gardenLockDigest' "$inputs")" \
+    --arg nscVersion "$(jq -r '.nscVersion' "$inputs")" \
+    --arg nscArtifactDigest "$(jq -r '.nscArtifactDigest' "$inputs")" \
+    --arg nscBinaryDigest "$(jq -r '.nscBinaryDigest' "$inputs")" \
     --arg vendorDigest "$vendor_digest" --arg vendorOutcome "$vendor_outcome" \
     --arg vendorReason "$vendor_reason" --arg reportOutcome "$report_outcome" --arg reportReason "$report_reason" \
     --argjson required "$required" --slurpfile probes "$evidence/hostile-probes.json" \
@@ -361,7 +390,8 @@ if [[ $lane == ditto-vendor ]]; then
      instance:{allocationKey:$allocation,generationKey:$generation,substrateName:("diene-"+$allocation),
        clusterId:$cluster,osId:"wolfi",osVersion:"rolling",k3sVersion:"v1.33.1+k3s1",
        kubernetesVersion:"v1.33.1+k3s1",nodeCount:1,capacity:{cpu:"16",memory:"32Gi"}},
-     tooling:{gardenLockDigest:$garden,journeyManifestDigest:$vendorDigest,nscVersion:"v0.0.532",
+     tooling:{gardenLockDigest:$garden,journeyManifestDigest:$vendorDigest,nscVersion:$nscVersion,
+       nscArtifactDigest:$nscArtifactDigest,nscBinaryDigest:$nscBinaryDigest,
        sourceArchiveDigest:"sha256:4444444444444444444444444444444444444444444444444444444444444444",
        artifactSubjectDigest:"sha256:5555555555555555555555555555555555555555555555555555555555555555"},
      vendorOutcome:{id:$action,outcome:$vendorOutcome,reasonCode:$vendorReason,required:$required,durationSeconds:1},
@@ -386,6 +416,9 @@ else
     --arg imageRef "$(jq -r '.artifact.imageRef' "$state/artifact-subject.json")" \
     --arg receipt "$receipt_id" --arg allocation "$allocation" --arg generation "$generation" \
     --arg cluster "$cluster_id" --arg garden "$(jq -r '.gardenLockDigest' "$inputs")" \
+    --arg nscVersion "$(jq -r '.nscVersion' "$inputs")" \
+    --arg nscArtifactDigest "$(jq -r '.nscArtifactDigest' "$inputs")" \
+    --arg nscBinaryDigest "$(jq -r '.nscBinaryDigest' "$inputs")" \
     --arg journey "$journey_digest" --arg profileId "$profile_id" --arg reportOutcome "$report_outcome" \
     --arg reportReason "$report_reason" --slurpfile readiness "$evidence/readiness.json" \
     --slurpfile probes "$evidence/hostile-probes.json" --slurpfile chain "$evidence/checkpoint-chain.json" '
@@ -395,7 +428,8 @@ else
      instance:{allocationKey:$allocation,generationKey:$generation,substrateName:("diene-"+$allocation),
        clusterId:$cluster,osId:"wolfi",osVersion:"rolling",k3sVersion:"v1.33.1+k3s1",
        kubernetesVersion:"v1.33.1+k3s1",nodeCount:1,capacity:{cpu:"16",memory:"32Gi"}},receiptId:$receipt,
-     tooling:{gardenLockDigest:$garden,journeyManifestDigest:$journey,nscVersion:"v0.0.532",
+     tooling:{gardenLockDigest:$garden,journeyManifestDigest:$journey,nscVersion:$nscVersion,
+       nscArtifactDigest:$nscArtifactDigest,nscBinaryDigest:$nscBinaryDigest,
        sourceArchiveDigest:"sha256:4444444444444444444444444444444444444444444444444444444444444444",
        artifactSubjectDigest:"sha256:5555555555555555555555555555555555555555555555555555555555555555"},
      readiness:$readiness[0],journeys:[],coverage:[],
@@ -416,11 +450,20 @@ if [[ $scenario == receipt-mismatch ]]; then
 else
   cp "$receipt" "$evidence/ci-receipt.json"
 fi
+if [[ $scenario == proof-fifo ]]; then
+  mkfifo "$evidence/hostile-fifo"
+elif [[ $scenario == proof-unreadable ]]; then
+  printf '%s\n' unreadable >"$evidence/hostile-unreadable"
+fi
 jq -n --arg outcome "$([[ $driver_exit == 0 ]] && printf Pass || printf Fail)" \
   --arg reason "$([[ $driver_exit == 0 ]] && printf DriverCompleted || printf JourneyFailed)" \
   --argjson exitCode "$driver_exit" '{outcome:$outcome,reasonCode:$reason,exitCode:$exitCode}' \
   >"$evidence/driver-status.json"
-tar -cf "$state/out/proof.tar" -C "$state" evidence
+if [[ $scenario == proof-unreadable ]]; then
+  tar --mode=000 -cf "$state/out/proof.tar" -C "$state" evidence
+else
+  tar -cf "$state/out/proof.tar" -C "$state" evidence
+fi
 (cd "$state/out" && sha256sum proof.tar >proof.sha256)
 GUEST
 chmod 0755 "$fake_guest"
@@ -440,7 +483,11 @@ shift || true
 case $command in
   version)
     (($# == 0)) || exit 127
-    printf 'version v0.0.532\n'
+    case $scenario in
+      nsc-older) printf 'version v0.0.531\n' ;;
+      nsc-newer) printf 'version v0.0.533\n' ;;
+      *) printf 'version v0.0.532\n' ;;
+    esac
     ;;
   create)
     ephemeral=false
@@ -508,7 +555,16 @@ case $command in
     [[ $flag == -T && -n $remote_command && -f $root/instances/$id/live ]] || exit 66
     [[ $scenario != ssh-fail ]] || exit 42
     [[ $scenario != ssh-delay ]] || sleep 3
-    "${FAKE_GUEST_BIN:?}" "$root/instances/$id/fs/run/diene-ci" "$id"
+    state="$root/instances/$id/fs/run/diene-ci"
+    [[ $remote_command == *'sha256sum -c archive-validator.sha256'* &&
+      $remote_command == *'./archive-validator.sh source.tar source'* ]] || exit 67
+    if [[ $scenario == remote-source-special ]]; then
+      cp "${FAKE_HOSTILE_SOURCE_ARCHIVE:?}" "$state/source.tar"
+    fi
+    (cd "$state" && sha256sum -c archive-validator.sha256 >/dev/null)
+    chmod 0500 "$state/archive-validator.sh"
+    "$state/archive-validator.sh" "$state/source.tar" "$state/source"
+    "${FAKE_GUEST_BIN:?}" "$state" "$id"
     ;;
   destroy)
     flag=${1:-}; id=${2:-}; (($# == 2)) || exit 127
@@ -533,6 +589,22 @@ esac
 NSC
 chmod 0755 "$fake_nsc"
 
+fake_nsc_identity=$scratch/nsc-identity.json
+fake_nsc_binary_digest="sha256:$(sha256sum "$fake_nsc" | awk '{print $1}')"
+jq -n --arg binary "$fake_nsc_binary_digest" '
+  {version:"v0.0.532",
+   artifactDigest:"sha256:6666666666666666666666666666666666666666666666666666666666666666",
+   binaryDigest:$binary}
+' >"$fake_nsc_identity"
+chmod 0600 "$fake_nsc_identity"
+
+fake_grep_error=$scratch/grep-error
+cat >"$fake_grep_error" <<'GREP'
+#!/bin/sh
+exit 2
+GREP
+chmod 0755 "$fake_grep_error"
+
 prepare_run() {
   local run_id=${1:?run id required}
   local lane=${2:-ditto-build-local}
@@ -552,6 +624,7 @@ prepare_run() {
   export DIENE_ADMITTED_K3S_VERSION=v1.33.1+k3s1 DIENE_K3S_SERVICE_CIDR=10.143.0.0/16
   export DIENE_ORCHESTRATOR_VENUE=local DIENE_ORCHESTRATOR_LABEL=local-contract-test
   export DIENE_ORCHESTRATOR_FALLBACK_REASON='' DIENE_NSC_BIN=$fake_nsc
+  export DIENE_NSC_IDENTITY_FILE=$fake_nsc_identity
   export FAKE_NSC_ROOT=$nsc_root FAKE_NSC_LOG=$nsc_root/log FAKE_GUEST_BIN=$fake_guest
   export TEMPLATE_SCRIPT_DIR=$work/scripts/ci RUNNER_TEMP=$runner DIENE_SCHEMA_DIR=$work/schemas/ci
   export DIENE_CORE_REPORT=$runner/diene-environment-report.v1.json
@@ -569,6 +642,8 @@ prepare_run() {
   unset DIENE_PRE_SIT_NEGATIVE_CANARY DIENE_PRE_SIT_FIXTURE_ROOT
   unset FAKE_L7_COMPLETE FAKE_PROBE_FAIL_SCOPE FAKE_L7_LOG FAKE_PROBE_LOG FAKE_BROKER_LOG
   unset FAKE_TABLE_FAIL_REGEX FAKE_RESOLVER_IPV4 FAKE_BROKER_FAIL_COMMAND
+  unset FAKE_HOSTILE_SOURCE_ARCHIVE
+  unset DIENE_GREP_BIN
   if [[ $lane == ditto-target-pull ]]; then
     export DIENE_ARTIFACT_PROVENANCE_REF="oci://ghcr.io/atomicloud/example/provenance/$SOURCE_SHA"
     export DIENE_ARTIFACT_ATTESTATION_DIGEST=$ATTESTATION_DIGEST
@@ -655,6 +730,16 @@ if rg -n 'runner-pin|host-policy|leaseId|DigitalOcean|JIT' --glob '!test-environ
   fail 'the active runtime surface still depends on shelved runner apparatus'
 fi
 ok 'active code contains no self-hosted, DO, nested-k3d, ingress, cache, or export path'
+
+grep -Fq 'version = "0.0.532"' "$template_root/nix/packages.nix" ||
+  fail 'the declared CI shell does not pin nsc v0.0.532'
+grep -Fq 'sha256-suxxRscqokyVkwE1JZ3Wuool/cTa4vySNGKGrHG+oPw=' \
+  "$template_root/nix/packages.nix" || fail 'the measured x86_64 nsc release hash is absent'
+# The Nix interpolation is intentionally matched literally.
+# shellcheck disable=SC2016
+grep -Fq 'DIENE_NSC_BIN = "${packages.nsc}/bin/nsc"' "$template_root/nix/shells.nix" ||
+  fail 'the CI shell does not select the immutable nsc store executable'
+ok 'the declared shell selects the hash-pinned measured Namespace CLI'
 
 for input in lane repository_id repository_key source_sha garden_lock_digest artifact_digest \
   artifact_provenance_ref artifact_attestation_digest journey_manifest vendor_manifest action_id \
@@ -765,6 +850,59 @@ expect_precreate_refusal SchemaValidationFailed ./scripts/ci/environment-k3d-run
 cp "$vendor_backup" "$work/.diene/ci/vendors.v1.yaml"
 ok 'trust, selectors, closure, vendor, producer, and fixture defects all stop before create'
 
+printf '== exact Namespace CLI identity refuses version drift before create ==\n'
+
+prepare_run 3050
+exact_nsc_identity=$(
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_nsc_identity
+)
+jq -e --arg binary "$fake_nsc_binary_digest" '
+  .version == "v0.0.532" and
+  .artifactDigest == "sha256:6666666666666666666666666666666666666666666666666666666666666666" and
+  .binaryDigest == $binary
+' <<<"$exact_nsc_identity" >/dev/null || fail 'the exact fake nsc identity did not validate as an object'
+ok 'exact v0.0.532 version, release artifact, and executable digest are accepted'
+
+for nsc_drift in older newer; do
+  prepare_run "$([[ $nsc_drift == older ]] && printf 3051 || printf 3052)"
+  expect_precreate_refusal NamespaceLifecycleUnavailable env \
+    FAKE_NSC_SCENARIO="nsc-$nsc_drift" ./scripts/ci/environment-k3d-run.sh orchestrate
+done
+bad_nsc_identity=$scratch/bad-nsc-identity.json
+jq '.binaryDigest = "sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
+  "$fake_nsc_identity" >"$bad_nsc_identity"
+prepare_run 3053
+expect_precreate_refusal NamespaceLifecycleUnavailable env \
+  DIENE_NSC_IDENTITY_FILE="$bad_nsc_identity" ./scripts/ci/environment-k3d-run.sh orchestrate
+ok 'older, newer, and executable-identity drift all refuse before nsc create'
+
+printf '== hostile source archives refuse before create ==\n'
+
+unicode_listing=$scratch/canonical-unicode.list
+LC_ALL=C tar --list --quoting-style=escape --file "$source_archive" >"$unicode_listing"
+grep -F -- '\342\232\241reusable-environment-k3d.yaml' "$unicode_listing" >/dev/null ||
+  fail 'the source fixture did not exercise the canonical UTF-8 workflow name'
+(
+  # shellcheck source=/dev/null
+  source "$work/scripts/ci/environment-lib.sh"
+  diene_require_archive_members "$source_archive" \
+    scripts/ci/environment-k3d-run.sh schemas/ci/diene-environment-report-v1.schema.json
+) || fail 'a canonical archive containing the UTF-8 workflow name was rejected'
+ok 'canonical UTF-8 git-archive names remain accepted'
+
+hostile_run=3060
+for hostile_kind in traversal absolute symlink hardlink fifo device; do
+  prepare_run "$hostile_run"
+  expect_precreate_refusal UntrustedSubject env \
+    DIENE_SOURCE_ARCHIVE="$hostile_archive_dir/$hostile_kind.tar" \
+    ./scripts/ci/environment-k3d-run.sh orchestrate
+  hostile_run=$((hostile_run + 1))
+done
+ok 'traversal, absolute, symlink, hardlink, FIFO, and device source archives all refuse before create'
+
 printf '== exact measured Namespace happy path ==\n'
 
 run_happy_lane() {
@@ -803,7 +941,7 @@ happy_log=$LAST_LOG
 
 grep -Eq '^create --ephemeral --duration 2h --wait_kube_system .*--output_json_to .*--output json .*--purpose .*--unique_tag .*--label .*--label .*--label ' \
   "$happy_log" || fail 'fake nsc did not observe the exact stable create surface'
-[[ $(grep -Ec '^instance upload ' "$happy_log") == 5 ]] || fail 'immutable upload count is not exactly five'
+[[ $(grep -Ec '^instance upload ' "$happy_log") == 7 ]] || fail 'immutable upload count is not exactly seven'
 [[ $(grep -Ec '^instance download ' "$happy_log") == 2 ]] || fail 'fixed proof download count is not exactly two'
 grep -Eq "^ssh ${happy_cluster} -T " "$happy_log" || fail 'driver did not use exact-id noninteractive ssh'
 [[ $(grep -Ec "^destroy --force ${happy_cluster} " "$happy_log") == 1 ]] ||
@@ -814,7 +952,34 @@ if grep -Eq '^destroy .*diene_|^destroy .*\*|^destroy .*--label|^(scp|cp|ingress
 fi
 [[ $(FAKE_NSC_SCENARIO=happy "$fake_nsc" list --all -o json) == null ]] ||
   fail 'the measured empty-list null result was not normalized as exact absence'
+jq -e --arg binary "$fake_nsc_binary_digest" '
+  .tooling.nscVersion == "v0.0.532" and
+  .tooling.nscArtifactDigest ==
+    "sha256:6666666666666666666666666666666666666666666666666666666666666666" and
+  .tooling.nscBinaryDigest == $binary
+' "$happy_core_report" >/dev/null || fail 'the final report lost exact immutable nsc identity evidence'
+tar -xOf "$happy_core_bundle" ci-receipt.json >"$scratch/happy-receipt.json"
+jq -e --arg binary "$fake_nsc_binary_digest" '
+  .tooling.nscVersion == "v0.0.532" and
+  .tooling.nscArtifactDigest ==
+    "sha256:6666666666666666666666666666666666666666666666666666666666666666" and
+  .tooling.nscBinaryDigest == $binary
+' "$scratch/happy-receipt.json" >/dev/null || fail 'the exact receipt lost immutable nsc identity evidence'
 ok 'create/cid agreement/upload/ssh/download/exact destroy/list absence use measured nsc syntax'
+
+uploaded_validator="$FAKE_NSC_ROOT/instances/$happy_cluster/fs/run/diene-ci/archive-validator.sh"
+[[ -x $uploaded_validator ]] || fail 'the immutable remote archive validator was not uploaded'
+for hostile_kind in traversal absolute symlink hardlink fifo device; do
+  remote_extract=$scratch/remote-hostile-$hostile_kind
+  if "$uploaded_validator" "$hostile_archive_dir/$hostile_kind.tar" "$remote_extract" \
+    >"$remote_extract.out" 2>"$remote_extract.err"; then
+    fail "the uploaded validator accepted a $hostile_kind source archive"
+  fi
+  assert_contains "$remote_extract.err" UntrustedSubject
+  [[ ! -e $remote_extract && ! -L $remote_extract ]] ||
+    fail "the uploaded validator extracted the $hostile_kind source archive before refusal"
+done
+ok 'the locally executed remote validator rejects every unsafe name and member type before extraction'
 
 nsc_lines_before=$(wc -l <"$happy_log")
 (cd -- "$work" && FAKE_NSC_SCENARIO=happy ./scripts/ci/environment-k3d-run.sh lifecycle "$happy_core_bundle") \
@@ -860,6 +1025,10 @@ printf '== lifecycle phase failures stay red and exact ==\n'
 expect_lifecycle_failure() {
   local run_id=${1:?run id required} scenario=${2:?scenario required} reason=${3:?reason required}
   prepare_run "$run_id"
+  case $scenario in
+    remote-source-special) export FAKE_HOSTILE_SOURCE_ARCHIVE="$hostile_archive_dir/fifo.tar" ;;
+    proof-fifo | proof-unreadable) printf '%s\n' stale-proof-sentinel >"$DIENE_PROOF_BUNDLE" ;;
+  esac
   local nsc_root=$FAKE_NSC_ROOT rc
   if run_orchestrator "$scenario" >"$scratch/failure-$scenario.out" 2>"$scratch/failure-$scenario.err"; then
     fail "$scenario unexpectedly passed"
@@ -876,6 +1045,7 @@ expect_lifecycle_failure() {
   fi
   FAILURE_NSC_ROOT=$nsc_root
   FAILURE_LOG=$FAKE_NSC_LOG
+  FAILURE_RUNNER=$RUNNER_TEMP
   ok "$scenario remains red with $reason"
 }
 
@@ -901,6 +1071,42 @@ collection_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '
 [[ $(grep -Ec "^destroy --force ${collection_id} " "$FAILURE_LOG") == 1 ]] ||
   fail 'download failure did not destroy its exact cluster once'
 [[ ! -e $FAILURE_NSC_ROOT/instances/$collection_id/live ]] || fail 'download failure left its cluster live'
+
+expect_lifecycle_failure 5007 proof-fifo EvidenceCollectionFailed
+[[ ! -e $DIENE_CORE_REPORT && ! -e $DIENE_PROOF_BUNDLE ]] ||
+  fail 'a special collected proof left a report or stale proof artifact publishable'
+assert_contains "$scratch/failure-proof-fifo.err" EvidenceLeakageInterfaceUnavailable
+proof_fifo_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^destroy --force ${proof_fifo_id} " "$FAILURE_LOG") == 1 ]] ||
+  fail 'special collected proof did not preserve exact cleanup'
+
+expect_lifecycle_failure 5008 proof-unreadable EvidenceCollectionFailed
+[[ ! -e $DIENE_CORE_REPORT && ! -e $DIENE_PROOF_BUNDLE ]] ||
+  fail 'an unreadable collected tree left a report or stale proof artifact publishable'
+assert_contains "$scratch/failure-proof-unreadable.err" EvidenceLeakageInterfaceUnavailable
+ok 'special and unreadable proof members suppress all artifacts after exact cleanup'
+
+expect_lifecycle_failure 5009 remote-source-special NamespaceSshDriverFailed
+remote_stderr=$(find "$FAILURE_RUNNER/diene-namespace" -path '*/staging/stderr' -print -quit)
+[[ -n $remote_stderr ]] && assert_contains "$remote_stderr" UntrustedSubject
+remote_special_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^destroy --force ${remote_special_id} " "$FAILURE_LOG") == 1 ]] ||
+  fail 'remote archive revalidation failure did not preserve exact cleanup'
+ok 'the uploaded fixed validator repeats source safety before remote extraction'
+
+prepare_run 5010
+printf '%s\n' stale-proof-sentinel >"$DIENE_PROOF_BUNDLE"
+export DIENE_GREP_BIN=$fake_grep_error
+if run_orchestrator happy >"$scratch/failure-grep-error.out" 2>"$scratch/failure-grep-error.err"; then
+  fail 'a leakage scanner status 2 unexpectedly published a green lifecycle'
+fi
+assert_contains "$scratch/failure-grep-error.err" EvidenceLeakageInterfaceUnavailable
+[[ ! -e $DIENE_CORE_REPORT && ! -e $DIENE_PROOF_BUNDLE ]] ||
+  fail 'grep status 2 left a final report or pre-existing proof sentinel'
+grep_error_id=$(find "$FAKE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^destroy --force ${grep_error_id} " "$FAKE_NSC_LOG") == 1 ]] ||
+  fail 'leakage scanner failure did not preserve exact cleanup'
+ok 'grep status 2 preserves interface-unavailable and removes every stale publication artifact'
 
 expect_lifecycle_failure 5005 destroy-fail NamespaceDestroyFailed
 destroy_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
@@ -1546,7 +1752,8 @@ jq '
   del(.namespaceLifecycle,.checkpointChain,
       .instance.clusterId,.instance.osId,.instance.osVersion,.instance.k3sVersion,
       .instance.kubernetesVersion,.instance.nodeCount,.instance.capacity,
-      .tooling.nscVersion,.tooling.sourceArchiveDigest,.tooling.artifactSubjectDigest,
+      .tooling.nscVersion,.tooling.nscArtifactDigest,.tooling.nscBinaryDigest,
+      .tooling.sourceArchiveDigest,.tooling.artifactSubjectDigest,
       .evidence.proofBundle,
       .evidence.egressCanary.profileId,.evidence.egressCanary.enforcement,
       .evidence.egressCanary.platformStatus,.evidence.egressCanary.hostileProbes,
@@ -1558,7 +1765,8 @@ jq '
   del(.namespaceLifecycle,.checkpointChain,
       .instance.clusterId,.instance.osId,.instance.osVersion,.instance.k3sVersion,
       .instance.kubernetesVersion,.instance.nodeCount,.instance.capacity,
-      .tooling.nscVersion,.tooling.sourceArchiveDigest,.tooling.artifactSubjectDigest,
+      .tooling.nscVersion,.tooling.nscArtifactDigest,.tooling.nscBinaryDigest,
+      .tooling.sourceArchiveDigest,.tooling.artifactSubjectDigest,
       .evidence.proofBundle,
       .evidence.egressCanary.profileId,.evidence.egressCanary.enforcement,
       .evidence.egressCanary.platformStatus,.evidence.egressCanary.hostileProbes,
@@ -1618,6 +1826,41 @@ expect_refusal EvidenceLeakageInterfaceUnavailable env DIENE_LEAK_CANARY=interfa
   GITHUB_OUTPUT="$leak_interface/github-output" GITHUB_ENV="$leak_interface/github-env" \
   GITHUB_STEP_SUMMARY="$leak_interface/summary" "$work/scripts/ci/environment-report.sh" \
   --kind core --input "$happy_core_report" --output "$leak_interface/missing-surface.json"
+
+: >"$leak_interface/staging/stderr"
+mkfifo "$leak_interface/proof/hostile-fifo"
+printf '%s\n' stale-report-sentinel >"$leak_interface/special-surface.json"
+expect_refusal EvidenceLeakageInterfaceUnavailable env DIENE_LEAK_CANARY=interface-canary \
+  DIENE_EVIDENCE_STAGING="$leak_interface/staging" DIENE_PROOF_BUNDLE_DIR="$leak_interface/proof" \
+  DIENE_SCHEMA_DIR="$schema_dir" RUNNER_TEMP="$leak_interface/runner" \
+  GITHUB_OUTPUT="$leak_interface/github-output" GITHUB_ENV="$leak_interface/github-env" \
+  GITHUB_STEP_SUMMARY="$leak_interface/summary" "$work/scripts/ci/environment-report.sh" \
+  --kind core --input "$happy_core_report" --output "$leak_interface/special-surface.json"
+[[ ! -e $leak_interface/special-surface.json ]] ||
+  fail 'a special evidence surface left a stale report artifact'
+rm -f -- "$leak_interface/proof/hostile-fifo"
+
+printf '%s\n' unreadable >"$leak_interface/proof/unreadable"
+chmod 000 "$leak_interface/proof/unreadable"
+expect_refusal EvidenceLeakageInterfaceUnavailable env DIENE_LEAK_CANARY=interface-canary \
+  DIENE_EVIDENCE_STAGING="$leak_interface/staging" DIENE_PROOF_BUNDLE_DIR="$leak_interface/proof" \
+  DIENE_SCHEMA_DIR="$schema_dir" RUNNER_TEMP="$leak_interface/runner" \
+  GITHUB_OUTPUT="$leak_interface/github-output" GITHUB_ENV="$leak_interface/github-env" \
+  GITHUB_STEP_SUMMARY="$leak_interface/summary" "$work/scripts/ci/environment-report.sh" \
+  --kind core --input "$happy_core_report" --output "$leak_interface/unreadable-surface.json"
+chmod 0600 "$leak_interface/proof/unreadable"
+rm -f -- "$leak_interface/proof/unreadable"
+
+printf '%s\n' stale-report-sentinel >"$leak_interface/grep-error.json"
+expect_refusal EvidenceLeakageInterfaceUnavailable env DIENE_LEAK_CANARY=interface-canary \
+  DIENE_GREP_BIN="$fake_grep_error" DIENE_EVIDENCE_STAGING="$leak_interface/staging" \
+  DIENE_PROOF_BUNDLE_DIR="$leak_interface/proof" DIENE_SCHEMA_DIR="$schema_dir" \
+  RUNNER_TEMP="$leak_interface/runner" GITHUB_OUTPUT="$leak_interface/github-output" \
+  GITHUB_ENV="$leak_interface/github-env" GITHUB_STEP_SUMMARY="$leak_interface/summary" \
+  "$work/scripts/ci/environment-report.sh" --kind core --input "$happy_core_report" \
+  --output "$leak_interface/grep-error.json"
+[[ ! -e $leak_interface/grep-error.json ]] || fail 'grep status 2 left a stale report artifact'
+ok 'special, unreadable, and grep-error surfaces all fail closed without an output artifact'
 
 leak_canary=$'line one/+"?&\nline two'
 leak_base64=$(printf '%s' "$leak_canary" | base64 | tr -d '\n')

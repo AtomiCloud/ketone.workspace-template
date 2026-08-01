@@ -60,7 +60,12 @@
           "instance": {
             "required": ["clusterId", "osId", "k3sVersion", "kubernetesVersion", "nodeCount", "capacity"]
           },
-          "tooling": { "required": ["nscVersion", "sourceArchiveDigest", "artifactSubjectDigest"] },
+          "tooling": {
+            "required": [
+              "nscVersion", "nscArtifactDigest", "nscBinaryDigest",
+              "sourceArchiveDigest", "artifactSubjectDigest"
+            ]
+          },
           "evidence": {
             "required": ["proofBundle"],
             "properties": {

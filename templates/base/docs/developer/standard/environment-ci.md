@@ -75,6 +75,9 @@ Before `nsc create`, the caller and reusable workflow both prove:
 - lane selectors are neither missing nor crossed between core and vendor;
 - Absol's complete signed-closure tuple is present and well formed;
 - the production duration is exactly `2h`;
+- the declared CI shell selects the release-hash-pinned `nsc` v0.0.532 store
+  executable and its recorded executable digest agrees with the immutable
+  identity file;
 - declared journey/vendor manifests and every present production fixture are
   valid, Promotion/Freight objects are complete, duration spellings are
   canonical, and the negative canary is inactive; and
@@ -108,13 +111,18 @@ The production sequence is:
 
 ```text
 validate protected trust, immutable subject, closure, declarations and fixtures
+  -> require exact nsc v0.0.532 plus release-artifact and executable digests
+  -> reject unsafe source names, links, hardlinks, FIFOs, devices and special entries
   -> materialize the exact egress contract
   -> nsc create --ephemeral --duration 2h --wait_kube_system
        --cidfile <file> --output_json_to <file> --output json
   -> require cidfile == create metadata .cluster_id
   -> bind that exact cluster_id to the run/attempt receipt
+  -> bind exact nsc version/artifact/executable identity to the receipt
   -> nsc instance upload <id> <local> <remote> --mkdir
   -> nsc ssh <id> -T <fixed-command>
+  -> verify the separately uploaded fixed validator and repeat source safety
+     before constrained extraction into a fresh directory
   -> run the copied driver against built-in k3s
   -> nsc instance download <id> <remote> <local> --mkdir
   -> verify digest and safely extract the fixed proof archive
@@ -134,12 +142,16 @@ exact survivor debt but always returns red for that run; late success cannot
 rewrite failure green. A hard runner loss can still bypass Actions cleanup,
 which is why any post-TTL survivor is an incident and a fresh run is required.
 
-Only immutable files cross into `/run/diene-ci`, which is mode `0700`:
-source archive, driver inputs, artifact subject, egress contract, and the safe
-receipt projection. No `NSC_TOKEN`, GitHub token, SSH agent, destroy authority,
-vendor credential, kubeconfig body, or other capability is copied. Presence of
-an `nsc` executable in a shared Nix shell is not authority; the guest never
-invokes it.
+Only immutable files cross into `/run/diene-ci`, which is mode `0700`: source
+archive, driver inputs, artifact subject, egress contract, the safe receipt
+projection, and a separately uploaded fixed archive validator plus checksum.
+The outer and remote validators accept only unique normalized relative names
+and regular-file/directory members. Collection repeats those checks before
+extraction and rejects any unreadable, linked, or special extracted object.
+No `NSC_TOKEN`, GitHub token, SSH agent, destroy authority, vendor credential,
+kubeconfig body, or other capability is copied. The shared shell may expose
+the pinned client binary on the guest, but the driver has no Namespace
+authority and never invokes it.
 
 ## Guest posture and endpoint law
 
@@ -236,6 +248,8 @@ A green terminal report requires:
 
 - exact cluster ID, Wolfi/k3s/node/capacity evidence;
 - create, transfer, SSH, collection, destroy, and absence phase receipts;
+- exact `nsc` v0.0.532 release-artifact and executable digests in the receipt
+  and report;
 - host and actual-pod hostile probes;
 - a valid immutable checkpoint predecessor chain ending in a non-resumed
   `final-clean-pass`;
@@ -250,15 +264,22 @@ vendor, or a vendor digest from core is `ReportNamespaceViolation`.
 Candidate artifacts may contain only safe reports, transcripts, timings,
 checkpoints, and non-capability receipts. Runtime files, kubeconfig content,
 tokens, seed bytes, rendered Secrets, credentials, caches, and cleanup
-authority are never published.
+authority are never published. Every scanned surface must be a completely
+readable regular-file/directory tree: grep errors, links, FIFOs, devices,
+sockets, and other special objects are
+`EvidenceLeakageInterfaceUnavailable`, and stale report/proof outputs are
+removed before returning red.
 
 ## Local verification
 
 `scripts/ci/test-environment-contract.sh` uses a local fake `nsc` implementing
 only the measured v0.0.532 surface. It covers exact identity/destroy/absence,
-pre-create refusals, SSH and collection loss, destroy failure, signals,
-parallel tuple isolation, report namespaces, policy probes/removal, leakage,
-checkpoint chains, and forbidden substrate strings.
+release/executable identity drift, unsafe archive names and all special member
+types, pre-create refusals, remote revalidation, SSH and collection loss,
+unreadable/special proof suppression, grep status errors, stale-artifact
+removal, destroy failure, signals, parallel tuple isolation, report namespaces,
+policy probes/removal, leakage, checkpoint chains, and forbidden substrate
+strings.
 
 Run the canonical gates from the generated repository's CI shell:
 
@@ -269,6 +290,9 @@ actionlint
 check-jsonschema --check-metaschema schemas/ci/*.schema.json
 ```
 
-The shell includes the ordinary Unix/Kubernetes tools used by the driver. It
-does not package or invent `nsc`; the Namespace orchestrator image must provide
-the pinned CLI and the script records its semantic version.
+The shell includes the ordinary Unix/Kubernetes tools used by the driver and a
+locally declared Namespace CLI derivation. The derivation fixes v0.0.532 by the
+official per-platform release archive hash, exports an absolute store path,
+and writes a post-fixup executable identity record. The lifecycle refuses any
+other version or binary before `nsc create` and records both digests in its
+receipt and report.

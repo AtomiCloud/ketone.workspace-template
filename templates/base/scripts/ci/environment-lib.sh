@@ -8,6 +8,7 @@ set -euo pipefail
 
 DIENE_REASON_EXIT=64
 DIENE_ZERO_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
+DIENE_NSC_EXPECTED_VERSION=v0.0.532
 
 diene_die() {
   local code=${1:?reason code required}
@@ -65,16 +66,100 @@ diene_write_json() {
   mv -- "$tmp" "$target"
 }
 
+diene_archive_is_safe() {
+  local archive=${1:?archive required}
+  local required_root=${2:-}
+  [[ -f $archive && ! -L $archive ]] || return 1
+
+  local listing types name_count type_count
+  listing=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-archive-list.XXXXXX") || return 1
+  types=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-archive-types.XXXXXX") || {
+    rm -f -- "$listing"
+    return 1
+  }
+  if ! LC_ALL=C tar --list --quoting-style=escape --file "$archive" >"$listing"; then
+    rm -f -- "$listing" "$types"
+    return 1
+  fi
+  if ! LC_ALL=C tar --list --verbose --numeric-owner --quoting-style=escape \
+    --file "$archive" >"$types"; then
+    rm -f -- "$listing" "$types"
+    return 1
+  fi
+
+  name_count=$(wc -l <"$listing")
+  type_count=$(wc -l <"$types")
+  if [[ $name_count == 0 || $name_count != "$type_count" ]] ||
+    ! LC_ALL=C awk -v root="$required_root" '
+      function unsafe(name, normalized, escaped) {
+        # GNU tar escape quoting renders UTF-8 bytes as octal sequences. Allow
+        # non-ASCII byte escapes, but reject named/control escapes, encoded
+        # ASCII separators, and literal backslashes. Thus canonical names such
+        # as the lightning workflow survive without making newline or \057 a
+        # hidden path separator.
+        escaped = name
+        while (match(escaped, /\\[23][0-7][0-7]/))
+          escaped = substr(escaped, 1, RSTART - 1) "U" substr(escaped, RSTART + RLENGTH)
+        if (escaped ~ /\\/) return 1
+        if (name == "" || name ~ /^\// || name ~ /\/\//) return 1
+        normalized = name
+        sub(/\/$/, "", normalized)
+        if (normalized == "" || normalized == "." ||
+            normalized ~ /(^|\/)\.\.?(\/|$)/) return 1
+        if (root != "" && normalized != root && index(normalized, root "/") != 1) return 1
+        if (seen[normalized]++) return 1
+        return 0
+      }
+      unsafe($0) { bad=1 }
+      END { exit bad ? 1 : 0 }
+    ' "$listing" ||
+    ! LC_ALL=C awk '
+      substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { bad=1 }
+      END { exit bad ? 1 : 0 }
+    ' "$types"; then
+    rm -f -- "$listing" "$types"
+    return 1
+  fi
+  rm -f -- "$listing" "$types"
+}
+
+diene_tree_is_safe() {
+  local root=${1:?tree root required}
+  [[ -d $root && ! -L $root && -r $root && -x $root ]] || return 1
+  local manifest path safe=true
+  manifest=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-tree.XXXXXX") || return 1
+  if ! find "$root" -print0 >"$manifest"; then
+    rm -f -- "$manifest"
+    return 1
+  fi
+  while IFS= read -r -d '' path; do
+    if [[ -L $path ]]; then
+      safe=false
+      break
+    elif [[ -f $path ]]; then
+      [[ -r $path ]] || { safe=false; break; }
+    elif [[ -d $path ]]; then
+      [[ -r $path && -x $path ]] || { safe=false; break; }
+    else
+      safe=false
+      break
+    fi
+  done <"$manifest"
+  rm -f -- "$manifest"
+  [[ $safe == true ]]
+}
+
 diene_require_archive_members() {
   local archive=${1:?archive required}
   shift
   (($# > 0)) || diene_die InputContractInvalid 'at least one required archive member must be declared'
-  [[ -f $archive && ! -L $archive ]] ||
-    diene_die UntrustedSubject 'source archive is absent or not a regular file'
+  diene_archive_is_safe "$archive" ||
+    diene_die UntrustedSubject \
+      'source archive has an unsafe name, duplicate, link, device, FIFO, socket, or other special member'
   local listing member
   listing=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-archive-list.XXXXXX") ||
     diene_die UntrustedSubject 'could not allocate a source archive listing'
-  if ! tar -tf "$archive" >"$listing"; then
+  if ! LC_ALL=C tar --list --quoting-style=escape --file "$archive" >"$listing"; then
     rm -f -- "$listing"
     diene_die UntrustedSubject 'source archive could not be listed completely'
   fi
@@ -324,18 +409,48 @@ diene_validate_report_namespace() {
 # ---------------------------------------------------------------------------
 
 diene_nsc_bin() {
-  printf '%s\n' "${DIENE_NSC_BIN:-nsc}"
+  local bin=${DIENE_NSC_BIN:-}
+  [[ $bin == /* && -f $bin && ! -L $bin && -x $bin ]] ||
+    diene_die NamespaceLifecycleUnavailable \
+      'the declared CI shell did not select an absolute pinned nsc executable'
+  printf '%s\n' "$bin"
+}
+
+diene_nsc_identity() {
+  local bin identity_file identity output version version_count binary_digest
+  bin=$(diene_nsc_bin)
+  identity_file=${DIENE_NSC_IDENTITY_FILE:-}
+  [[ $identity_file == /* && -f $identity_file && ! -L $identity_file ]] ||
+    diene_die NamespaceLifecycleUnavailable \
+      'the declared CI shell did not provide the pinned nsc identity record'
+  identity=$(jq -ceS \
+    --arg expected "$DIENE_NSC_EXPECTED_VERSION" '
+      select(
+        .version == $expected and
+        (.artifactDigest | test("^sha256:[0-9a-f]{64}$")) and
+        (.binaryDigest | test("^sha256:[0-9a-f]{64}$")) and
+        keys == ["artifactDigest","binaryDigest","version"]
+      )
+    ' "$identity_file") ||
+    diene_die NamespaceLifecycleUnavailable 'pinned nsc identity record is malformed or has the wrong release'
+  if ! output=$("$bin" version 2>&1); then
+    diene_die NamespaceLifecycleUnavailable 'pinned nsc version probe failed'
+  fi
+  version=$(awk '$1 == "version" {print $2}' <<<"$output")
+  version_count=$(awk '$1 == "version" {count++} END {print count+0}' <<<"$output")
+  [[ $version_count == 1 && $version == "$DIENE_NSC_EXPECTED_VERSION" ]] ||
+    diene_die NamespaceLifecycleUnavailable \
+      "nsc must be exactly $DIENE_NSC_EXPECTED_VERSION; refusing an unmeasured client"
+  binary_digest=$(diene_file_digest "$bin")
+  jq -e --arg version "$version" --arg digest "$binary_digest" '
+    .version == $version and .binaryDigest == $digest
+  ' <<<"$identity" >/dev/null ||
+    diene_die NamespaceLifecycleUnavailable 'nsc executable digest disagrees with its immutable identity record'
+  printf '%s\n' "$identity"
 }
 
 diene_nsc_version() {
-  local bin output version
-  bin=$(diene_nsc_bin)
-  diene_require_command "$bin"
-  output=$($bin version)
-  version=$(awk '/^version / {print $2; exit}' <<<"$output")
-  [[ $version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-    diene_die NamespaceLifecycleUnavailable 'nsc version output is not stable semantic version evidence'
-  printf '%s\n' "$version"
+  diene_nsc_identity | jq -r '.version'
 }
 
 diene_nsc_extract_cluster_id() {
@@ -399,9 +514,16 @@ diene_arm_receipt() {
   local create_digest=${3:?create digest required}
   local create_seconds=${4:?create seconds required}
   local cache_attached=${5:-false}
+  local nsc_version=${6:?nsc version required}
+  local nsc_artifact_digest=${7:?nsc artifact digest required}
+  local nsc_binary_digest=${8:?nsc binary digest required}
   diene_require_safe_id receipt_id "$receipt_id"
   diene_require_safe_id cluster_id "$cluster_id"
   diene_require_digest create_receipt_digest "$create_digest"
+  [[ $nsc_version == "$DIENE_NSC_EXPECTED_VERSION" ]] ||
+    diene_die NamespaceLifecycleUnavailable 'receipt cannot bind an unmeasured nsc release'
+  diene_require_digest nsc_artifact_digest "$nsc_artifact_digest"
+  diene_require_digest nsc_binary_digest "$nsc_binary_digest"
   [[ $create_seconds =~ ^[0-9]+$ && $cache_attached =~ ^(true|false)$ ]] ||
     diene_die InputContractInvalid 'receipt create timing or cache fact is invalid'
 
@@ -421,6 +543,8 @@ diene_arm_receipt() {
     --arg generationKey "$(diene_generation_key)" --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" \
     --arg lane "$lane" --arg profile "$profile" --arg buildMode "$build_mode" \
     --arg actionId "${DIENE_ACTION_ID:-}" --arg clusterId "$cluster_id" --arg egressProfile "$egress" \
+    --arg nscVersion "$nsc_version" --arg nscArtifactDigest "$nsc_artifact_digest" \
+    --arg nscBinaryDigest "$nsc_binary_digest" \
     --arg createDigest "$create_digest" --arg observedAt "$(diene_timestamp)" \
     --argjson createSeconds "$create_seconds" --argjson cacheAttached "$cache_attached" '
       {
@@ -429,6 +553,8 @@ diene_arm_receipt() {
           runId:$runId,runAttempt:$runAttempt,receiptId:$receiptId,
           allocationKey:$allocationKey,generationKey:$generationKey,workflowRef:$workflowRef},
         lane:$lane,profile:$profile,buildMode:$buildMode,
+        tooling:{nscVersion:$nscVersion,nscArtifactDigest:$nscArtifactDigest,
+          nscBinaryDigest:$nscBinaryDigest},
         namespace:{clusterId:$clusterId,duration:"2h",ephemeral:true,egressProfile:$egressProfile,
           cacheAttached:$cacheAttached,
           policy:{mechanism:"interim-in-guest-iptables-nft",trustBoundary:"trusted-generated-content",
@@ -463,12 +589,17 @@ diene_validate_receipt_owner() {
     --arg repositoryId "$GITHUB_REPOSITORY_ID" --arg repositoryKey "$GITHUB_REPOSITORY" \
     --arg sourceSha "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
     --arg receiptId "$(diene_receipt_id)" --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" \
-    --arg clusterId "$cluster_id" '
+    --arg clusterId "$cluster_id" --arg nscVersion "${DIENE_NSC_VERSION:-}" \
+    --arg nscArtifactDigest "${DIENE_NSC_ARTIFACT_DIGEST:-}" \
+    --arg nscBinaryDigest "${DIENE_NSC_BINARY_DIGEST:-}" '
       .owner.repositoryId == $repositoryId and .owner.repositoryKey == $repositoryKey and
       .owner.sourceSha == $sourceSha and .owner.runId == $runId and
       .owner.runAttempt == $runAttempt and .owner.receiptId == $receiptId and
       .owner.workflowRef == $workflowRef and
-      ($clusterId == "" or .namespace.clusterId == $clusterId)
+      ($clusterId == "" or .namespace.clusterId == $clusterId) and
+      ($nscVersion == "" or (.tooling.nscVersion == $nscVersion and
+        .tooling.nscArtifactDigest == $nscArtifactDigest and
+        .tooling.nscBinaryDigest == $nscBinaryDigest))
     ' "$receipt" >/dev/null || diene_die ReceiptOwnershipMismatch 'receipt owner tuple or exact cluster_id mismatch'
 }
 
@@ -613,6 +744,10 @@ diene_load_remote_inputs() {
     .trustedRuntimeContext == "protected-base" and .duration == "2h" and
     .platformPolicyStatus == "platform per-instance policy pending (support ask #4)" and
     (.clusterId | type == "string" and length > 0) and
+    .nscVersion == "v0.0.532" and
+    (.nscArtifactDigest | test("^sha256:[0-9a-f]{64}$")) and
+    (.nscBinaryDigest | test("^sha256:[0-9a-f]{64}$")) and
+    (.archiveValidatorDigest | test("^sha256:[0-9a-f]{64}$")) and
     (.sourceArchiveDigest | test("^sha256:[0-9a-f]{64}$")) and
     (.artifactSubjectDigest | test("^sha256:[0-9a-f]{64}$")) and
     (.admittedK3sVersion | test("^v[0-9]+\\.[0-9]+\\.[0-9]+\\+k3s[0-9]+$")) and
@@ -628,6 +763,7 @@ diene_load_remote_inputs() {
   export DIENE_CLOSURE_DIGEST DIENE_CLOSURE_BUNDLE_REF
   export DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST DIENE_CLOSURE_TRUST_ROOT_DIGEST
   export DIENE_TRUSTED_RUNTIME_CONTEXT DIENE_NSC_CLUSTER_ID DIENE_NSC_VERSION
+  export DIENE_NSC_ARTIFACT_DIGEST DIENE_NSC_BINARY_DIGEST
   export DIENE_SOURCE_ARCHIVE_DIGEST DIENE_ORCHESTRATOR_VENUE DIENE_ORCHESTRATOR_LABEL
   export DIENE_ORCHESTRATOR_FALLBACK_REASON DIENE_CACHE_ATTACHED
   export DIENE_ADMITTED_K3S_VERSION DIENE_EGRESS_CANARY_IMAGE
@@ -657,6 +793,8 @@ diene_load_remote_inputs() {
   DIENE_TRUSTED_RUNTIME_CONTEXT=protected-base
   DIENE_NSC_CLUSTER_ID=$(jq -r '.clusterId' "$input")
   DIENE_NSC_VERSION=$(jq -r '.nscVersion' "$input")
+  DIENE_NSC_ARTIFACT_DIGEST=$(jq -r '.nscArtifactDigest' "$input")
+  DIENE_NSC_BINARY_DIGEST=$(jq -r '.nscBinaryDigest' "$input")
   DIENE_SOURCE_ARCHIVE_DIGEST=$(jq -r '.sourceArchiveDigest' "$input")
   DIENE_ORCHESTRATOR_VENUE=$(jq -r '.orchestrator.venue' "$input")
   DIENE_ORCHESTRATOR_LABEL=$(jq -r '.orchestrator.label' "$input")
@@ -674,6 +812,9 @@ diene_load_remote_inputs() {
 
   [[ $(diene_file_digest "$state_dir/source.tar") == "$DIENE_SOURCE_ARCHIVE_DIGEST" ]] ||
     diene_die UntrustedSubject 'copied source archive digest mismatch'
+  [[ -f $state_dir/archive-validator.sh && ! -L $state_dir/archive-validator.sh &&
+    $(diene_file_digest "$state_dir/archive-validator.sh") == "$(jq -r '.archiveValidatorDigest' "$input")" ]] ||
+    diene_die UntrustedSubject 'copied remote archive validator digest mismatch'
   [[ $(diene_file_digest "$DIENE_ARTIFACT_SUBJECT") == "$(jq -r '.artifactSubjectDigest' "$input")" ]] ||
     diene_die UntrustedSubject 'copied artifact subject digest mismatch'
   [[ -f $DIENE_EGRESS_CONTRACT && ! -L $DIENE_EGRESS_CONTRACT ]] ||

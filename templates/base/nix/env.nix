@@ -6,6 +6,9 @@ with packages;
     # `pls` is the single ratified lifecycle entrypoint, so it must exist in
     # every shell that runs CI scripts - not just the interactive one.
     pls
+    # Namespace lifecycle commands are pinned by archive hash and selected by
+    # an absolute store path in shells.nix.
+    nsc
   ];
 
   dev = [

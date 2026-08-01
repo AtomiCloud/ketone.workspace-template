@@ -34,6 +34,10 @@ ORCH_CLUSTER_ID=
 ORCH_RECEIPT=
 ORCH_RECEIPT_ID=
 ORCH_KIND=core
+ORCH_NSC_VERSION=
+ORCH_NSC_ARTIFACT_DIGEST=
+ORCH_NSC_BINARY_DIGEST=
+ORCH_PUBLICATION_SAFE=1
 ORCH_FIRST_RC=0
 ORCH_FIRST_REASON=
 ORCH_CLEANUP_DONE=0
@@ -130,28 +134,93 @@ orchestrator_cleanup() {
 
 orchestrator_safe_extract() {
   local archive=${1:?archive required} target=${2:?target required}
-  local listing
-  listing=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-tar.XXXXXX")
-  tar -tf "$archive" >"$listing" || {
-    rm -f -- "$listing"
-    return 1
+  if ! diene_archive_is_safe "$archive" evidence; then
+    ORCH_PUBLICATION_SAFE=0
+    diene_warn EvidenceLeakageInterfaceUnavailable \
+      'collected proof archive has an unsafe name, link, device, FIFO, socket, or other special member'
+    return "$DIENE_REASON_EXIT"
+  fi
+  [[ ! -e $target/evidence && ! -L $target/evidence ]] || {
+    ORCH_PUBLICATION_SAFE=0
+    diene_warn EvidenceLeakageInterfaceUnavailable 'collected evidence target already exists'
+    return "$DIENE_REASON_EXIT"
   }
-  awk '
-    /^\// {bad=1}
-    /(^|\/)\.\.($|\/)/ {bad=1}
-    !/^evidence\// {bad=1}
-    END {exit bad ? 1 : 0}
-  ' "$listing" || {
-    rm -f -- "$listing"
-    return 1
-  }
-  rm -f -- "$listing"
   install -d -m 0700 "$target"
-  tar --extract --no-same-owner --no-same-permissions -f "$archive" -C "$target"
-  while IFS= read -r -d '' link; do
-    diene_warn EvidenceCollectionFailed "collected proof contains forbidden link $link"
-    return 1
-  done < <(find "$target" -type l -print0)
+  if ! tar --extract --no-same-owner --no-same-permissions --keep-old-files \
+    -f "$archive" -C "$target" || ! diene_tree_is_safe "$target"; then
+    ORCH_PUBLICATION_SAFE=0
+    diene_warn EvidenceLeakageInterfaceUnavailable \
+      'collected proof could not be extracted into a completely scannable regular tree'
+    return "$DIENE_REASON_EXIT"
+  fi
+}
+
+orchestrator_write_remote_archive_validator() {
+  local target=${1:?remote archive validator target required}
+  cat >"$target" <<'VALIDATOR'
+#!/bin/sh
+set -eu
+archive=${1:?archive required}
+target=${2:?target required}
+fail() {
+  printf '%s\n' "UntrustedSubject: $*" >&2
+  exit 64
+}
+[ -f "$archive" ] && [ ! -L "$archive" ] || fail 'source archive is not a regular file'
+listing=$(mktemp "${TMPDIR:-/tmp}/diene-archive-list.XXXXXX") || fail 'cannot allocate archive listing'
+types=$(mktemp "${TMPDIR:-/tmp}/diene-archive-types.XXXXXX") || {
+  rm -f -- "$listing"
+  fail 'cannot allocate archive type listing'
+}
+paths=$(mktemp "${TMPDIR:-/tmp}/diene-source-paths.XXXXXX") || {
+  rm -f -- "$listing" "$types"
+  fail 'cannot allocate extracted-tree listing'
+}
+cleanup() { rm -f -- "$listing" "$types" "$paths"; }
+trap cleanup EXIT HUP INT TERM
+LC_ALL=C tar -tf "$archive" >"$listing" || fail 'source archive cannot be listed'
+LC_ALL=C tar -tvf "$archive" >"$types" || fail 'source archive types cannot be listed'
+[ "$(wc -l <"$listing")" -gt 0 ] &&
+  [ "$(wc -l <"$listing")" -eq "$(wc -l <"$types")" ] || fail 'source archive listing is ambiguous'
+LC_ALL=C awk '
+  function unsafe(name, normalized, escaped) {
+    escaped = name
+    while (match(escaped, /\\[23][0-7][0-7]/))
+      escaped = substr(escaped, 1, RSTART - 1) "U" substr(escaped, RSTART + RLENGTH)
+    if (escaped ~ /\\/) return 1
+    if (name == "" || name ~ /^\// || name ~ /\/\//) return 1
+    normalized = name
+    sub(/\/$/, "", normalized)
+    if (normalized == "" || normalized == "." || normalized ~ /(^|\/)\.\.?(\/|$)/) return 1
+    if (seen[normalized]++) return 1
+    return 0
+  }
+  unsafe($0) { bad=1 }
+  END { exit bad ? 1 : 0 }
+' "$listing" || fail 'source archive contains an unsafe or non-normalized name'
+LC_ALL=C awk '
+  substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { bad=1 }
+  END { exit bad ? 1 : 0 }
+' "$types" || fail 'source archive contains a link or special member'
+[ ! -e "$target" ] && [ ! -L "$target" ] || fail 'source extraction target is not fresh'
+install -d -m 0700 "$target"
+tar -xf "$archive" -C "$target" || fail 'constrained source extraction failed'
+find "$target" -print >"$paths" || fail 'extracted source tree cannot be traversed'
+while IFS= read -r path; do
+  if [ -L "$path" ]; then
+    fail 'extracted source tree contains a link'
+  elif [ -f "$path" ]; then
+    [ -r "$path" ] || fail 'extracted source tree contains an unreadable file'
+  elif [ -d "$path" ]; then
+    [ -r "$path" ] && [ -x "$path" ] || fail 'extracted source tree contains an unreadable directory'
+  else
+    fail 'extracted source tree contains a special object'
+  fi
+done <"$paths"
+cleanup
+trap - EXIT HUP INT TERM
+VALIDATOR
+  chmod 0500 "$target"
 }
 
 orchestrator_synthetic_report() {
@@ -218,6 +287,14 @@ orchestrator_finalize_report() {
   ((ORCH_FINALIZED == 0)) || return 0
   ORCH_FINALIZED=1
   [[ -n $ORCH_STATE ]] || return 0
+  if ((ORCH_PUBLICATION_SAFE == 0)); then
+    rm -f -- "${DIENE_CORE_REPORT:-$RUNNER_TEMP/diene-environment-report.v1.json}" \
+      "${DIENE_VENDOR_REPORT:-$RUNNER_TEMP/diene-vendor-report.v1.json}" \
+      "${DIENE_PROOF_BUNDLE:-$RUNNER_TEMP/diene-proof-bundle.tar}" 2>/dev/null || true
+    orchestrator_fail "$DIENE_REASON_EXIT" EvidenceLeakageInterfaceUnavailable \
+      'unsafe or unscannable collected evidence suppresses every report and proof artifact'
+    return "$DIENE_REASON_EXIT"
+  fi
   local collected="$ORCH_STATE/collected/evidence"
   local base_report="$collected/${ORCH_KIND}-report.driver.json"
   if [[ ! -f $base_report ]]; then
@@ -324,7 +401,7 @@ orchestrator_finalize_report() {
      absence:phase($absenceOutcome;$absenceReason;$absenceSeconds;$absenceDigest),
      lateCleanupCanRewrite:false,outcome:$outcome}' | diene_write_json "$lifecycle"
 
-  local source_digest subject_digest proof_digest total_seconds raw final_report
+  local source_digest subject_digest proof_digest total_seconds raw final_report final_bundle
   source_digest=$(diene_file_digest "$ORCH_STATE/source.tar")
   subject_digest=$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")
   proof_digest=$ORCH_COLLECTION_DIGEST
@@ -335,7 +412,8 @@ orchestrator_finalize_report() {
     --argjson clusterId "$cluster_json" --argjson osId "$os_id" --argjson osVersion "$os_version" \
     --argjson k3sVersion "$k3s_version" --argjson kubernetesVersion "$kubernetes_version" \
     --argjson nodeCount "$node_count" --argjson capacity "$capacity" --argjson probes "$probes" \
-    --arg nscVersion "$(diene_nsc_version)" --arg sourceDigest "$source_digest" \
+    --arg nscVersion "$ORCH_NSC_VERSION" --arg nscArtifactDigest "$ORCH_NSC_ARTIFACT_DIGEST" \
+    --arg nscBinaryDigest "$ORCH_NSC_BINARY_DIGEST" --arg sourceDigest "$source_digest" \
     --arg subjectDigest "$subject_digest" --arg proofDigest "$proof_digest" \
     --arg profileId "$(diene_egress_profile "$DIENE_LANE")" --arg verdict "$report_outcome" \
     --arg reason "$report_reason" --argjson createSeconds "$ORCH_CREATE_SECONDS" \
@@ -343,7 +421,9 @@ orchestrator_finalize_report() {
     --argjson destroySeconds "$ORCH_DESTROY_SECONDS" --argjson totalSeconds "$total_seconds" '
     .instance += {clusterId:$clusterId,osId:$osId,osVersion:$osVersion,k3sVersion:$k3sVersion,
       kubernetesVersion:$kubernetesVersion,nodeCount:$nodeCount,capacity:$capacity} |
-    .tooling += {nscVersion:$nscVersion,sourceArchiveDigest:$sourceDigest,artifactSubjectDigest:$subjectDigest} |
+    .tooling += {nscVersion:$nscVersion,nscArtifactDigest:$nscArtifactDigest,
+      nscBinaryDigest:$nscBinaryDigest,sourceArchiveDigest:$sourceDigest,
+      artifactSubjectDigest:$subjectDigest} |
     .namespaceLifecycle = $lifecycle | .checkpointChain = $checkpoint |
     .evidence.egressCanary += {profileId:$profileId,enforcement:"interim-in-guest-iptables-nft",
       platformStatus:"platform per-instance policy pending (support ask #4)",hostileProbes:$probes} |
@@ -363,11 +443,23 @@ orchestrator_finalize_report() {
 
   final_report=${DIENE_CORE_REPORT:-$RUNNER_TEMP/diene-environment-report.v1.json}
   [[ $ORCH_KIND != vendor ]] || final_report=${DIENE_VENDOR_REPORT:-$RUNNER_TEMP/diene-vendor-report.v1.json}
+  final_bundle=${DIENE_PROOF_BUNDLE:-$RUNNER_TEMP/diene-proof-bundle.tar}
+  rm -f -- "$final_bundle"
   export DIENE_PROOF_BUNDLE_DIR=$ORCH_STATE
-  "$script_dir/environment-report.sh" --kind "$ORCH_KIND" --input "$raw" --output "$final_report" || {
-    orchestrator_fail "$DIENE_REASON_EXIT" EvidenceLeakDetected 'final outer proof-bundle scan or schema validation failed'
-    return "$DIENE_REASON_EXIT"
-  }
+  local finalize_reason_file="$ORCH_STATE/report-finalize.reason" finalize_rc=0
+  DIENE_REASON_FILE="$finalize_reason_file" \
+    "$script_dir/environment-report.sh" --kind "$ORCH_KIND" --input "$raw" --output "$final_report" ||
+    finalize_rc=$?
+  if ((finalize_rc != 0)); then
+    local finalize_reason=EvidenceLeakDetected
+    [[ ! -s $finalize_reason_file ]] || IFS=$'\t' read -r finalize_reason _ <"$finalize_reason_file"
+    ORCH_PUBLICATION_SAFE=0
+    rm -f -- "${DIENE_CORE_REPORT:-$RUNNER_TEMP/diene-environment-report.v1.json}" \
+      "${DIENE_VENDOR_REPORT:-$RUNNER_TEMP/diene-vendor-report.v1.json}" "$final_bundle" 2>/dev/null || true
+    orchestrator_fail "$finalize_rc" "$finalize_reason" \
+      'final outer proof-bundle scan or schema validation failed; every publication artifact was suppressed'
+    return "$finalize_rc"
+  fi
 
   local proof_dir="$ORCH_STATE/final-proof"
   install -d -m 0700 "$proof_dir"
@@ -375,8 +467,9 @@ orchestrator_finalize_report() {
   install -m 0600 "$lifecycle" "$proof_dir/namespace-lifecycle.json"
   install -m 0600 "$checkpoint" "$proof_dir/checkpoint-chain.json"
   [[ ! -f $ORCH_RECEIPT ]] || install -m 0600 "$ORCH_RECEIPT" "$proof_dir/ci-receipt.json"
-  local final_bundle=${DIENE_PROOF_BUNDLE:-$RUNNER_TEMP/diene-proof-bundle.tar}
-  tar -cf "$final_bundle" -C "$proof_dir" .
+  local -a final_members=("$(basename -- "$final_report")" namespace-lifecycle.json checkpoint-chain.json)
+  [[ ! -f $proof_dir/ci-receipt.json ]] || final_members+=(ci-receipt.json)
+  tar -cf "$final_bundle" -C "$proof_dir" "${final_members[@]}"
   chmod 0600 "$final_bundle"
   local report_digest
   report_digest=$(diene_file_digest "$final_report")
@@ -452,9 +545,21 @@ orchestrate() {
     scripts/ci/environment-k3d-run.sh \
     schemas/ci/diene-environment-report-v1.schema.json
 
-  local nsc_bin nsc_version source_digest subject_digest contract_digest create_started create_rc
+  local nsc_bin nsc_identity nsc_version nsc_artifact_digest nsc_binary_digest
+  local source_digest subject_digest contract_digest validator_digest create_started create_rc
   nsc_bin=$(diene_nsc_bin)
-  nsc_version=$(diene_nsc_version)
+  nsc_identity=$(diene_nsc_identity)
+  nsc_version=$(jq -r '.version' <<<"$nsc_identity")
+  nsc_artifact_digest=$(jq -r '.artifactDigest' <<<"$nsc_identity")
+  nsc_binary_digest=$(jq -r '.binaryDigest' <<<"$nsc_identity")
+  ORCH_NSC_VERSION=$nsc_version
+  ORCH_NSC_ARTIFACT_DIGEST=$nsc_artifact_digest
+  ORCH_NSC_BINARY_DIGEST=$nsc_binary_digest
+  orchestrator_write_remote_archive_validator "$ORCH_STATE/archive-validator.sh"
+  validator_digest=$(diene_file_digest "$ORCH_STATE/archive-validator.sh")
+  printf '%s  archive-validator.sh\n' "${validator_digest#sha256:}" \
+    >"$ORCH_STATE/archive-validator.sha256"
+  chmod 0600 "$ORCH_STATE/archive-validator.sha256"
   source_digest=$(diene_file_digest "$ORCH_STATE/source.tar")
   subject_digest=$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")
   contract_digest=$(diene_file_digest "$ORCH_STATE/egress-contract.json")
@@ -477,7 +582,8 @@ orchestrate() {
     ORCH_CLUSTER_ID=$(diene_nsc_extract_cluster_id "$ORCH_STATE/cluster.cid" "$ORCH_STATE/create.json")
     ORCH_CREATE_DIGEST=$(diene_file_digest "$ORCH_STATE/create.json")
     ORCH_RECEIPT=$(diene_arm_receipt "$ORCH_RECEIPT_ID" "$ORCH_CLUSTER_ID" \
-      "$ORCH_CREATE_DIGEST" "$ORCH_CREATE_SECONDS" false)
+      "$ORCH_CREATE_DIGEST" "$ORCH_CREATE_SECONDS" false "$nsc_version" \
+      "$nsc_artifact_digest" "$nsc_binary_digest")
   fi
   if ((create_rc != 0)); then
     ORCH_CREATE_OUTCOME=Fail
@@ -500,7 +606,9 @@ orchestrate() {
     --arg closure "${DIENE_CLOSURE_DIGEST:-}" --arg closureRef "${DIENE_CLOSURE_BUNDLE_REF:-}" \
     --arg closureSignature "${DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST:-}" \
     --arg closureRoot "${DIENE_CLOSURE_TRUST_ROOT_DIGEST:-}" --arg clusterId "$ORCH_CLUSTER_ID" \
-    --arg nscVersion "$nsc_version" --arg sourceDigest "$source_digest" --arg subjectDigest "$subject_digest" \
+    --arg nscVersion "$nsc_version" --arg nscArtifactDigest "$nsc_artifact_digest" \
+    --arg nscBinaryDigest "$nsc_binary_digest" --arg sourceDigest "$source_digest" \
+    --arg subjectDigest "$subject_digest" --arg archiveValidatorDigest "$validator_digest" \
     --arg contractDigest "$contract_digest" --arg canaryImage "$DIENE_EGRESS_CANARY_IMAGE" \
     --arg l7 "${DIENE_EGRESS_L7_ENFORCER_BIN:-}" --arg probe "${DIENE_EGRESS_PROBE_BIN:-}" \
     --arg vendorBroker "${DIENE_VENDOR_CREDENTIAL_BROKER_BIN:-}" \
@@ -518,6 +626,8 @@ orchestrate() {
      selectors:{journeyManifest:$journey,vendorManifest:$vendor,actionId:$action,fixtureId:$fixture},
      closure:{digest:$closure,bundleRef:$closureRef,signatureBundleDigest:$closureSignature,
        trustRootDigest:$closureRoot},clusterId:$clusterId,nscVersion:$nscVersion,
+     nscArtifactDigest:$nscArtifactDigest,nscBinaryDigest:$nscBinaryDigest,
+     archiveValidatorDigest:$archiveValidatorDigest,
      sourceArchiveDigest:$sourceDigest,artifactSubjectDigest:$subjectDigest,
      admittedK3sVersion:$k3s,admittedServiceCidr:$serviceCidr,cacheAttached:false,
      egress:{contractDigest:$contractDigest,canaryImage:$canaryImage,l7Enforcer:$l7,probeBin:$probe},
@@ -536,8 +646,14 @@ orchestrate() {
     /run/diene-ci/egress-contract.json --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
   ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_RECEIPT" \
     /run/diene-ci/receipt.json --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/archive-validator.sh" \
+    /run/diene-ci/archive-validator.sh --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/archive-validator.sha256" \
+    /run/diene-ci/archive-validator.sha256 --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
   ORCH_TRANSFER_SECONDS=$((SECONDS - transfer_started))
-  ORCH_TRANSFER_DIGEST=$(phase_digest transfer "$source_digest" "$contract_digest")
+  ORCH_TRANSFER_DIGEST=$(phase_digest transfer "$source_digest" "$contract_digest|$validator_digest")
   if ((transfer_rc != 0)); then
     ORCH_TRANSFER_OUTCOME=Fail
     ORCH_TRANSFER_REASON=NamespaceTransferFailed
@@ -550,7 +666,7 @@ orchestrate() {
   local remote_command ssh_started ssh_rc=0
   # The command is intentionally expanded only by the remote shell.
   # shellcheck disable=SC2016
-  remote_command='set -eu; umask 077; test "$(id -u)" = 0; install -d -m 0700 /run/diene-ci/source /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out; tar -xf /run/diene-ci/source.tar -C /run/diene-ci/source; install -m 0600 /run/diene-ci/receipt.json /run/diene-ci/receipts/exact.json; cd /run/diene-ci/source; command -v nix >/dev/null; exec nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci'
+  remote_command='set -eu; umask 077; test "$(id -u)" = 0; install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out; cd /run/diene-ci; sha256sum -c archive-validator.sha256; chmod 0500 archive-validator.sh; ./archive-validator.sh source.tar source; install -m 0600 receipt.json receipts/exact.json; cd source; command -v nix >/dev/null; exec nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci'
   ssh_started=$SECONDS
   "$nsc_bin" ssh "$ORCH_CLUSTER_ID" -T "$remote_command" \
     >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || ssh_rc=$?
@@ -612,7 +728,12 @@ orchestrator_cleanup_command() {
   diene_validate_inputs
   diene_require_command jq
   diene_require_command tar
-  diene_require_command "$(diene_nsc_bin)"
+  local nsc_identity
+  nsc_identity=$(diene_nsc_identity)
+  export DIENE_NSC_VERSION DIENE_NSC_ARTIFACT_DIGEST DIENE_NSC_BINARY_DIGEST
+  DIENE_NSC_VERSION=$(jq -r '.version' <<<"$nsc_identity")
+  DIENE_NSC_ARTIFACT_DIGEST=$(jq -r '.artifactDigest' <<<"$nsc_identity")
+  DIENE_NSC_BINARY_DIGEST=$(jq -r '.binaryDigest' <<<"$nsc_identity")
   ORCH_RECEIPT_ID=$(diene_receipt_id)
   ORCH_STATE="${RUNNER_TEMP:?}/diene-namespace/$ORCH_RECEIPT_ID"
   ORCH_RECEIPT=$(diene_receipt_path "$ORCH_RECEIPT_ID")
@@ -668,19 +789,24 @@ orchestrator_verify_lifecycle() {
   diene_require_command tar
   [[ -f $bundle && ! -L $bundle ]] ||
     diene_die EvidenceCollectionFailed 'workflow-owned lifecycle proof bundle is absent or unsafe'
+  diene_archive_is_safe "$bundle" ||
+    diene_die EvidenceCollectionFailed \
+      'lifecycle proof contains an unsafe name, link, device, FIFO, socket, or other special member'
   local listing extract
   listing=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-lifecycle-list.XXXXXX")
   extract=$(mktemp -d "${RUNNER_TEMP:-/tmp}/diene-lifecycle-proof.XXXXXX")
-  trap 'rm -f -- "$listing"; rm -r -- "$extract"' RETURN
-  tar -tf "$bundle" >"$listing" || diene_die EvidenceCollectionFailed 'lifecycle proof tar is unreadable'
+  trap 'rm -f -- "$listing"; chmod -R u+rwX "$extract" 2>/dev/null || true; rm -r -- "$extract" 2>/dev/null || true' RETURN
+  LC_ALL=C tar --list --quoting-style=escape --file "$bundle" >"$listing" ||
+    diene_die EvidenceCollectionFailed 'lifecycle proof tar is unreadable'
   awk '
-    /^\// || /(^|\/)\.\.($|\/)/ {bad=1}
-    !/^\.\/$/ && !/^\.\/(diene-environment-report\.v1\.json|diene-vendor-report\.v1\.json|namespace-lifecycle\.json|checkpoint-chain\.json|ci-receipt\.json)$/ {bad=1}
+    !/^(diene-environment-report\.v1\.json|diene-vendor-report\.v1\.json|namespace-lifecycle\.json|checkpoint-chain\.json|ci-receipt\.json)$/ {bad=1}
     END {exit bad ? 1 : 0}
   ' "$listing" || diene_die EvidenceCollectionFailed 'lifecycle proof has an unexpected or unsafe member'
-  tar --extract --no-same-owner --no-same-permissions -f "$bundle" -C "$extract"
-  find "$extract" -type l -print -quit | grep -q . &&
-    diene_die EvidenceCollectionFailed 'lifecycle proof contains a link'
+  tar --extract --no-same-owner --no-same-permissions --keep-old-files \
+    -f "$bundle" -C "$extract" ||
+    diene_die EvidenceCollectionFailed 'lifecycle proof could not be extracted safely'
+  diene_tree_is_safe "$extract" ||
+    diene_die EvidenceCollectionFailed 'lifecycle proof contains an unreadable or special object'
 
   local schema=diene-environment-report-v1.schema.json
   local report="$extract/diene-environment-report.v1.json"
@@ -814,6 +940,8 @@ driver_emit_report() {
     --arg receiptId "$(diene_receipt_id)" --arg clusterId "$DIENE_NSC_CLUSTER_ID" \
     --arg garden "$DIENE_GARDEN_LOCK_DIGEST" --arg journeyDigest "$journey_digest" \
     --arg environmentDigest "$environment_digest" --arg nscVersion "$DIENE_NSC_VERSION" \
+    --arg nscArtifactDigest "$DIENE_NSC_ARTIFACT_DIGEST" \
+    --arg nscBinaryDigest "$DIENE_NSC_BINARY_DIGEST" \
     --arg sourceDigest "$DIENE_SOURCE_ARCHIVE_DIGEST" \
     --arg subjectDigest "$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")" \
     --arg verdict "$verdict" --arg reason "$reason" --arg teardownOutcome "$teardown_outcome" \
@@ -836,6 +964,7 @@ driver_emit_report() {
        k3sVersion:$preflight[0].k3s.version,kubernetesVersion:$preflight[0].k3s.kubernetesVersion,
        nodeCount:$preflight[0].k3s.nodeCount,capacity:$preflight[0].k3s.capacity},receiptId:$receiptId,
      tooling:({gardenLockDigest:$garden,journeyManifestDigest:$journeyDigest,nscVersion:$nscVersion,
+       nscArtifactDigest:$nscArtifactDigest,nscBinaryDigest:$nscBinaryDigest,
        sourceArchiveDigest:$sourceDigest,artifactSubjectDigest:$subjectDigest}
        + (if $environmentDigest == "" then {} else {environmentLockDigest:$environmentDigest} end)),
      readiness:($readiness[0] // null),journeys:$journeys,coverage:$coverage,
