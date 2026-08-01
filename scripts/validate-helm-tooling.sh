@@ -200,14 +200,19 @@ channel_inheritance_status() {
       sub(/[^[:space:]].*$/, "", line)
       return line
     }
-    BEGIN { code = 2 }
+    BEGIN {
+      code = 2
+      # Structural lines may end in a Nix `#` line comment, but never other tokens.
+      # Block-comment grammar is deliberately outside this line-oriented contract.
+      line_end = "([[:space:]]*#.*)?[[:space:]]*$"
+    }
     !inside && $0 ~ "^[[:space:]]*" block "[[:space:]]*=" {
       inside = 1
       code = 3
       block_indent = indent_of($0)
       # Both direct structural edges are derived from the outer block opener.
-      closer = "^" block_indent "\\);[[:space:]]*$"
-      direct_with = "^" block_indent "  with[[:space:]]+" source ";[[:space:]]*$"
+      closer = "^" block_indent "\\);" line_end
+      direct_with = "^" block_indent "  with[[:space:]]+" source ";" line_end
       next
     }
     !inside { next }
@@ -215,7 +220,7 @@ channel_inheritance_status() {
       bound = 1
       code = 4
       # The inherit list must be one indentation level beneath the accepted direct with.
-      inherit_re = "^" indent_of($0) "  inherit[[:space:]]*$"
+      inherit_re = "^" indent_of($0) "  inherit" line_end
       next
     }
     bound && $0 ~ inherit_re { in_inherit = 1; next }
@@ -381,6 +386,47 @@ NIX
       with pkgs-2605;
       rec {
         inherit
+          kyverno
+        ;
+      }
+    );
+NIX
+
+  expect_channel_inheritance commented-direct-control pass <<'NIX'
+    nix-2605 = (
+      with pkgs-2605; # direct channel
+      rec {
+        inherit # direct tools
+          kyverno
+        ;
+      }
+    ); # nix-2605
+NIX
+
+  expect_channel_inheritance commented-nested-binding-only fail <<'NIX'
+    nix-2605 = (
+      let
+        misleading = (
+          with pkgs-2605; # nested channel
+          rec {
+            inherit # nested tools
+              kyverno
+            ;
+          }
+        );
+      in
+      rec { }
+    ); # nix-2605
+NIX
+
+  expect_channel_inheritance commented-closer-stops-scan fail <<'NIX'
+    nix-2605 = (
+      rec { }
+    ); # nix-2605
+    later = (
+      with pkgs-2605; # must not bind the closed nix-2605 block
+      rec {
+        inherit # misleading later tools
           kyverno
         ;
       }
