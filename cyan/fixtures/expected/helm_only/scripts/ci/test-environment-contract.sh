@@ -9,11 +9,13 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 template_root=$(cd -- "$script_dir/../.." && pwd)
 scratch=$(mktemp -d)
+nix_shell_home=$scratch/nix-shell-home
 cleanup_scratch() {
   chmod -R u+rwX "$scratch" 2>/dev/null || true
   rm -r -- "$scratch"
 }
 trap cleanup_scratch EXIT
+install -d -m 0700 "$nix_shell_home"
 
 passed=0
 fail() {
@@ -998,7 +1000,7 @@ grep -Eq '^/nix/store/[a-z0-9]{32}-[^/]+\.drv$' "$scratch/ci-shell-darwin-drv" |
 
 # This single-quoted program is evaluated by the pure inner Bash, not here.
 # shellcheck disable=SC2016
-if ! "${nix_shell_develop[@]}" --command bash -ceu '
+if ! HOME=$nix_shell_home "${nix_shell_develop[@]}" --command bash -ceu '
     assertion=${1:?assertion required}
     shift
     failed=0
@@ -1085,7 +1087,8 @@ if [[ -f $source_template_root/cyan.yaml && -d $generated_fixture_root &&
       "$fixture_darwin_proof"
 
     for shell_name in default ci cd releaser; do
-      nix develop --offline --impure --ignore-environment --keep-env-var HOME \
+      HOME=$nix_shell_home \
+        nix develop --offline --impure --ignore-environment --keep-env-var HOME \
         --file "$ci_shell_composition" "${fixture_composition_args[@]}" \
         --argstr system x86_64-linux "$shell_name" --command "$nsc_shell_assertion" ||
         fail "generated fixture ${fixture_root##*/} shell $shell_name lost its exact runtime inputs"
