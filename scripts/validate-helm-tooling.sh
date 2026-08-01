@@ -189,14 +189,12 @@ require_in_list() {
 # derivation. Its closing `);` is deeper than the block's, and any `inherit` it declares
 # is deeper than the block's -- so a bare token scan would stop early (or accept a nested
 # declaration) instead of reading the block's real inherit list.
-require_inherited_from_channel() {
-  local file="$1"
-  local block="$2"
-  local source="$3"
-  local tool="$4"
-  local status=0
+channel_inheritance_status() {
+  local block="$1"
+  local source="$2"
+  local tool="$3"
+  local file="${4:--}"
 
-  [[ -f "${file}" ]] || fail "missing ${file}"
   awk -v block="${block}" -v source="${source}" -v tool="${tool}" '
     function indent_of(line) {
       sub(/[^[:space:]].*$/, "", line)
@@ -206,17 +204,17 @@ require_inherited_from_channel() {
     !inside && $0 ~ "^[[:space:]]*" block "[[:space:]]*=" {
       inside = 1
       code = 3
-      # The block ends at the first `);` sitting at exactly the opening indentation.
-      closer = "^" indent_of($0) "\\);[[:space:]]*$"
+      block_indent = indent_of($0)
+      # Both direct structural edges are derived from the outer block opener.
+      closer = "^" block_indent "\\);[[:space:]]*$"
+      direct_with = "^" block_indent "  with[[:space:]]+" source ";[[:space:]]*$"
       next
     }
     !inside { next }
-    !bound && $1 == "with" {
-      if ($2 != source ";") exit
+    !bound && $0 ~ direct_with {
       bound = 1
       code = 4
-      # The attrset body sits one level in from the `with` binding, so only an `inherit`
-      # at that exact depth belongs to this block.
+      # The inherit list must be one indentation level beneath the accepted direct with.
       inherit_re = "^" indent_of($0) "  inherit[[:space:]]*$"
       next
     }
@@ -225,7 +223,18 @@ require_inherited_from_channel() {
     in_inherit && $1 == tool { code = 0; exit }
     $0 ~ closer { exit }
     END { exit code }
-  ' "${file}" || status=$?
+  ' "${file}"
+}
+
+require_inherited_from_channel() {
+  local file="$1"
+  local block="$2"
+  local source="$3"
+  local tool="$4"
+  local status=0
+
+  [[ -f "${file}" ]] || fail "missing ${file}"
+  channel_inheritance_status "${block}" "${source}" "${tool}" "${file}" || status=$?
 
   case "${status}" in
     0) ;;
@@ -234,6 +243,149 @@ require_inherited_from_channel() {
     4) fail "expected ${tool} in the inherit declaration of ${block} in ${file}" ;;
     *) fail "unexpected status ${status} checking ${block}/${tool} in ${file}" ;;
   esac
+}
+
+expect_channel_inheritance() {
+  local name="$1"
+  local expectation="$2"
+  local status=0
+
+  channel_inheritance_status "${CHANNEL_BLOCK}" "${CHANNEL_SOURCE}" kyverno || status=$?
+  case "${expectation}:${status}" in
+    pass:0 | fail:[1-9]*) ;;
+    pass:*) fail "channel inheritance self-test ${name} rejected its direct declaration" ;;
+    fail:0) fail "channel inheritance self-test ${name} accepted a hostile declaration" ;;
+    *) fail "channel inheritance self-test ${name} has invalid expectation ${expectation}" ;;
+  esac
+}
+
+# Keep the structural guard honest without relying on generated fixtures. These cases are
+# intentionally fed through stdin so the validator owns its complete hostile matrix.
+run_channel_inheritance_self_tests() {
+  expect_channel_inheritance direct-control pass <<'NIX'
+    nix-2605 = (
+      with pkgs-2605;
+      rec {
+        inherit
+          kyverno
+        ;
+      }
+    );
+NIX
+
+  expect_channel_inheritance missing-tool fail <<'NIX'
+    nix-2605 = (
+      with pkgs-2605;
+      rec {
+        inherit
+          kubeconform
+        ;
+      }
+    );
+NIX
+
+  expect_channel_inheritance aliased-tool fail <<'NIX'
+    nix-2605 = (
+      with pkgs-2605;
+      rec {
+        kyverno = pkgs-2605.hello;
+      }
+    );
+NIX
+
+  expect_channel_inheritance nested-inherit fail <<'NIX'
+    nix-2605 = (
+      with pkgs-2605;
+      rec {
+        passthru = {
+          inherit
+            kyverno
+          ;
+        };
+        inherit
+          kubeconform
+        ;
+      }
+    );
+NIX
+
+  expect_channel_inheritance wrong-channel fail <<'NIX'
+    nix-2605 = (
+      with pkgs-unstable;
+      rec {
+        inherit
+          kyverno
+        ;
+      }
+    );
+NIX
+
+  expect_channel_inheritance renamed-block fail <<'NIX'
+    nix-2606 = (
+      with pkgs-2605;
+      rec {
+        inherit
+          kyverno
+        ;
+      }
+    );
+NIX
+
+  expect_channel_inheritance later-block-inherit fail <<'NIX'
+    nix-2605 = (
+      with pkgs-2605;
+      rec {
+        inherit
+          kubeconform
+        ;
+      }
+    );
+    nix-unstable = (
+      with pkgs-unstable;
+      rec {
+        inherit
+          kyverno
+        ;
+      }
+    );
+NIX
+
+  expect_channel_inheritance nested-binding-only fail <<'NIX'
+    nix-2605 = (
+      let
+        misleading = (
+          with pkgs-2605;
+          rec {
+            inherit
+              kyverno
+            ;
+          }
+        );
+      in
+      rec { }
+    );
+NIX
+
+  expect_channel_inheritance direct-amid-nested-control pass <<'NIX'
+    nix-2605 = (
+      let
+        misleading = (
+          with pkgs-2605;
+          rec {
+            inherit
+              kyverno
+            ;
+          }
+        );
+      in
+      with pkgs-2605;
+      rec {
+        inherit
+          kyverno
+        ;
+      }
+    );
+NIX
 }
 
 # The channel block must be merged into the file's result attrset, otherwise everything
@@ -349,6 +501,8 @@ while IFS= read -r fixture_dir; do
 done <<<"${disk_fixtures}"
 
 # --- tool assertions ----------------------------------------------------------------
+
+run_channel_inheritance_self_tests
 
 for tool in "${TOOLS[@]}"; do
   require_exactly_once "${SOURCE_ENV}" "${tool}"
