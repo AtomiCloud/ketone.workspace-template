@@ -20,7 +20,7 @@ while (($#)); do
   esac
 done
 
-for command in jq stat id ip awk sed grep; do
+for command in jq stat id ip awk sed grep sha256sum readlink cmp uname; do
   diene_require_command "$command"
 done
 kubectl_bin=${DIENE_KUBECTL_BIN:-kubectl}
@@ -70,6 +70,17 @@ kubernetes_version=$($kubectl_bin version -o json | jq -er '.serverVersion.gitVe
 diene_require_admitted_k3s_runtime "${DIENE_ADMITTED_K3S_VERSION:-}" \
   "$k3s_version" "$kubernetes_version"
 
+# Refined-by the generation-9 direct-binary ruling: the pre-Nix rail has
+# already verified and executed the pinned payload. Re-source the one exact
+# profile, then independently bind direct-path runtime identity before any
+# policy or application mutation. The canonical receipt is schema-free and is
+# packaged with the complete evidence tree.
+diene_source_guest_nix_profile "$DIENE_GUEST_NIX_PROFILE"
+guest_nix_evidence=$(diene_guest_nix_evidence_dir) || exit $?
+guest_nix=$(diene_guest_nix_identity "${DIENE_GUEST_NIX_INPUT:?}" "$guest_nix_evidence" \
+  "$DIENE_GUEST_NIX_BIN" "$DIENE_GUEST_NIX_STORE_ROOT" "$DIENE_GUEST_NIX_INSTALLED_COPY" \
+  "${DIENE_GUEST_NIX_INSTALLER_PATH:?}" "${DIENE_GUEST_NIX_PAYLOAD_PATH:?}" "$(uname -m)") || exit $?
+
 nodes=$($kubectl_bin get nodes -o json)
 jq -e '
   (.items | length) == 1 and
@@ -118,7 +129,7 @@ jq -n \
   --arg cpu "$cpu" --arg memory "$memory" --arg iptablesVersion "$iptables_version" \
   --argjson nodeCount "$node_count" --argjson podCidrs "$pod_cidrs" \
   --argjson serviceCidrs "$service_cidrs" --argjson ipv6Disabled "$ipv6_disabled" \
-  --argjson cacheAttached "$DIENE_CACHE_ATTACHED" '
+  --argjson cacheAttached "$DIENE_CACHE_ATTACHED" --argjson guestNix "$guest_nix" '
   {outcome:"Pass",reasonCode:"NamespaceWolfiBuiltInK3sReady",
    clusterId:$clusterId,identitySource:"cidfile-metadata-exact-id-ssh",
    os:{id:$osId,version:$osVersion,uid:0},
@@ -128,8 +139,11 @@ jq -n \
             namespaceIngress:false,publicBinding:false},
    storage:{defaultClass:"local-path"},
    policyBackend:{mechanism:"iptables",backend:"nf_tables",version:$iptablesVersion},
+   guestNix:$guestNix,
    cacheAttached:$cacheAttached,
    platformStatus:"platform per-instance policy pending (support ask #4)"}' |
   diene_write_json "$output"
+
+diene_require_guest_nix_preflight_agreement "$output" "$guest_nix_evidence/identity.json"
 
 printf 'NamespaceInstanceReady: %s\n' "$DIENE_NSC_CLUSTER_ID"

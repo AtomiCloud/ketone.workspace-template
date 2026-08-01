@@ -113,6 +113,9 @@ The production sequence is:
 validate protected trust, immutable subject, closure, declarations and fixtures
   -> require exact nsc v0.0.532 plus release-artifact and executable digests
   -> reject unsafe source names, links, hardlinks, FIFOs, devices and special entries
+  -> privately fetch the tagged guest-Nix provenance witness and the separately
+     pinned x86_64 installer payload; reject redirects, byte or digest drift
+     before nsc create
   -> materialize the exact egress contract
   -> derive the admitted full k3s version and its single Kubernetes feature
      selector from one helper, refusing malformed or unsupported admission
@@ -124,6 +127,8 @@ validate protected trust, immutable subject, closure, declarations and fixtures
   -> bind exact nsc version/artifact/executable identity to the receipt
   -> nsc instance upload <id> <local> <remote> --mkdir
   -> nsc ssh <id> -T <fixed-command>
+  -> reverify both guest-Nix assets and sidecars, refuse ambient Nix state,
+     execute only the pinned installer binary, and enter the pinned Nix shell
   -> verify the separately uploaded fixed validator and repeat source safety
      before constrained extraction into a fresh directory
   -> run the copied driver against built-in k3s
@@ -147,7 +152,9 @@ which is why any post-TTL survivor is an incident and a fresh run is required.
 
 Only immutable files cross into `/run/diene-ci`, which is mode `0700`: source
 archive, driver inputs, artifact subject, egress contract, the safe receipt
-projection, and a separately uploaded fixed archive validator plus checksum.
+projection, a separately uploaded fixed archive validator plus checksum, and
+the tagged guest-Nix provenance witness, pinned x86_64 installer payload, and
+their checksum sidecars.
 The outer and remote validators accept only unique normalized relative names
 and regular-file/directory members. Collection repeats those checks before
 extraction and rejects any unreadable, linked, or special extracted object.
@@ -155,6 +162,70 @@ No `NSC_TOKEN`, GitHub token, SSH agent, destroy authority, vendor credential,
 kubeconfig body, or other capability is copied. The shared shell may expose
 the pinned client binary on the guest, but the driver has no Namespace
 authority and never invokes it.
+
+## Pinned guest Nix acquisition and identity
+
+Refined-by the generation-9 direct-binary ruling: the earlier freeze rationale
+treated `GuestNixToolchainAbsent` as a prohibition on downloading or installing
+Nix. Its fail-closed intent remains binding, but that blanket no-bootstrap
+interpretation is superseded. The same diagnostic and exit-64 guard now means
+that a fully verified install still failed to expose the required toolchain; it
+never permits an ambient or partially identified Nix installation to pass.
+
+The orchestrator acquires two Determinate v3.21.9 artifacts before `nsc
+create`. The tagged shell is an unexecuted provenance witness. The
+architecture-specific binary is an independently pinned execution trust root.
+Each acquisition uses HTTPS with TLS 1.2 or newer, refuses redirects, validates
+the expected byte count before the full SHA-256, and atomically publishes a
+mode-0600 file only at a fresh, real-directory target; existing objects and
+linked publication targets or parents refuse before fetch. Acquisition failure
+therefore has no Namespace create side effect. The immutable URLs, byte counts,
+and digests have one source of truth in `environment-lib.sh`; the rolling
+endpoint, pipe-to-shell forms, alternate package URLs, upstream preference,
+force/plan overrides, and unpinned installer paths remain forbidden.
+
+Both assets and their checksum sidecars cross the existing ordered transfer
+chain. The fixed POSIX guest template materializes its expected digest and byte
+pins only from the centrally validated contract, then requires each asset and
+its exact one-line sidecar to match those independent expected values before
+either can gain execute permission. An asset and sidecar altered together
+cannot self-authorize. The shell witness stays mode `0600` and is never run.
+The guest must be exactly `x86_64`, contain neither an ambient `nix` command nor
+pre-existing `/nix` state, and report `nix-installer 3.21.9` from the verified
+payload before installation. The installer proof retains raw stdout and stderr
+in separate private files and accepts only empty stderr plus the exact 21-byte,
+one-line stdout `nix-installer 3.21.9` followed by one newline. It executes only
+`install linux --no-confirm --init none`; the diagnostic endpoint is disabled
+through the environment without changing that argv. The exact default profile
+is sourced with shell error and unset-variable handling temporarily relaxed,
+then strict handling is restored before the retained toolchain guard. The
+identity field `profileSourced:true` means that exact profile returned success;
+an attempted source that returns nonzero is refused before identity acceptance.
+
+Preflight independently verifies the fixed
+`/nix/var/nix/profiles/default/bin/nix` path before policy or application
+mutation. Its raw version result must be exactly the 35-character line `nix
+(Determinate Nix 3.21.9) 2.34.8` plus one newline, with empty stderr. The
+resolved target must be a regular executable `/nix/store/*/bin/nix`; its digest,
+the installed `/nix/nix-installer` digest, and both still-uploaded artifact
+digests must agree with the admitted contract.
+
+One canonical JSON object supplies the schema-free identity proof. The private
+`evidence/guest-nix/identity.json` receipt records both artifact identities and
+lengths, architecture, direct-binary execution mode, exact argv, installer and
+Nix versions, initialization and profile facts, resolved store path and digest,
+and installed-copy digest. Preflight embeds that same object plus the receipt's
+SHA-256 as `guestNix.identityReceiptDigest`; removing only that digest must make
+the two objects equal exactly. The existing `instance-preflight` checkpoint
+binds the complete preflight bytes, so the terminal proof carries both the
+mode-0600 receipt and its checkpoint-bound digest without expanding the
+schema-validated CI receipt or report.
+
+The installer payload remains inside the mandatory outer leakage-scan surfaces;
+it has no scan exclusion. Transfer, shell entry, and scan wall-clock remain
+measurement items within the two-hour ephemeral-instance TTL. Cleanup is still
+only exact Namespace destroy plus positive absence proof: no Nix uninstall step
+can mask a lifecycle failure.
 
 ## Guest posture and endpoint law
 
@@ -298,6 +369,8 @@ A green terminal report requires:
 - create, transfer, SSH, collection, destroy, and absence phase receipts;
 - exact `nsc` v0.0.532 release-artifact and executable digests in the receipt
   and report;
+- a schema-free guest-Nix identity receipt whose digest agrees with preflight
+  and is bound by the `instance-preflight` checkpoint;
 - host and actual-pod hostile probes;
 - a valid immutable checkpoint predecessor chain ending in a non-resumed
   `final-clean-pass`;
@@ -326,8 +399,10 @@ release/executable identity drift, unsafe archive names and all special member
 types, pre-create refusals, remote revalidation, SSH and collection loss,
 unreadable/special proof suppression, grep status errors, stale-artifact
 removal, destroy failure, signals, parallel tuple isolation, report namespaces,
-policy probes/removal, leakage, checkpoint chains, and forbidden substrate
-strings.
+policy probes/removal, leakage, checkpoint chains, forbidden substrate strings,
+and the hostile guest-Nix acquisition/install/identity matrix. It also checks
+the collected kernel-socket observation against the digest bound in collected
+`policy.json`; production keeps the dual-source socket contract unchanged.
 
 Run the canonical gates from the generated repository's CI shell:
 

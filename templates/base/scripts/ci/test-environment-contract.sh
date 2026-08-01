@@ -66,7 +66,7 @@ expect_precreate_refusal() {
   ok "$reason refuses before nsc create"
 }
 
-for command in jq yq check-jsonschema sha256sum tar grep sed awk find timeout rg base64 stat nix; do
+for command in jq yq check-jsonschema sha256sum tar grep sed awk find timeout rg base64 stat nix cmp readlink diff; do
   command -v "$command" >/dev/null 2>&1 || fail "$command is required for the contract suite"
 done
 
@@ -88,6 +88,69 @@ cp -R "$template_root/schemas/ci" "$work/schemas/"
 cp "$script_dir"/environment-*.sh "$work/scripts/ci/"
 cp "$template_root/.github/workflows/⚡reusable-environment-k3d.yaml" "$work/.github/workflows/"
 chmod 0755 "$work/scripts/ci"/*.sh
+
+# The production pins remain asserted from template_root below. The synthetic
+# lifecycle copy uses tiny deterministic stand-ins so every fake Namespace run
+# exercises the real fetch/length/digest/publish/upload rail without a network
+# dependency or a repeated 73 MB transfer.
+guest_nix_fixture_dir=$scratch/guest-nix-fixture
+install -d -m 0700 "$guest_nix_fixture_dir"
+printf '%s\n' '#!/bin/sh' 'printf provenance-witness-only' \
+  >"$guest_nix_fixture_dir/guest-nix-bootstrap.sh"
+printf '%s\n' 'synthetic-direct-installer-payload' \
+  >"$guest_nix_fixture_dir/guest-nix-installer"
+chmod 0600 "$guest_nix_fixture_dir/guest-nix-bootstrap.sh" \
+  "$guest_nix_fixture_dir/guest-nix-installer"
+guest_nix_fixture_installer_digest="sha256:$(sha256sum "$guest_nix_fixture_dir/guest-nix-bootstrap.sh" | awk '{print $1}')"
+guest_nix_fixture_payload_digest="sha256:$(sha256sum "$guest_nix_fixture_dir/guest-nix-installer" | awk '{print $1}')"
+guest_nix_fixture_installer_bytes=$(wc -c <"$guest_nix_fixture_dir/guest-nix-bootstrap.sh")
+guest_nix_fixture_payload_bytes=$(wc -c <"$guest_nix_fixture_dir/guest-nix-installer")
+sed -i \
+  -e "s|^DIENE_GUEST_NIX_INSTALLER_DIGEST=.*|DIENE_GUEST_NIX_INSTALLER_DIGEST=$guest_nix_fixture_installer_digest|" \
+  -e "s|^DIENE_GUEST_NIX_INSTALLER_BYTES=.*|DIENE_GUEST_NIX_INSTALLER_BYTES=$guest_nix_fixture_installer_bytes|" \
+  -e "s|^DIENE_GUEST_NIX_PAYLOAD_DIGEST=.*|DIENE_GUEST_NIX_PAYLOAD_DIGEST=$guest_nix_fixture_payload_digest|" \
+  -e "s|^DIENE_GUEST_NIX_PAYLOAD_BYTES=.*|DIENE_GUEST_NIX_PAYLOAD_BYTES=$guest_nix_fixture_payload_bytes|" \
+  "$work/scripts/ci/environment-lib.sh"
+
+fake_guest_nix_curl=$scratch/guest-nix-curl
+cat >"$fake_guest_nix_curl" <<'CURL'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%q ' "$@" >>"${FAKE_GUEST_NIX_CURL_LOG:?}"
+printf '\n' >>"$FAKE_GUEST_NIX_CURL_LOG"
+output=
+url=
+while (($#)); do
+  case $1 in
+    --output) output=${2:?}; shift 2 ;;
+    --proto | --proto-redir | --max-redirs | --max-time | --retry) shift 2 ;;
+    --fail | --show-error | --silent | --tlsv1.2 | --location) shift ;;
+    https://*) url=$1; shift ;;
+    *) exit 127 ;;
+  esac
+done
+[[ -n $output && -n $url ]] || exit 127
+scenario=${FAKE_GUEST_NIX_FETCH_SCENARIO:-happy}
+case $scenario in
+  redirect) exit 47 ;;
+  transport-fail) exit 22 ;;
+esac
+case $url in
+  */nix-installer-x86_64-linux) source_file=${FAKE_GUEST_NIX_SOURCE_DIR:?}/guest-nix-installer; kind=payload ;;
+  */tag/v3.21.9) source_file=${FAKE_GUEST_NIX_SOURCE_DIR:?}/guest-nix-bootstrap.sh; kind=installer ;;
+  *) exit 127 ;;
+esac
+case $scenario in
+  "$kind-short") printf x >"$output" ;;
+  "$kind-digest")
+    cp "$source_file" "$output"
+    printf X | dd of="$output" bs=1 seek=0 conv=notrunc status=none
+    ;;
+  happy) cp "$source_file" "$output" ;;
+  *) cp "$source_file" "$output" ;;
+esac
+CURL
+chmod 0755 "$fake_guest_nix_curl"
 
 cat >"$work/.diene/ci/artifact-producer.sh" <<'SH'
 #!/usr/bin/env bash
@@ -347,8 +410,56 @@ create_metadata=${FAKE_NSC_ROOT:?}/instances/$cluster_id/meta.json
 
 # shellcheck disable=SC1091
 source "${TEMPLATE_SCRIPT_DIR:?}/environment-lib.sh"
+
+guest_nix_contract=$(jq -ce '.guestNix' "$inputs")
+guest_nix_evidence=$evidence/guest-nix
+install -d -m 0700 "$guest_nix_evidence"
+guest_nix_identity=$(jq -Scn --argjson contract "$guest_nix_contract" \
+  --arg storePath /nix/store/synthetic-determinate/bin/nix \
+  --arg storePathDigest sha256:7777777777777777777777777777777777777777777777777777777777777777 \
+  --arg installedCopyDigest "$(jq -r '.payloadDigest' <<<"$guest_nix_contract")" '
+  $contract + {storePath:$storePath,storePathDigest:$storePathDigest,
+    installedCopyDigest:$installedCopyDigest,profileSourced:true}')
+printf '%s\n' "$guest_nix_identity" | diene_write_json "$guest_nix_evidence/identity.json"
+guest_nix_receipt_digest=$(diene_file_digest "$guest_nix_evidence/identity.json")
+guest_nix_preflight=$(jq -c --arg digest "$guest_nix_receipt_digest" \
+  '. + {identityReceiptDigest:$digest}' "$guest_nix_evidence/identity.json")
+
+install -d -m 0700 "$evidence/staging/orchestration"
+printf '%s\n' 'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' \
+  >"$evidence/staging/orchestration/ss-observation.txt"
+chmod 0600 "$evidence/staging/orchestration/ss-observation.txt"
+socket_digest=$(diene_file_digest "$evidence/staging/orchestration/ss-observation.txt")
+jq -n --arg digest "$socket_digest" '
+  {orchestrationTupleSource:"kernel-ss",orchestrationFlowCount:1,
+   orchestrationSelectedRow:"ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242",
+   orchestrationObservationDigest:$digest,
+   orchestrationObservationArtifact:"orchestration/ss-observation.txt"}' \
+  >"$evidence/policy.json"
+chmod 0600 "$evidence/policy.json"
+
+jq -n --arg cluster "$cluster_id" --arg k3s "$admitted_k3s" \
+  --argjson guestNix "$guest_nix_preflight" '
+  {outcome:"Pass",reasonCode:"NamespaceWolfiBuiltInK3sReady",clusterId:$cluster,
+   identitySource:"cidfile-metadata-exact-id-ssh",os:{id:"wolfi",version:"rolling",uid:0},
+   k3s:{version:$k3s,kubernetesVersion:$k3s,nodeCount:1,
+        capacity:{cpu:"16",memory:"32Gi"}},
+   network:{podCidrs:["10.142.0.0/16"],serviceCidrs:["10.143.0.0/16"],ipv6Disabled:false,
+            namespaceIngress:false,publicBinding:false},storage:{defaultClass:"local-path"},
+   policyBackend:{mechanism:"iptables",backend:"nf_tables",version:"iptables v1.8.13 (nf_tables)"},
+   guestNix:$guestNix,
+   cacheAttached:false,platformStatus:"platform per-instance policy pending (support ask #4)"}' \
+  >"$evidence/preflight.json"
+chmod 0600 "$evidence/preflight.json"
+jq -e --arg digest "$guest_nix_receipt_digest" --slurpfile identity "$guest_nix_evidence/identity.json" '
+  (.guestNix | del(.identityReceiptDigest)) == $identity[0] and
+  .guestNix.identityReceiptDigest == $digest
+' "$evidence/preflight.json" >/dev/null
+
 input_digest=$(diene_sha256_text "$(jq -cS . "$inputs")")
 diene_checkpoint_init "$evidence/checkpoint-chain.json" "$input_digest"
+diene_checkpoint_append "$evidence/checkpoint-chain.json" instance-preflight Pass \
+  "$(diene_file_digest "$evidence/preflight.json")" false
 if [[ $scenario == checkpoint-resumed ]]; then
   diene_checkpoint_append "$evidence/checkpoint-chain.json" resumed-readiness Pass \
     "$(diene_sha256_text "$cluster_id|resumed-readiness")" true
@@ -369,17 +480,6 @@ if [[ $scenario == checkpoint-broken ]]; then
     "$evidence/checkpoint-chain.json" >"$evidence/checkpoint-chain.json.tmp"
   mv "$evidence/checkpoint-chain.json.tmp" "$evidence/checkpoint-chain.json"
 fi
-
-jq -n --arg cluster "$cluster_id" --arg k3s "$admitted_k3s" '
-  {outcome:"Pass",reasonCode:"NamespaceWolfiBuiltInK3sReady",clusterId:$cluster,
-   identitySource:"cidfile-metadata-exact-id-ssh",os:{id:"wolfi",version:"rolling",uid:0},
-   k3s:{version:$k3s,kubernetesVersion:$k3s,nodeCount:1,
-        capacity:{cpu:"16",memory:"32Gi"}},
-   network:{podCidrs:["10.142.0.0/16"],serviceCidrs:["10.143.0.0/16"],ipv6Disabled:false,
-            namespaceIngress:false,publicBinding:false},storage:{defaultClass:"local-path"},
-   policyBackend:{mechanism:"iptables",backend:"nf_tables",version:"iptables v1.8.13 (nf_tables)"},
-   cacheAttached:false,platformStatus:"platform per-instance policy pending (support ask #4)"}' \
-  >"$evidence/preflight.json"
 
 jq -n '[
   {id:"preexisting-flow-transition-denial",outcome:"Pass",reasonCode:"NoGrandfatheredExternalFlow",required:true},
@@ -554,6 +654,15 @@ root=${FAKE_NSC_ROOT:?}
 log=${FAKE_NSC_LOG:?}
 scenario=${FAKE_NSC_SCENARIO:-happy}
 install -d -m 0700 "$root/instances" "$root/stale"
+fake_guest_nix_pinned_asset_valid() {
+  local asset=${1:?asset required} sidecar=${2:?sidecar required}
+  local expected_digest=${3:?digest required} expected_bytes=${4:?byte length required}
+  local expected_line="${expected_digest#sha256:}  $asset"
+  [[ -f $asset && ! -L $asset && -f $sidecar && ! -L $sidecar ]] &&
+    [[ $(wc -c <"$asset") == "$expected_bytes" && $(wc -l <"$sidecar") == 1 ]] &&
+    [[ $(sha256sum "$asset") == "$expected_line" && $(<"$sidecar") == "$expected_line" ]] &&
+    sha256sum -c "$sidecar" >/dev/null 2>&1
+}
 printf '%q ' "$@" >>"$log"
 printf '\n' >>"$log"
 command=${1:-}
@@ -650,16 +759,101 @@ case $command in
     state="$root/instances/$id/fs/run/diene-ci"
     [[ $remote_command == *'sha256sum -c archive-validator.sha256'* &&
       $remote_command == *'./archive-validator.sh source.tar source'* ]] || exit 67
-    # The fixed remote command must carry the exact fail-closed guest Nix guard.
-    # Nothing here bootstraps a toolchain; the driver rail stays real and the
-    # absence stays an explicit, stable diagnostic.
-    [[ $remote_command == *"${FAKE_GUEST_NIX_GUARD:?}"* ]] || exit 69
+    # Bind the fixed program text, then simulate its ordered side effects. The
+    # production string remains the authority; the synthetic guest supplies
+    # only outer lifecycle evidence.
+    [[ $remote_command == *"${FAKE_GUEST_NIX_GUARD:?}"* &&
+      $remote_command == *'uname -m'* &&
+      $remote_command == *'guest_nix_pinned_asset_valid guest-nix-bootstrap.sh guest-nix-bootstrap.sha256'* &&
+      $remote_command == *'guest_nix_pinned_asset_valid guest-nix-installer guest-nix-installer.sha256'* &&
+      $remote_command == *'./guest-nix-installer --version'* &&
+      $remote_command == *'installer-version.stderr'* &&
+      $remote_command == *"'nix-installer 3.21.9' 21"* &&
+      $remote_command == *'guest_nix_exact_output_valid'* &&
+      $remote_command == *"NIX_INSTALLER_DIAGNOSTIC_ENDPOINT='' ./guest-nix-installer install linux --no-confirm --init none"* &&
+      $remote_command == *'guest_nix_source_profile /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh'* &&
+      $remote_command == *'exec /nix/var/nix/profiles/default/bin/nix '* ]] || exit 69
+    guest_nix_installer_digest=$(jq -er '.guestNix.installerDigest' "$state/inputs.json")
+    guest_nix_installer_bytes=$(jq -er '.guestNix.installerBytes' "$state/inputs.json")
+    guest_nix_payload_digest=$(jq -er '.guestNix.payloadDigest' "$state/inputs.json")
+    guest_nix_payload_bytes=$(jq -er '.guestNix.payloadBytes' "$state/inputs.json")
+    [[ $remote_command == *"guest_nix_installer_digest=${guest_nix_installer_digest}"* &&
+      $remote_command == *"guest_nix_installer_bytes=${guest_nix_installer_bytes}"* &&
+      $remote_command == *"guest_nix_payload_digest=${guest_nix_payload_digest}"* &&
+      $remote_command == *"guest_nix_payload_bytes=${guest_nix_payload_bytes}"* ]] || exit 69
+    [[ $remote_command != *'sh ./guest-nix-bootstrap.sh'* &&
+      $remote_command != *'guest-nix-bootstrap.sh install'* ]] || exit 69
     if [[ $scenario == remote-source-special ]]; then
       cp "${FAKE_HOSTILE_SOURCE_ARCHIVE:?}" "$state/source.tar"
     fi
     (cd "$state" && sha256sum -c archive-validator.sha256 >/dev/null)
     chmod 0500 "$state/archive-validator.sh"
     "$state/archive-validator.sh" "$state/source.tar" "$state/source"
+    event_log=${FAKE_GUEST_NIX_EVENT_LOG:?}
+    case $scenario in
+      guest-wrong-arch)
+        printf '%s\n' arch-refused >>"$event_log"
+        printf '%s\n' 'GuestNixInstallerUnsupportedArch: the guest architecture is not the pinned x86_64 target' >&2
+        exit 64
+        ;;
+      guest-preexisting)
+        printf '%s\n' preexisting-refused >>"$event_log"
+        printf '%s\n' 'GuestNixPreexistingState: the ephemeral guest already contains Nix or /nix state' >&2
+        exit 64
+        ;;
+      guest-upload-bootstrap-tamper) printf X >>"$state/guest-nix-bootstrap.sh" ;;
+      guest-upload-payload-tamper) printf X >>"$state/guest-nix-installer" ;;
+      guest-upload-sidecar-tamper) printf X >>"$state/guest-nix-installer.sha256" ;;
+      guest-upload-bootstrap-pair-tamper)
+        printf X | dd of="$state/guest-nix-bootstrap.sh" bs=1 seek=0 conv=notrunc status=none
+        (cd "$state" && sha256sum guest-nix-bootstrap.sh >guest-nix-bootstrap.sha256)
+        ;;
+      guest-upload-payload-pair-tamper)
+        printf X | dd of="$state/guest-nix-installer" bs=1 seek=0 conv=notrunc status=none
+        (cd "$state" && sha256sum guest-nix-installer >guest-nix-installer.sha256)
+        ;;
+      guest-upload-payload-symlink)
+        cp "$state/guest-nix-installer" "$state/guest-nix-installer.link-target"
+        rm "$state/guest-nix-installer"
+        ln -s guest-nix-installer.link-target "$state/guest-nix-installer"
+        ;;
+    esac
+    if ! (cd "$state" &&
+      fake_guest_nix_pinned_asset_valid guest-nix-bootstrap.sh guest-nix-bootstrap.sha256 \
+        "$guest_nix_installer_digest" "$guest_nix_installer_bytes" &&
+      fake_guest_nix_pinned_asset_valid guest-nix-installer guest-nix-installer.sha256 \
+        "$guest_nix_payload_digest" "$guest_nix_payload_bytes"); then
+      printf '%s\n' verify-refused >>"$event_log"
+      printf '%s\n' 'GuestNixInstallerUntrusted: an uploaded guest Nix artifact or sidecar changed' >&2
+      exit 64
+    fi
+    printf '%s\n' uploads-verified >>"$event_log"
+    printf '%s\n' installer-version-probe >>"$event_log"
+    case $scenario in
+      guest-wrong-installer-version | guest-empty-installer-version | \
+        guest-multiline-installer-version | guest-extra-newline-installer-version | \
+        guest-installer-version-stderr)
+        printf '%s\n' version-refused >>"$event_log"
+        printf '%s\n' 'GuestNixInstallerUntrusted: the pinned installer version output is not exact' >&2
+        exit 64
+        ;;
+    esac
+    printf '%s\n' 'installer-version nix-installer 3.21.9' >>"$event_log"
+    printf '%s\n' 'installer-argv install linux --no-confirm --init none' >>"$event_log"
+    if [[ $scenario == guest-installer-fail ]]; then
+      printf '%s\n' 'GuestNixInstallFailed: the pinned guest Nix installer failed' >&2
+      exit 64
+    fi
+    printf '%s\n' profile-source >>"$event_log"
+    if [[ $scenario == guest-profile-source-fail ]]; then
+      printf '%s\n' 'GuestNixProfileSourceFailed: the exact guest Nix profile returned nonzero while being sourced' >&2
+      exit 64
+    fi
+    if [[ $scenario == guest-toolchain-absent ]]; then
+      printf '%s\n' 'GuestNixToolchainAbsent: the instance provides no nix command for the driver entry' >&2
+      exit 64
+    fi
+    printf '%s\n' nix-develop >>"$event_log"
     "${FAKE_GUEST_BIN:?}" "$state" "$id"
     ;;
   destroy)
@@ -729,6 +923,9 @@ prepare_run() {
   export DIENE_NSC_IDENTITY_FILE=$fake_nsc_identity
   export FAKE_NSC_ROOT=$nsc_root FAKE_NSC_LOG=$nsc_root/log FAKE_GUEST_BIN=$fake_guest
   export FAKE_GUEST_NIX_GUARD=$guest_nix_guard
+  export FAKE_GUEST_NIX_EVENT_LOG=$runner/guest-nix-events.log
+  export DIENE_CURL_BIN=$fake_guest_nix_curl FAKE_GUEST_NIX_SOURCE_DIR=$guest_nix_fixture_dir
+  export FAKE_GUEST_NIX_CURL_LOG=$runner/guest-nix-curl.log
   export TEMPLATE_SCRIPT_DIR=$work/scripts/ci RUNNER_TEMP=$runner DIENE_SCHEMA_DIR=$work/schemas/ci
   export DIENE_CORE_REPORT=$runner/diene-environment-report.v1.json
   export DIENE_VENDOR_REPORT=$runner/diene-vendor-report.v1.json
@@ -736,7 +933,8 @@ prepare_run() {
   export DIENE_LEAK_CANARY="contract-canary-$run_id" DIENE_NSC_ABSENCE_WAIT_SECONDS=0
   export DIENE_NSC_ABSENCE_INTERVAL_SECONDS=1 GITHUB_OUTPUT=$runner/github-output
   export GITHUB_ENV=$runner/github-env GITHUB_STEP_SUMMARY=$runner/summary
-  : >"$FAKE_NSC_LOG"; : >"$GITHUB_OUTPUT"; : >"$GITHUB_ENV"; : >"$GITHUB_STEP_SUMMARY"
+  : >"$FAKE_NSC_LOG"; : >"$FAKE_GUEST_NIX_CURL_LOG"; : >"$FAKE_GUEST_NIX_EVENT_LOG"
+  : >"$GITHUB_OUTPUT"; : >"$GITHUB_ENV"; : >"$GITHUB_STEP_SUMMARY"
   unset DIENE_ARTIFACT_PROVENANCE_REF DIENE_ARTIFACT_ATTESTATION_DIGEST
   unset DIENE_CLOSURE_DIGEST DIENE_CLOSURE_BUNDLE_REF
   unset DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST DIENE_CLOSURE_TRUST_ROOT_DIGEST
@@ -750,6 +948,7 @@ prepare_run() {
   unset FAKE_TABLE_FAIL_REGEX FAKE_RESOLVER_IPV4 FAKE_BROKER_FAIL_COMMAND
   unset FAKE_NODE_POD_CIDRS DIENE_IPV6_DISABLE_PATH DIENE_EVIDENCE_STAGING
   unset FAKE_HOSTILE_SOURCE_ARCHIVE
+  unset FAKE_GUEST_NIX_FETCH_SCENARIO
   unset DIENE_GREP_BIN
   if [[ $lane == ditto-target-pull ]]; then
     export DIENE_ARTIFACT_PROVENANCE_REF="oci://ghcr.io/atomicloud/example/provenance/$SOURCE_SHA"
@@ -1944,7 +2143,23 @@ jq -e '.kubernetes_feature == "kubernetes:1.33" and .labels["nsc.kubernetes"] ==
 if grep -Eq -- '(^| )--bare( |$)|--k3s[-_]image|--image( |=)|--ingress|--endpoint' "$happy_log"; then
   fail 'create substituted a bare, replacement-image, ingress, or endpoint surface'
 fi
-[[ $(grep -Ec '^instance upload ' "$happy_log") == 7 ]] || fail 'immutable upload count is not exactly seven'
+expected_uploads=$scratch/expected-guest-nix-uploads
+actual_uploads=$scratch/actual-guest-nix-uploads
+printf '%s\n' \
+  /run/diene-ci/archive-validator.sh \
+  /run/diene-ci/archive-validator.sha256 \
+  /run/diene-ci/artifact-subject.json \
+  /run/diene-ci/egress-contract.json \
+  /run/diene-ci/guest-nix-bootstrap.sh \
+  /run/diene-ci/guest-nix-bootstrap.sha256 \
+  /run/diene-ci/guest-nix-installer \
+  /run/diene-ci/guest-nix-installer.sha256 \
+  /run/diene-ci/inputs.json \
+  /run/diene-ci/receipt.json \
+  /run/diene-ci/source.tar | LC_ALL=C sort >"$expected_uploads"
+awk '$1 == "instance" && $2 == "upload" {print $5}' "$happy_log" | LC_ALL=C sort >"$actual_uploads"
+diff -u "$expected_uploads" "$actual_uploads" >/dev/null ||
+  fail 'the immutable upload path set is not the exact seven originals plus four guest Nix files'
 [[ $(grep -Ec '^instance download ' "$happy_log") == 2 ]] || fail 'fixed proof download count is not exactly two'
 grep -Eq "^ssh ${happy_cluster} -T " "$happy_log" || fail 'driver did not use exact-id noninteractive ssh'
 [[ $(grep -Ec "^destroy --force ${happy_cluster} " "$happy_log") == 1 ]] ||
@@ -1969,6 +2184,59 @@ jq -e --arg binary "$fake_nsc_binary_digest" '
   .tooling.nscBinaryDigest == $binary
 ' "$scratch/happy-receipt.json" >/dev/null || fail 'the exact receipt lost immutable nsc identity evidence'
 ok 'create/cid agreement/upload/ssh/download/exact destroy/list absence use measured nsc syntax'
+
+happy_instance_state="$FAKE_NSC_ROOT/instances/$happy_cluster/fs/run/diene-ci"
+for guest_asset in guest-nix-bootstrap.sh guest-nix-bootstrap.sha256 \
+  guest-nix-installer guest-nix-installer.sha256; do
+  [[ -f $happy_instance_state/$guest_asset && ! -L $happy_instance_state/$guest_asset ]] ||
+    fail "the verified guest Nix upload $guest_asset is absent"
+  [[ $(stat -c %a -- "$happy_instance_state/$guest_asset") == 600 ]] ||
+    fail "the verified guest Nix upload $guest_asset is not mode 0600"
+done
+(cd "$happy_instance_state" && sha256sum -c guest-nix-bootstrap.sha256 >/dev/null &&
+  sha256sum -c guest-nix-installer.sha256 >/dev/null) ||
+  fail 'the uploaded guest Nix assets do not match their exact sidecars'
+grep -Fxq -- 'installer-argv install linux --no-confirm --init none' "$FAKE_GUEST_NIX_EVENT_LOG" ||
+  fail 'the fake installer did not capture the exact measured install argv'
+grep -Fxq -- nix-develop "$FAKE_GUEST_NIX_EVENT_LOG" ||
+  fail 'the happy guest rail did not reach nix develop after its identity gates'
+ok 'both private pinned assets and exact sidecars upload and re-verify before the measured installer argv'
+
+happy_collected=$(find "$RUNNER_TEMP/diene-namespace" -path '*/collected/evidence' -type d -print -quit)
+[[ -n $happy_collected ]] || fail 'the happy lifecycle retained no safely extracted evidence tree'
+happy_identity=$happy_collected/guest-nix/identity.json
+happy_preflight=$happy_collected/preflight.json
+[[ -f $happy_identity && ! -L $happy_identity && $(stat -c %a -- "$happy_identity") == 600 ]] ||
+  fail 'the collected guest Nix identity receipt is not a regular mode-0600 file'
+happy_identity_digest="sha256:$(sha256sum "$happy_identity" | awk '{print $1}')"
+jq -e --arg digest "$happy_identity_digest" --slurpfile identity "$happy_identity" '
+  .guestNix.payloadDigestVerified == true and
+  .guestNix.executionMode == "direct-pinned-binary" and
+  .guestNix.installerVersion == "nix-installer 3.21.9" and
+  .guestNix.nixVersion == "nix (Determinate Nix 3.21.9) 2.34.8" and
+  .guestNix.argv == ["install","linux","--no-confirm","--init","none"] and
+  .guestNix.identityReceiptDigest == $digest and
+  (.guestNix | del(.identityReceiptDigest)) == $identity[0]
+' "$happy_preflight" >/dev/null ||
+  fail 'the collected identity receipt and preflight object do not agree exactly'
+happy_preflight_digest="sha256:$(sha256sum "$happy_preflight" | awk '{print $1}')"
+jq -e --arg digest "$happy_preflight_digest" '
+  [.checkpoints[] | select(.id == "instance-preflight" and .evidenceDigest == $digest)] | length == 1
+' "$happy_collected/checkpoint-chain.json" >/dev/null ||
+  fail 'the checkpoint chain does not bind the preflight object containing the identity receipt digest'
+ok 'mode-0600 guest Nix identity agrees with preflight and is transitively checkpoint-bound'
+
+happy_socket=$happy_collected/staging/orchestration/ss-observation.txt
+[[ -f $happy_socket && ! -L $happy_socket && $(stat -c %a -- "$happy_socket") == 600 ]] ||
+  fail 'the safely collected proof lost the regular mode-0600 raw socket observation'
+happy_socket_digest="sha256:$(sha256sum "$happy_socket" | awk '{print $1}')"
+jq -e --arg digest "$happy_socket_digest" '
+  .orchestrationTupleSource == "kernel-ss" and
+  .orchestrationObservationArtifact == "orchestration/ss-observation.txt" and
+  .orchestrationObservationDigest == $digest
+' "$happy_collected/policy.json" >/dev/null ||
+  fail 'collected policy.json does not digest-bind the retained raw socket observation'
+ok 'the safely extracted proof retains the raw socket artifact bound by collected policy.json'
 
 uploaded_validator="$FAKE_NSC_ROOT/instances/$happy_cluster/fs/run/diene-ci/archive-validator.sh"
 [[ -x $uploaded_validator ]] || fail 'the immutable remote archive validator was not uploaded'
@@ -3365,7 +3633,7 @@ done
 chmod -R u+rwX "$scratch/policy-kernel-ss-staging-unwritable-staging" 2>/dev/null || true
 ok 'observation, staging, retention, and parse failures all refuse before any policy artifact exists'
 
-printf '== the fixed remote command refuses an absent guest nix ==\n'
+printf '== the fixed remote command pins and verifies guest nix ==\n'
 
 nix_guard_probe=$scratch/nix-guard-probe.sh
 {
@@ -3392,14 +3660,222 @@ env -i "PATH=$nix_guard_bin" "$BASH" "$nix_guard_probe" \
   fail 'the guest nix guard refused an instance that does provide nix'
 grep -Fxq -- GuestNixToolchainPresent "$scratch/nix-guard-present.out" ||
   fail 'the guest nix guard did not fall through to the driver entry'
-# The harness itself carries these tokens inside this very pattern, so only the
-# production driver rail is scanned for an ambient bootstrap.
-if rg -n --glob '!test-*.sh' \
-  'curl[^|]*\|[[:space:]]*(sh|bash)|nix-installer|install\.determinate\.systems|nixos\.org/nix/install' \
-  "$template_root/scripts/ci" >"$scratch/guest-nix-bootstrap"; then
+# Refined-by the generation-9 direct-binary ruling: preserve the old blanket
+# bootstrap guard's intent while admitting only the two exact immutable tagged
+# assets. The harness carries hostile tokens, so scan production files only.
+# Join shell continuations before matching, retain a non-whitespace boundary
+# between files, and scan pipe continuations in multiline mode. A forbidden
+# command therefore cannot evade the scan by moving onto the next physical
+# line, and two unrelated files cannot combine into one synthetic command. The
+# shell-command token boundary excludes the `.sh` suffix in a benign helper.
+guest_nix_production_normalized=$scratch/guest-nix-production-normalized
+: >"$guest_nix_production_normalized"
+while IFS= read -r guest_nix_production_file; do
+  sed ':join; /\\$/ { N; s/\\\n[[:space:]]*/ /; b join; }' \
+    "$guest_nix_production_file" >>"$guest_nix_production_normalized"
+  printf '\nDIENE_GUEST_NIX_FILE_BOUNDARY\n' >>"$guest_nix_production_normalized"
+done < <(find "$template_root/scripts/ci" -type f -name '*.sh' ! -name 'test-*.sh' -print | LC_ALL=C sort)
+
+guest_nix_pipe_shell_regex='curl[^\r\n|]*\|[[:space:]]*(sh|bash)($|[;&|<>[:space:]])'
+guest_nix_bootstrap_regex="${guest_nix_pipe_shell_regex}"'|nixos\.org/nix/install|DeterminateSystems/nix-installer-action|install\.determinate\.systems/nix($|[^/[:alnum:]._-])'
+if rg -n -U "$guest_nix_bootstrap_regex" \
+  "$guest_nix_production_normalized" >"$scratch/guest-nix-bootstrap"; then
   sed -n '1,120p' "$scratch/guest-nix-bootstrap" >&2
-  fail 'the driver rail attempts an ambient guest Nix bootstrap'
+  fail 'the driver rail contains a pipe-to-shell, rolling, upstream, or action bootstrap path'
 fi
+guest_nix_execution_regex='(^|[^[:alnum:]_.-])(sh|bash)[[:space:]]+[^;|&]*guest-nix-bootstrap\.sh|guest-nix-bootstrap\.sh[[:space:]]+install|guest-nix-installer[[:space:]]+install[^;[:cntrl:]]*(--nix-package-url|--prefer-upstream|--force|--plan)'
+if rg -n "$guest_nix_execution_regex" "$guest_nix_production_normalized" \
+  >"$scratch/guest-nix-execution-overrides"; then
+  sed -n '1,120p' "$scratch/guest-nix-execution-overrides" >&2
+  fail 'the production rail executes the provenance shell or changes the pinned installer argv'
+fi
+printf '%s\n' 'guest_nix_pinned_asset_valid guest-nix-bootstrap.sh guest-nix-bootstrap.sha256' \
+  >"$scratch/guest-nix-guard-safe"
+if rg -q "$guest_nix_execution_regex" "$scratch/guest-nix-guard-safe"; then
+  fail 'the provenance-shell execution scan mistakes a sidecar helper argument for a shell command'
+fi
+printf '%s\n' "sh \\" '  ./guest-nix-bootstrap.sh install linux --no-confirm --init none' \
+  >"$scratch/guest-nix-guard-continuation"
+sed ':join; /\\$/ { N; s/\\\n[[:space:]]*/ /; b join; }' \
+  "$scratch/guest-nix-guard-continuation" >"$scratch/guest-nix-guard-continuation.normalized"
+rg -q "$guest_nix_execution_regex" "$scratch/guest-nix-guard-continuation.normalized" ||
+  fail 'a backslash-newline provenance-shell execution evaded the production scan'
+printf '%s\n' 'curl https://example.invalid/install |' '  sh' \
+  >"$scratch/guest-nix-guard-pipe-newline"
+rg -U -q "$guest_nix_pipe_shell_regex" "$scratch/guest-nix-guard-pipe-newline" ||
+  fail 'a pipe-newline shell execution evaded the production scan'
+printf '%s\n' 'curl https://example.invalid/data | sidecar-helper.sh --check' \
+  >"$scratch/guest-nix-guard-pipe-helper"
+if rg -U -q "$guest_nix_pipe_shell_regex" "$scratch/guest-nix-guard-pipe-helper"; then
+  fail 'the pipe-to-shell scan mistakes a .sh helper suffix for a shell command token'
+fi
+pinned_shell_url='https://install.'
+pinned_shell_url+='determinate.systems/nix/tag/v3.21.9'
+pinned_payload_url="$pinned_shell_url/nix-installer-x86_64-linux"
+pinned_shell_digest='sha256:ed6067b13423cfd36c50e5b156b9e08e'
+pinned_shell_digest+='b3a7bea4dde8cb1c8d997d757b37b7f6'
+pinned_payload_digest='sha256:58cf15422853e95187405d66b0cdb306'
+pinned_payload_digest+='e66f602218ee0032386c46b1b776a6d1'
+production_lib=$template_root/scripts/ci/environment-lib.sh
+[[ $(grep -Fxc -- "DIENE_GUEST_NIX_INSTALLER_URL=$pinned_shell_url" "$production_lib") == 1 &&
+  $(grep -Fxc -- "DIENE_GUEST_NIX_PAYLOAD_URL=$pinned_payload_url" "$production_lib") == 1 &&
+  $(grep -Fxc -- "DIENE_GUEST_NIX_INSTALLER_DIGEST=$pinned_shell_digest" "$production_lib") == 1 &&
+  $(grep -Fxc -- "DIENE_GUEST_NIX_PAYLOAD_DIGEST=$pinned_payload_digest" "$production_lib") == 1 ]] ||
+  fail 'the exact tagged guest Nix URLs and full digests are not unique pinned constants'
+[[ $(rg -F --glob '!test-*.sh' 'install.determinate.systems' "$template_root/scripts/ci" | wc -l) == 2 ]] ||
+  fail 'an unreviewed Determinate installer URL exists outside the two exact pinned constants'
+[[ $(rg -F --glob '!test-*.sh' "$pinned_shell_digest" "$template_root/scripts/ci" | wc -l) == 1 &&
+  $(rg -F --glob '!test-*.sh' "$pinned_payload_digest" "$template_root/scripts/ci" | wc -l) == 1 ]] ||
+  fail 'a guest Nix digest is duplicated outside its single source-of-truth constant'
+production_remote_command=$scratch/guest-nix-production-remote-command
+(
+  # shellcheck source=/dev/null
+  source "$template_root/scripts/ci/environment-k3d-run.sh"
+  orchestrator_fixed_remote_command
+) >"$production_remote_command"
+[[ $(grep -Fxc -- "guest_nix_installer_digest=$pinned_shell_digest" "$production_remote_command") == 1 &&
+  $(grep -Fxc -- 'guest_nix_installer_bytes=19299' "$production_remote_command") == 1 &&
+  $(grep -Fxc -- "guest_nix_payload_digest=$pinned_payload_digest" "$production_remote_command") == 1 &&
+  $(grep -Fxc -- 'guest_nix_payload_bytes=73234640' "$production_remote_command") == 1 ]] ||
+  fail 'the materialized fixed remote command is not bound to all four centrally validated pins'
+! rg -q '__DIENE_GUEST_NIX_' "$production_remote_command" ||
+  fail 'the materialized fixed remote command retained an unresolved pin placeholder'
+remote_bootstrap_pin_line=$(rg -n '^guest_nix_pinned_asset_valid guest-nix-bootstrap\.sh ' \
+  "$production_remote_command" | cut -d: -f1)
+remote_payload_pin_line=$(rg -n '^  guest_nix_pinned_asset_valid guest-nix-installer ' \
+  "$production_remote_command" | cut -d: -f1)
+remote_payload_chmod_line=$(rg -n '^chmod 0500 guest-nix-installer$' \
+  "$production_remote_command" | cut -d: -f1)
+remote_installer_version_line=$(rg -n '^if ! \./guest-nix-installer --version ' \
+  "$production_remote_command" | cut -d: -f1)
+remote_installer_validation_line=$(rg -n '^guest_nix_exact_output_valid ' \
+  "$production_remote_command" | cut -d: -f1)
+remote_install_line=$(rg -n "^NIX_INSTALLER_DIAGNOSTIC_ENDPOINT='' ./guest-nix-installer install " \
+  "$production_remote_command" | cut -d: -f1)
+for remote_boundary in "$remote_bootstrap_pin_line" "$remote_payload_pin_line" \
+  "$remote_payload_chmod_line" "$remote_installer_version_line" \
+  "$remote_installer_validation_line" "$remote_install_line"; do
+  [[ $remote_boundary =~ ^[1-9][0-9]*$ ]] ||
+    fail 'a fixed remote pin/version/install boundary is absent or ambiguous'
+done
+[[ $remote_bootstrap_pin_line -lt $remote_payload_pin_line &&
+  $remote_payload_pin_line -lt $remote_payload_chmod_line &&
+  $remote_payload_chmod_line -lt $remote_installer_version_line &&
+  $remote_installer_version_line -lt $remote_installer_validation_line &&
+  $remote_installer_validation_line -lt $remote_install_line ]] ||
+  fail 'fixed remote pin validation does not precede chmod, raw --version validation, and install'
+# The fixed remote source is matched literally, not expanded by this harness.
+# shellcheck disable=SC2016
+remote_installer_probe_source='if ! ./guest-nix-installer --version >"$installer_version_stdout" 2>"$installer_version_stderr"; then'
+if ! grep -Fqx -- 'installer_version_stdout=evidence/guest-nix/installer-version.txt' \
+  "$production_remote_command" ||
+  ! grep -Fqx -- 'installer_version_stderr=evidence/guest-nix/installer-version.stderr' \
+    "$production_remote_command" ||
+  ! grep -Fqx -- "$remote_installer_probe_source" "$production_remote_command"; then
+  fail 'the fixed remote command does not retain raw installer stdout and stderr separately'
+fi
+! rg -q 'installer_version[[:space:]]*=\$\(' "$production_remote_command" ||
+  fail 'the installer version proof regressed to newline-normalizing command substitution'
+
+remote_exact_output_helper=$scratch/guest-nix-exact-output-helper.sh
+sed -n '/^guest_nix_exact_output_valid() {$/,/^}$/p' \
+  "$production_remote_command" >"$remote_exact_output_helper"
+[[ $(grep -c '^guest_nix_exact_output_valid() {$' "$remote_exact_output_helper") == 1 ]] ||
+  fail 'the exact installer output helper could not be isolated from the fixed remote command'
+# shellcheck source=/dev/null
+source "$remote_exact_output_helper"
+guest_nix_remote_output_case() {
+  local label=${1:?output case required} shape=${2:?output shape required}
+  local expect=${3:?output expectation required}
+  local stdout_file=$scratch/guest-nix-installer-output-$label.stdout
+  local stderr_file=$scratch/guest-nix-installer-output-$label.stderr result=refuse
+  : >"$stdout_file"
+  : >"$stderr_file"
+  case $shape in
+    exact) printf '%s\n' 'nix-installer 3.21.9' >"$stdout_file" ;;
+    wrong) printf '%s\n' 'nix-installer 3.21.8' >"$stdout_file" ;;
+    empty) ;;
+    multiline) printf '%s\n%s\n' 'nix-installer 3.21.9' extra >"$stdout_file" ;;
+    extra-newline) printf 'nix-installer 3.21.9\n\n' >"$stdout_file" ;;
+    stderr)
+      printf '%s\n' 'nix-installer 3.21.9' >"$stdout_file"
+      printf '%s\n' warning >"$stderr_file"
+      ;;
+    *) fail "unknown exact installer output shape $shape" ;;
+  esac
+  if guest_nix_exact_output_valid "$stdout_file" "$stderr_file" \
+    'nix-installer 3.21.9' 21; then
+    result=accept
+  fi
+  [[ $result == "$expect" ]] ||
+    fail "$label installer output was $result instead of $expect"
+}
+guest_nix_remote_output_case exact exact accept
+guest_nix_remote_output_case wrong wrong refuse
+guest_nix_remote_output_case empty empty refuse
+guest_nix_remote_output_case multiline multiline refuse
+guest_nix_remote_output_case extra-newline extra-newline refuse
+guest_nix_remote_output_case stderr stderr refuse
+
+remote_profile_helper=$scratch/guest-nix-source-profile-helper.sh
+sed -n '/^guest_nix_source_profile() {$/,/^}$/p' \
+  "$production_remote_command" >"$remote_profile_helper"
+[[ $(grep -c '^guest_nix_source_profile() {$' "$remote_profile_helper") == 1 ]] ||
+  fail 'the profile source helper could not be isolated from the fixed remote command'
+# shellcheck source=/dev/null
+source "$remote_profile_helper"
+hostile_guest_nix_profile=$scratch/hostile-guest-nix-profile.sh
+# The hostile profile must expand its inherited PATH only when it is sourced.
+# shellcheck disable=SC2016
+printf '%s\n' 'PATH=/hostile-profile/bin:$PATH' 'export PATH' 'return 23' \
+  >"$hostile_guest_nix_profile"
+remote_profile_original_path=$PATH
+remote_profile_rc=0
+if guest_nix_source_profile "$hostile_guest_nix_profile"; then
+  fail 'the fixed remote profile helper accepted a nonzero source result'
+else
+  remote_profile_rc=$?
+fi
+remote_profile_flags=$-
+[[ $remote_profile_rc == 23 && $PATH == /hostile-profile/bin:* &&
+  $remote_profile_flags == *e* && $remote_profile_flags == *u* ]] ||
+  fail 'the fixed remote profile helper lost source status, profile state, or strict flags'
+PATH=$remote_profile_original_path
+
+remote_profile_line=$(rg -n '^  guest_nix_source_profile ' \
+  "$production_remote_command" | cut -d: -f1)
+remote_profile_refusal_line=$(rg -n '^    guest_nix_fail GuestNixProfileSourceFailed ' \
+  "$production_remote_command" | cut -d: -f1)
+remote_develop_line=$(rg -n '^exec /nix/var/nix/profiles/default/bin/nix .* develop ' \
+  "$production_remote_command" | cut -d: -f1)
+for remote_boundary in "$remote_profile_line" "$remote_profile_refusal_line" "$remote_develop_line"; do
+  [[ $remote_boundary =~ ^[1-9][0-9]*$ ]] ||
+    fail 'a fixed remote profile/develop boundary is absent or ambiguous'
+done
+[[ $remote_profile_line -lt $remote_profile_refusal_line &&
+  $remote_profile_refusal_line -lt $remote_develop_line ]] ||
+  fail 'the fixed remote command does not refuse a failed profile source before nix develop'
+
+profile_refusal_marker=$scratch/guest-nix-host-profile-protected-mutation
+profile_refusal_rc=0
+if (
+  # shellcheck source=/dev/null
+  source "$template_root/scripts/ci/environment-lib.sh"
+  diene_source_guest_nix_profile "$hostile_guest_nix_profile"
+  : >"$profile_refusal_marker"
+) >"$scratch/guest-nix-host-profile.out" 2>"$scratch/guest-nix-host-profile.err"; then
+  fail 'the shared profile verifier accepted a nonzero source result'
+else
+  profile_refusal_rc=$?
+fi
+[[ $profile_refusal_rc == 64 ]] ||
+  fail "the shared profile verifier did not exit 64 (got $profile_refusal_rc)"
+grep -Fq -- 'GuestNixProfileSourceFailed:' "$scratch/guest-nix-host-profile.err" ||
+  fail 'the shared profile verifier emitted no stable profile-source refusal'
+[[ ! -e $profile_refusal_marker ]] ||
+  fail 'a failed profile source reached a protected mutation'
+ok 'raw installer bytes and successful profile sourcing are proved before install or develop'
+
 nix_guard_binding_root=$scratch/nix-guard-binding
 install -d -m 0700 "$nix_guard_binding_root/instances/cluster-0000000000000000/fs"
 : >"$nix_guard_binding_root/instances/cluster-0000000000000000/live"
@@ -3411,7 +3887,361 @@ FAKE_NSC_ROOT=$nix_guard_binding_root FAKE_NSC_LOG=$nix_guard_binding_root/log \
   >/dev/null 2>&1 || nix_guard_binding_rc=$?
 [[ $nix_guard_binding_rc == 69 ]] ||
   fail 'the fake ssh leg does not bind the fixed guest nix guard to production text'
-ok 'the fixed remote command emits a stable GuestNixToolchainAbsent red and bootstraps nothing'
+ok 'the fixed rail preserves GuestNixToolchainAbsent while admitting only exact direct-binary pins'
+
+printf '== pinned guest Nix bootstrap fails closed ==\n'
+
+guest_nix_work_lib=$work/scripts/ci/environment-lib.sh
+guest_nix_work_lib_backup=$scratch/environment-lib.guest-nix-good.sh
+cp "$guest_nix_work_lib" "$guest_nix_work_lib_backup"
+
+guest_nix_invalid_contract_case() {
+  local run_id=${1:?run id required} mutation=${2:?contract mutation required}
+  cp "$guest_nix_work_lib_backup" "$guest_nix_work_lib"
+  case $mutation in
+    rolling-url)
+      sed -i 's|^DIENE_GUEST_NIX_INSTALLER_URL=.*|DIENE_GUEST_NIX_INSTALLER_URL=https://install.determinate.systems/nix|' \
+        "$guest_nix_work_lib"
+      ;;
+    unpinned-payload)
+      sed -i 's|^DIENE_GUEST_NIX_PAYLOAD_URL=.*|DIENE_GUEST_NIX_PAYLOAD_URL=https://install.determinate.systems/nix/tag/v3.21.9/other|' \
+        "$guest_nix_work_lib"
+      ;;
+    short-digest)
+      sed -i 's|^DIENE_GUEST_NIX_INSTALLER_DIGEST=.*|DIENE_GUEST_NIX_INSTALLER_DIGEST=sha256:abcd|' \
+        "$guest_nix_work_lib"
+      ;;
+    malformed-bytes)
+      sed -i 's|^DIENE_GUEST_NIX_PAYLOAD_BYTES=.*|DIENE_GUEST_NIX_PAYLOAD_BYTES=not-a-number|' \
+        "$guest_nix_work_lib"
+      ;;
+    wrong-architecture)
+      sed -i 's|^DIENE_GUEST_NIX_ARCH=.*|DIENE_GUEST_NIX_ARCH=aarch64|' "$guest_nix_work_lib"
+      ;;
+    *) fail "unknown guest Nix contract mutation $mutation" ;;
+  esac
+  prepare_run "$run_id"
+  expect_precreate_refusal InputContractInvalid env ./scripts/ci/environment-k3d-run.sh orchestrate
+  cp "$guest_nix_work_lib_backup" "$guest_nix_work_lib"
+}
+
+guest_nix_invalid_contract_case 7301 rolling-url
+guest_nix_invalid_contract_case 7302 unpinned-payload
+guest_nix_invalid_contract_case 7303 short-digest
+guest_nix_invalid_contract_case 7304 malformed-bytes
+guest_nix_invalid_contract_case 7305 wrong-architecture
+
+guest_nix_contract_value_refusal() {
+  local label=${1:?label required} rc=0
+  if (
+    # shellcheck source=/dev/null
+    source "$guest_nix_work_lib_backup"
+    case $label in
+      empty-identity) DIENE_GUEST_NIX_EXPECTED_IDENTITY= ;;
+      multiline-identity) DIENE_GUEST_NIX_EXPECTED_IDENTITY=$'nix (Determinate Nix 3.21.9) 2.34.8\nextra' ;;
+      wrong-mode) DIENE_GUEST_NIX_EXECUTION_MODE=shell-bootstrap ;;
+      *) exit 127 ;;
+    esac
+    export DIENE_GUEST_NIX_EXPECTED_IDENTITY DIENE_GUEST_NIX_EXECUTION_MODE
+    diene_guest_nix_contract
+  ) >"$scratch/guest-nix-contract-$label.out" 2>"$scratch/guest-nix-contract-$label.err"; then
+    fail "$label guest Nix contract unexpectedly passed"
+  else
+    rc=$?
+  fi
+  [[ $rc == 64 ]] || fail "$label guest Nix contract did not exit 64"
+  assert_contains "$scratch/guest-nix-contract-$label.err" InputContractInvalid
+}
+guest_nix_contract_value_refusal empty-identity
+guest_nix_contract_value_refusal multiline-identity
+guest_nix_contract_value_refusal wrong-mode
+ok 'rolling, unpinned, malformed, non-x86_64, empty, multiline, and shell-mode contracts refuse before create'
+
+guest_nix_fetch_refusal() {
+  local run_id=${1:?run id required} scenario=${2:?fetch scenario required}
+  prepare_run "$run_id"
+  expect_precreate_refusal GuestNixInstallerUntrusted env \
+    FAKE_GUEST_NIX_FETCH_SCENARIO="$scenario" ./scripts/ci/environment-k3d-run.sh orchestrate
+  ! find "$RUNNER_TEMP" -name '*.tmp.*' -print -quit | grep -q . ||
+    fail "$scenario left a private acquisition temporary file"
+  ! find "$RUNNER_TEMP" -name 'guest-nix-*.sha256' -print -quit | grep -q . ||
+    fail "$scenario published sidecars before both artifacts verified"
+}
+guest_nix_fetch_refusal 7310 redirect
+guest_nix_fetch_refusal 7311 transport-fail
+guest_nix_fetch_refusal 7312 installer-short
+guest_nix_fetch_refusal 7313 installer-digest
+guest_nix_fetch_refusal 7314 payload-short
+guest_nix_fetch_refusal 7315 payload-digest
+ok 'redirect, transport, byte-count, and full-digest failures leave zero creates and no partial publication'
+
+guest_nix_publication_refusal() {
+  local label=${1:?publication label required} shape=${2:?publication shape required}
+  local root=$scratch/guest-nix-publication-$label outside=$scratch/guest-nix-publication-$label-outside
+  local target curl_log=$scratch/guest-nix-publication-$label.curl rc=0
+  install -d -m 0700 "$root" "$outside"
+  : >"$curl_log"
+  case $shape in
+    target-symlink)
+      install -d -m 0700 "$root/publish"
+      printf '%s\n' sentinel >"$outside/sentinel"
+      ln -s "$outside/sentinel" "$root/publish/guest-nix-bootstrap.sh"
+      target=$root/publish/guest-nix-bootstrap.sh
+      ;;
+    parent-symlink)
+      ln -s "$outside" "$root/publish"
+      target=$root/publish/guest-nix-bootstrap.sh
+      ;;
+    *) fail "unknown guest Nix publication shape $shape" ;;
+  esac
+  if (
+    # shellcheck source=/dev/null
+    source "$guest_nix_work_lib_backup"
+    export DIENE_CURL_BIN=$fake_guest_nix_curl FAKE_GUEST_NIX_CURL_LOG=$curl_log
+    export FAKE_GUEST_NIX_SOURCE_DIR=$guest_nix_fixture_dir
+    diene_fetch_pinned_artifact "$DIENE_GUEST_NIX_INSTALLER_URL" \
+      "$DIENE_GUEST_NIX_INSTALLER_DIGEST" "$DIENE_GUEST_NIX_INSTALLER_BYTES" "$target"
+  ) >"$root.out" 2>"$root.err"; then
+    fail "$label hostile publication target unexpectedly passed"
+  else
+    rc=$?
+  fi
+  [[ $rc == 64 ]] || fail "$label hostile publication target did not exit 64"
+  assert_contains "$root.err" GuestNixInstallerUntrusted
+  [[ ! -s $curl_log ]] || fail "$label fetched before refusing the hostile publication target"
+  [[ -z $(find "$root" -name '*.tmp.*' -print -quit) ]] ||
+    fail "$label left a private publication temporary file"
+  case $shape in
+    target-symlink)
+      [[ -L $target && $(<"$outside/sentinel") == sentinel ]] ||
+        fail 'the target-symlink refusal replaced the link or changed its outside referent'
+      ;;
+    parent-symlink)
+      [[ -L $root/publish && ! -e $outside/guest-nix-bootstrap.sh ]] ||
+        fail 'the parent-symlink refusal published outside the private target directory'
+      ;;
+  esac
+}
+guest_nix_publication_refusal symlink-target target-symlink
+guest_nix_publication_refusal symlink-parent parent-symlink
+ok 'host acquisition refuses linked publication targets and parents before fetch or outside write'
+
+guest_nix_remote_refusal() {
+  local run_id=${1:?run id required} scenario=${2:?remote scenario required}
+  local inner_reason=${3:?inner reason required} rc=0
+  prepare_run "$run_id"
+  local runner=$RUNNER_TEMP nsc_root=$FAKE_NSC_ROOT event_log=$FAKE_GUEST_NIX_EVENT_LOG
+  if run_orchestrator "$scenario" >"$scratch/guest-remote-$scenario.out" \
+    2>"$scratch/guest-remote-$scenario.err"; then
+    fail "$scenario guest Nix refusal unexpectedly passed"
+  else
+    rc=$?
+  fi
+  ((rc != 0)) || fail "$scenario guest Nix refusal returned zero"
+  assert_contains "$scratch/guest-remote-$scenario.err" NamespaceSshDriverFailed
+  local remote_stderr
+  remote_stderr=$(find "$runner/diene-namespace" -path '*/staging/stderr' -print -quit)
+  [[ -n $remote_stderr ]] || fail "$scenario retained no SSH stderr evidence"
+  assert_contains "$remote_stderr" "$inner_reason"
+  ! grep -Fxq -- nix-develop "$event_log" || fail "$scenario reached nix develop"
+  local expect_version=false expect_install=false expect_profile=false
+  case $scenario in
+    guest-wrong-arch | guest-preexisting | guest-upload-*) ;;
+    guest-wrong-installer-version | guest-empty-installer-version | \
+      guest-multiline-installer-version | guest-extra-newline-installer-version | \
+      guest-installer-version-stderr)
+      expect_version=true
+      ;;
+    guest-installer-fail)
+      expect_version=true
+      expect_install=true
+      ;;
+    guest-profile-source-fail | guest-toolchain-absent)
+      expect_version=true
+      expect_install=true
+      expect_profile=true
+      ;;
+    *) fail "missing event-boundary expectation for $scenario" ;;
+  esac
+  if [[ $expect_version == true ]]; then
+    [[ $(grep -Fxc -- installer-version-probe "$event_log") == 1 ]] ||
+      fail "$scenario did not reach its one allowed installer --version boundary"
+  else
+    ! grep -Fxq -- installer-version-probe "$event_log" ||
+      fail "$scenario reached forbidden installer --version"
+  fi
+  if [[ $expect_install == true ]]; then
+    [[ $(grep -Fxc -- 'installer-argv install linux --no-confirm --init none' "$event_log") == 1 ]] ||
+      fail "$scenario did not reach its one allowed installer install boundary"
+  else
+    ! grep -Eq '^installer-argv( |$)' "$event_log" ||
+      fail "$scenario reached forbidden installer install"
+  fi
+  if [[ $expect_profile == true ]]; then
+    [[ $(grep -Fxc -- profile-source "$event_log") == 1 ]] ||
+      fail "$scenario did not reach its one allowed profile-source boundary"
+  else
+    ! grep -Fxq -- profile-source "$event_log" ||
+      fail "$scenario reached forbidden profile sourcing"
+  fi
+  local version_event_line=0 install_event_line=0 profile_event_line=0
+  if [[ $expect_version == true ]]; then
+    version_event_line=$(grep -nFx -- installer-version-probe "$event_log" | cut -d: -f1)
+  fi
+  if [[ $expect_install == true ]]; then
+    install_event_line=$(grep -nFx -- 'installer-argv install linux --no-confirm --init none' \
+      "$event_log" | cut -d: -f1)
+    [[ $version_event_line -lt $install_event_line ]] ||
+      fail "$scenario installer install did not follow its version probe"
+  fi
+  if [[ $expect_profile == true ]]; then
+    profile_event_line=$(grep -nFx -- profile-source "$event_log" | cut -d: -f1)
+    [[ $install_event_line -lt $profile_event_line ]] ||
+      fail "$scenario profile source did not follow its installer invocation"
+  fi
+  local cluster
+  cluster=$(find "$nsc_root/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+  [[ $(grep -Ec "^destroy --force ${cluster} " "$FAKE_NSC_LOG") == 1 &&
+    ! -e $nsc_root/instances/$cluster/live ]] ||
+    fail "$scenario did not preserve exact destroy and absence"
+}
+
+guest_nix_remote_refusal 7320 guest-wrong-arch GuestNixInstallerUnsupportedArch
+guest_nix_remote_refusal 7321 guest-preexisting GuestNixPreexistingState
+guest_nix_remote_refusal 7322 guest-upload-bootstrap-tamper GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7323 guest-upload-payload-tamper GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7324 guest-upload-sidecar-tamper GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7328 guest-upload-bootstrap-pair-tamper GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7329 guest-upload-payload-pair-tamper GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7330 guest-upload-payload-symlink GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7325 guest-wrong-installer-version GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7331 guest-empty-installer-version GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7332 guest-multiline-installer-version GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7333 guest-extra-newline-installer-version GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7334 guest-installer-version-stderr GuestNixInstallerUntrusted
+guest_nix_remote_refusal 7326 guest-installer-fail GuestNixInstallFailed
+guest_nix_remote_refusal 7335 guest-profile-source-fail GuestNixProfileSourceFailed
+guest_nix_remote_refusal 7327 guest-toolchain-absent GuestNixToolchainAbsent
+ok 'every remote refusal stops at its exact version, install, profile, and develop event boundary'
+
+guest_nix_identity_probe() (
+  local mode=${1:?identity mode required} root=${2:?identity root required}
+  # shellcheck source=/dev/null
+  source "$guest_nix_work_lib_backup"
+  local evidence=$root/evidence/guest-nix store_root=$root/nix/store
+  local store_bin=$store_root/synthetic-determinate/bin/nix
+  local nix_bin=$root/nix/var/nix/profiles/default/bin/nix
+  local installed_copy=$root/nix/nix-installer
+  local bootstrap=$root/run/diene-ci/guest-nix-bootstrap.sh
+  local payload=$root/run/diene-ci/guest-nix-installer input=$root/run/diene-ci/inputs.json
+  install -d -m 0700 "$evidence" "$(dirname -- "$store_bin")" "$(dirname -- "$nix_bin")" \
+    "$(dirname -- "$installed_copy")" "$(dirname -- "$bootstrap")"
+  cat >"$store_bin" <<'NIX'
+#!/bin/sh
+case ${FAKE_IDENTITY_MODE:-happy} in
+  wrong-version) printf '%s\n' 'nix (Determinate Nix 3.21.9) 2.34.7' ;;
+  empty) : ;;
+  multiline) printf '%s\n%s\n' 'nix (Determinate Nix 3.21.9) 2.34.8' extra ;;
+  *) printf '%s\n' 'nix (Determinate Nix 3.21.9) 2.34.8' ;;
+esac
+NIX
+  chmod 0500 "$store_bin"
+  ln -s "$store_bin" "$nix_bin"
+  cp "$guest_nix_fixture_dir/guest-nix-bootstrap.sh" "$bootstrap"
+  cp "$guest_nix_fixture_dir/guest-nix-installer" "$payload"
+  cp "$payload" "$installed_copy"
+  chmod 0600 "$bootstrap" "$payload" "$installed_copy"
+  printf '%s\n' 'nix (Determinate Nix 3.21.9) 2.34.8' >"$evidence/version.txt"
+  : >"$evidence/version.stderr"
+  printf '%s\n' 'nix-installer 3.21.9' >"$evidence/installer-version.txt"
+  : >"$evidence/installer-version.stderr"
+  chmod 0600 "$evidence/version.txt" "$evidence/version.stderr" \
+    "$evidence/installer-version.txt" "$evidence/installer-version.stderr"
+  local contract
+  contract=$(diene_guest_nix_contract)
+  jq -n --argjson guestNix "$contract" '{guestNix:$guestNix}' >"$input"
+  case $mode in
+    recorded-drift) printf '%s\n' wrong >"$evidence/version.txt" ;;
+    non-store)
+      install -d -m 0700 "$root/outside/bin"
+      cp "$store_bin" "$root/outside/bin/nix"
+      rm "$nix_bin"
+      ln -s "$root/outside/bin/nix" "$nix_bin"
+      ;;
+    unresolvable)
+      rm "$nix_bin"
+      ln -s "$root/missing/bin/nix" "$nix_bin"
+      ;;
+    installed-copy-mismatch) printf X >>"$installed_copy" ;;
+    upload-payload-mismatch) printf X >>"$payload" ;;
+    upload-shell-mismatch) printf X >>"$bootstrap" ;;
+    installer-version-mismatch) printf '%s\n' 'nix-installer 3.21.8' >"$evidence/installer-version.txt" ;;
+    installer-stderr-mismatch) printf '%s\n' warning >"$evidence/installer-version.stderr" ;;
+  esac
+  export FAKE_IDENTITY_MODE=$mode
+  local guest_nix
+  guest_nix=$(diene_guest_nix_identity "$input" "$evidence" "$nix_bin" "$store_root" \
+    "$installed_copy" "$bootstrap" "$payload" x86_64 "$root")
+  jq -n --argjson guestNix "$guest_nix" '{guestNix:$guestNix}' >"$evidence/preflight.json"
+  case $mode in
+    receipt-mismatch)
+      jq '.nixVersion = "tampered"' "$evidence/identity.json" >"$evidence/identity.json.tmp"
+      mv "$evidence/identity.json.tmp" "$evidence/identity.json"
+      ;;
+    binding-digest-mismatch)
+      jq '.guestNix.identityReceiptDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"' \
+        "$evidence/preflight.json" >"$evidence/preflight.json.tmp"
+      mv "$evidence/preflight.json.tmp" "$evidence/preflight.json"
+      ;;
+  esac
+  diene_require_guest_nix_preflight_agreement "$evidence/preflight.json" "$evidence/identity.json"
+)
+
+guest_nix_identity_refusal() {
+  local label=${1:?identity case required} rc=0
+  local root=$scratch/guest-nix-identity-$label
+  if guest_nix_identity_probe "$label" "$root" >"$root.out" 2>"$root.err"; then
+    fail "$label guest Nix identity unexpectedly passed"
+  else
+    rc=$?
+  fi
+  [[ $rc == 64 ]] || fail "$label guest Nix identity did not exit 64 (got $rc)"
+  assert_contains "$root.err" GuestNixIdentityUnexpected
+  [[ ! -e $root/policy.json && ! -e $root/application-mutated ]] ||
+    fail "$label guest Nix identity reached a protected mutation"
+}
+
+for identity_case in wrong-version empty multiline recorded-drift non-store unresolvable \
+  installed-copy-mismatch upload-payload-mismatch upload-shell-mismatch installer-version-mismatch \
+  installer-stderr-mismatch receipt-mismatch binding-digest-mismatch; do
+  guest_nix_identity_refusal "$identity_case"
+done
+guest_nix_identity_probe happy "$scratch/guest-nix-identity-happy" \
+  >"$scratch/guest-nix-identity-happy.out" 2>"$scratch/guest-nix-identity-happy.err" || {
+  sed -n '1,160p' "$scratch/guest-nix-identity-happy.err" >&2
+  fail 'the exact direct-path guest Nix identity did not pass'
+}
+
+preflight_profile_line=$(rg -n '^diene_source_guest_nix_profile ' \
+  "$template_root/scripts/ci/environment-runner-preflight.sh" | cut -d: -f1)
+preflight_identity_line=$(rg -n 'guest_nix=\$\(diene_guest_nix_identity' \
+  "$template_root/scripts/ci/environment-runner-preflight.sh" | cut -d: -f1)
+preflight_node_line=$(rg -n '^nodes=' "$template_root/scripts/ci/environment-runner-preflight.sh" | cut -d: -f1)
+driver_preflight_line=$(rg -n 'diene_core_driver_preflight --output' \
+  "$template_root/scripts/ci/environment-k3d-run.sh" | cut -d: -f1)
+driver_policy_line=$(rg -n 'diene_apply_interim_policy "\$resolved"' \
+  "$template_root/scripts/ci/environment-k3d-run.sh" | cut -d: -f1)
+# The production application seam is source text, not a regular expression.
+# shellcheck disable=SC2016
+driver_application_seam='"${DIENE_PLS_BIN:-pls}" env up '
+driver_application_line=$(rg -n -F "$driver_application_seam" \
+  "$template_root/scripts/ci/environment-k3d-run.sh" | cut -d: -f1)
+[[ $preflight_profile_line -lt $preflight_identity_line &&
+  $preflight_identity_line -lt $preflight_node_line &&
+  $driver_preflight_line -lt $driver_policy_line &&
+  $driver_preflight_line -lt $driver_application_line ]] ||
+  fail 'guest Nix profile and identity are not ordered before posture, policy, and application mutation'
+ok 'exact, empty, multiline, recorded, store-path, installed-copy, upload, receipt, and binding identity cases fail before mutation'
 
 printf '== resolver, hostile probe, and vendor broker fail closed ==\n'
 

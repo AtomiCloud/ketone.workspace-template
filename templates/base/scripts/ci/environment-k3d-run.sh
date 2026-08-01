@@ -223,6 +223,141 @@ VALIDATOR
   chmod 0500 "$target"
 }
 
+# One fixed pre-Nix remote program. The tagged shell is verified but remains
+# mode 0600 and is never executed; only the independently pinned binary gains
+# execute permission. Identity acceptance is deferred to the in-shell
+# preflight, which runs before policy or application mutation.
+orchestrator_fixed_remote_command() {
+  local contract installer_digest installer_bytes payload_digest payload_bytes remote_command
+  contract=$(diene_guest_nix_contract) || return $?
+  installer_digest=$(jq -er '.installerDigest' <<<"$contract") ||
+    diene_die InputContractInvalid 'guest Nix provenance digest is absent from the fixed contract'
+  installer_bytes=$(jq -er '.installerBytes' <<<"$contract") ||
+    diene_die InputContractInvalid 'guest Nix provenance length is absent from the fixed contract'
+  payload_digest=$(jq -er '.payloadDigest' <<<"$contract") ||
+    diene_die InputContractInvalid 'guest Nix payload digest is absent from the fixed contract'
+  payload_bytes=$(jq -er '.payloadBytes' <<<"$contract") ||
+    diene_die InputContractInvalid 'guest Nix payload length is absent from the fixed contract'
+  diene_require_digest guest-nix-remote-installer-digest "$installer_digest"
+  diene_require_digest guest-nix-remote-payload-digest "$payload_digest"
+  [[ $installer_bytes =~ ^[1-9][0-9]*$ && $payload_bytes =~ ^[1-9][0-9]*$ ]] ||
+    diene_die InputContractInvalid 'guest Nix remote pin lengths are invalid'
+
+  remote_command=$(cat <<'REMOTE'
+set -eu
+umask 077
+test "$(id -u)" = 0
+install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out
+cd /run/diene-ci
+sha256sum -c archive-validator.sha256
+chmod 0500 archive-validator.sh
+./archive-validator.sh source.tar source
+install -m 0600 receipt.json receipts/exact.json
+install -d -m 0700 evidence/guest-nix
+guest_nix_fail() { printf '%s: %s\n' "$1" "$2" >&2; exit 64; }
+guest_nix_pinned_asset_valid() {
+  asset=$1
+  sidecar=$2
+  expected_digest=$3
+  expected_bytes=$4
+  expected_line=${expected_digest#sha256:}'  '"$asset"
+  [ -f "$asset" ] && [ ! -L "$asset" ] &&
+    [ -f "$sidecar" ] && [ ! -L "$sidecar" ] &&
+    [ "$(wc -c <"$asset")" -eq "$expected_bytes" ] &&
+    [ "$(wc -l <"$sidecar")" -eq 1 ] &&
+    [ "$(sha256sum "$asset")" = "$expected_line" ] &&
+    [ "$(cat "$sidecar")" = "$expected_line" ] &&
+    sha256sum -c "$sidecar" >/dev/null 2>&1
+}
+guest_nix_exact_output_valid() {
+  stdout_file=$1
+  stderr_file=$2
+  expected_output=$3
+  expected_output_bytes=$4
+  [ -f "$stdout_file" ] && [ ! -L "$stdout_file" ] &&
+    [ -f "$stderr_file" ] && [ ! -L "$stderr_file" ] &&
+    [ ! -s "$stderr_file" ] &&
+    [ "$(wc -c <"$stdout_file")" -eq "$expected_output_bytes" ] &&
+    [ "$(wc -l <"$stdout_file")" -eq 1 ] &&
+    [ "$(cat "$stdout_file")" = "$expected_output" ]
+}
+guest_nix_source_profile() {
+  profile=$1
+  set +eu
+  . "$profile"
+  profile_rc=$?
+  set -eu
+  return "$profile_rc"
+}
+guest_nix_installer_digest=__DIENE_GUEST_NIX_INSTALLER_DIGEST__
+guest_nix_installer_bytes=__DIENE_GUEST_NIX_INSTALLER_BYTES__
+guest_nix_payload_digest=__DIENE_GUEST_NIX_PAYLOAD_DIGEST__
+guest_nix_payload_bytes=__DIENE_GUEST_NIX_PAYLOAD_BYTES__
+[ "$(uname -m)" = x86_64 ] || guest_nix_fail GuestNixInstallerUnsupportedArch 'the guest architecture is not the pinned x86_64 target'
+if command -v nix >/dev/null 2>&1 || [ -e /nix ] || [ -L /nix ]; then
+  guest_nix_fail GuestNixPreexistingState 'the ephemeral guest already contains Nix or /nix state'
+fi
+guest_nix_pinned_asset_valid guest-nix-bootstrap.sh guest-nix-bootstrap.sha256 \
+  "$guest_nix_installer_digest" "$guest_nix_installer_bytes" &&
+  guest_nix_pinned_asset_valid guest-nix-installer guest-nix-installer.sha256 \
+    "$guest_nix_payload_digest" "$guest_nix_payload_bytes" ||
+  guest_nix_fail GuestNixInstallerUntrusted 'an uploaded guest Nix artifact or sidecar changed'
+{
+  cat guest-nix-bootstrap.sha256 guest-nix-installer.sha256
+  printf '%s\n' 'executionMode=direct-pinned-binary' 'payloadDigestVerified=true'
+} >evidence/guest-nix/verified.txt
+chmod 0600 evidence/guest-nix/verified.txt guest-nix-bootstrap.sh guest-nix-installer
+if [ "${NIX_INSTALLER_NIX_PACKAGE_URL+x}" = x ] ||
+  [ "${NIX_INSTALLER_PREFER_UPSTREAM_NIX+x}" = x ] ||
+  [ "${NIX_INSTALLER_FORCE+x}" = x ] || [ "${NIX_INSTALLER_PLAN+x}" = x ] ||
+  [ "${NIX_INSTALLER_OVERRIDE_URL+x}" = x ] || [ "${NIX_INSTALLER_BINARY_ROOT+x}" = x ]; then
+  guest_nix_fail GuestNixInstallerUntrusted 'a prohibited installer payload, upstream, force, plan, or URL override is present'
+fi
+unset NIX_INSTALLER_NIX_PACKAGE_URL NIX_INSTALLER_PREFER_UPSTREAM_NIX NIX_INSTALLER_FORCE \
+  NIX_INSTALLER_PLAN NIX_INSTALLER_OVERRIDE_URL NIX_INSTALLER_BINARY_ROOT
+chmod 0500 guest-nix-installer
+installer_version_stdout=evidence/guest-nix/installer-version.txt
+installer_version_stderr=evidence/guest-nix/installer-version.stderr
+: >"$installer_version_stdout"
+: >"$installer_version_stderr"
+chmod 0600 "$installer_version_stdout" "$installer_version_stderr"
+if ! ./guest-nix-installer --version >"$installer_version_stdout" 2>"$installer_version_stderr"; then
+  guest_nix_fail GuestNixInstallerUntrusted 'the pinned installer version probe failed'
+fi
+guest_nix_exact_output_valid "$installer_version_stdout" "$installer_version_stderr" \
+  'nix-installer 3.21.9' 21 ||
+  guest_nix_fail GuestNixInstallerUntrusted 'the pinned installer version output is not exact'
+install_rc=0
+NIX_INSTALLER_DIAGNOSTIC_ENDPOINT='' ./guest-nix-installer install linux --no-confirm --init none \
+  >evidence/guest-nix/install.log 2>&1 || install_rc=$?
+chmod 0600 evidence/guest-nix/install.log
+[ "$install_rc" -eq 0 ] || guest_nix_fail GuestNixInstallFailed 'the pinned guest Nix installer failed'
+if [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
+  guest_nix_source_profile /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ||
+    guest_nix_fail GuestNixProfileSourceFailed 'the exact guest Nix profile returned nonzero while being sourced'
+fi
+command -v nix >/dev/null 2>&1 || { printf "GuestNixToolchainAbsent: %s\n" "the instance provides no nix command for the driver entry" >&2; exit 64; }
+if ! /nix/var/nix/profiles/default/bin/nix --version >evidence/guest-nix/version.txt \
+  2>evidence/guest-nix/version.stderr; then
+  guest_nix_fail GuestNixIdentityUnexpected 'the direct installed Nix identity probe failed'
+fi
+chmod 0600 evidence/guest-nix/version.txt evidence/guest-nix/version.stderr
+cd source
+exec /nix/var/nix/profiles/default/bin/nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci
+REMOTE
+  )
+  # The only runtime material inserted into the reviewed fixed template comes
+  # from diene_guest_nix_contract after its strict URL/digest/length admission.
+  # No uploaded file or sidecar contributes to these expected values.
+  remote_command=${remote_command//__DIENE_GUEST_NIX_INSTALLER_DIGEST__/$installer_digest}
+  remote_command=${remote_command//__DIENE_GUEST_NIX_INSTALLER_BYTES__/$installer_bytes}
+  remote_command=${remote_command//__DIENE_GUEST_NIX_PAYLOAD_DIGEST__/$payload_digest}
+  remote_command=${remote_command//__DIENE_GUEST_NIX_PAYLOAD_BYTES__/$payload_bytes}
+  [[ $remote_command != *'__DIENE_GUEST_NIX_'* ]] ||
+    diene_die InputContractInvalid 'guest Nix fixed remote command contains an unresolved pin placeholder'
+  printf '%s\n' "$remote_command"
+}
+
 orchestrator_synthetic_report() {
   local target=${1:?synthetic report required}
   local journey_digest=$DIENE_ZERO_DIGEST component=K9 permission=ditto-vendor-demo
@@ -570,6 +705,7 @@ orchestrate() {
 
   local nsc_bin nsc_identity nsc_version nsc_artifact_digest nsc_binary_digest
   local source_digest subject_digest contract_digest validator_digest create_started create_rc
+  local guest_nix_contract guest_nix_installer_digest guest_nix_payload_digest
   nsc_bin=$(diene_nsc_bin)
   nsc_identity=$(diene_nsc_identity)
   nsc_version=$(jq -r '.version' <<<"$nsc_identity")
@@ -586,6 +722,20 @@ orchestrate() {
   printf '%s  archive-validator.sh\n' "${validator_digest#sha256:}" \
     >"$ORCH_STATE/archive-validator.sha256"
   chmod 0600 "$ORCH_STATE/archive-validator.sha256"
+  guest_nix_contract=$(diene_guest_nix_contract) || exit $?
+  guest_nix_installer_digest=$(jq -r '.installerDigest' <<<"$guest_nix_contract")
+  guest_nix_payload_digest=$(jq -r '.payloadDigest' <<<"$guest_nix_contract")
+  diene_fetch_pinned_artifact "$(jq -r '.installerUrl' <<<"$guest_nix_contract")" \
+    "$guest_nix_installer_digest" "$(jq -r '.installerBytes' <<<"$guest_nix_contract")" \
+    "$ORCH_STATE/guest-nix-bootstrap.sh"
+  diene_fetch_pinned_artifact "$(jq -r '.payloadUrl' <<<"$guest_nix_contract")" \
+    "$guest_nix_payload_digest" "$(jq -r '.payloadBytes' <<<"$guest_nix_contract")" \
+    "$ORCH_STATE/guest-nix-installer"
+  printf '%s  guest-nix-bootstrap.sh\n' "${guest_nix_installer_digest#sha256:}" \
+    >"$ORCH_STATE/guest-nix-bootstrap.sha256"
+  printf '%s  guest-nix-installer\n' "${guest_nix_payload_digest#sha256:}" \
+    >"$ORCH_STATE/guest-nix-installer.sha256"
+  chmod 0600 "$ORCH_STATE/guest-nix-bootstrap.sha256" "$ORCH_STATE/guest-nix-installer.sha256"
   source_digest=$(diene_file_digest "$ORCH_STATE/source.tar")
   subject_digest=$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")
   contract_digest=$(diene_file_digest "$ORCH_STATE/egress-contract.json")
@@ -651,7 +801,8 @@ orchestrate() {
     --arg serviceCidr "${DIENE_K3S_SERVICE_CIDR:-10.143.0.0/16}" \
     --arg venue "${DIENE_ORCHESTRATOR_VENUE:-namespace}" \
     --arg label "${DIENE_ORCHESTRATOR_LABEL:-nscloud-ubuntu-26.04-amd64-16x32}" \
-    --arg fallback "${DIENE_ORCHESTRATOR_FALLBACK_REASON:-}" '
+    --arg fallback "${DIENE_ORCHESTRATOR_FALLBACK_REASON:-}" \
+    --argjson guestNix "$guest_nix_contract" '
     {apiVersion:"diene.atomi.cloud/ci-driver-inputs/v1",trustedRuntimeContext:"protected-base",
      duration:"2h",platformPolicyStatus:"platform per-instance policy pending (support ask #4)",
      owner:{repositoryId:$repositoryId,repositoryKey:$repositoryKey,sourceSha:$sourceSha,
@@ -666,7 +817,7 @@ orchestrate() {
      sourceArchiveDigest:$sourceDigest,artifactSubjectDigest:$subjectDigest,
      admittedK3sVersion:$k3s,admittedServiceCidr:$serviceCidr,cacheAttached:false,
      egress:{contractDigest:$contractDigest,canaryImage:$canaryImage,l7Enforcer:$l7,probeBin:$probe},
-     vendorCredentialBroker:$vendorBroker,
+     vendorCredentialBroker:$vendorBroker,guestNix:$guestNix,
      orchestrator:{venue:$venue,label:$label,fallbackReason:(if $fallback == "" then null else $fallback end)}}' |
     diene_write_json "$ORCH_STATE/inputs.json"
 
@@ -687,8 +838,21 @@ orchestrate() {
   ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/archive-validator.sha256" \
     /run/diene-ci/archive-validator.sha256 --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
     2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/guest-nix-bootstrap.sh" \
+    /run/diene-ci/guest-nix-bootstrap.sh --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/guest-nix-bootstrap.sha256" \
+    /run/diene-ci/guest-nix-bootstrap.sha256 --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/guest-nix-installer" \
+    /run/diene-ci/guest-nix-installer --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/guest-nix-installer.sha256" \
+    /run/diene-ci/guest-nix-installer.sha256 --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
   ORCH_TRANSFER_SECONDS=$((SECONDS - transfer_started))
-  ORCH_TRANSFER_DIGEST=$(phase_digest transfer "$source_digest" "$contract_digest|$validator_digest")
+  ORCH_TRANSFER_DIGEST=$(phase_digest transfer "$source_digest|$guest_nix_installer_digest" \
+    "$contract_digest|$validator_digest|$guest_nix_payload_digest")
   if ((transfer_rc != 0)); then
     ORCH_TRANSFER_OUTCOME=Fail
     ORCH_TRANSFER_REASON=NamespaceTransferFailed
@@ -699,9 +863,7 @@ orchestrate() {
   ORCH_TRANSFER_REASON=ImmutableInputsUploaded
 
   local remote_command ssh_started ssh_rc=0
-  # The command is intentionally expanded only by the remote shell.
-  # shellcheck disable=SC2016
-  remote_command='set -eu; umask 077; test "$(id -u)" = 0; install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out; cd /run/diene-ci; sha256sum -c archive-validator.sha256; chmod 0500 archive-validator.sh; ./archive-validator.sh source.tar source; install -m 0600 receipt.json receipts/exact.json; cd source; command -v nix >/dev/null 2>&1 || { printf "GuestNixToolchainAbsent: %s\n" "the instance provides no nix command for the driver entry" >&2; exit 64; }; exec nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci'
+  remote_command=$(orchestrator_fixed_remote_command)
   ssh_started=$SECONDS
   "$nsc_bin" ssh "$ORCH_CLUSTER_ID" -T "$remote_command" \
     >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || ssh_rc=$?
