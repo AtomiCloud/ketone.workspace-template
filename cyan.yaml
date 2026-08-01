@@ -46,6 +46,7 @@ resolvers:
   - 'nix/fmt.nix'
   - 'nix/pre-commit.nix'
 commands:
+- "sed -i -e '${/^$/d;}' .github/workflows/ci.yaml"
 - 'chmod +x scripts/ci/*.sh 2>/dev/null || true'
 build:
   registry: ${DOMAIN:-docker.io}/${GITHUB_REPO_REF:-atomi}
