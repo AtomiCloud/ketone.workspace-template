@@ -843,6 +843,9 @@ ci_shell_commands=(
 nix_shell_build=()
 nix_shell_darwin_eval=()
 nix_shell_develop=()
+nix_shell_linux_proof=()
+nix_shell_darwin_proof=()
+nix_shell_proof_has_main=false
 if [[ -f $template_root/flake.nix ]]; then
   nix_system=$(nix eval --impure --raw --expr builtins.currentSystem) ||
     fail 'the current Nix system could not be resolved'
@@ -852,6 +855,12 @@ if [[ -f $template_root/flake.nix ]]; then
     "$template_root#devShells.aarch64-darwin.ci.drvPath")
   nix_shell_develop=(nix develop --offline --ignore-environment \
     --keep-env-var HOME "$template_root#ci")
+  nix_shell_linux_proof=(nix eval --offline --json --apply \
+    'shells: {shellNames = builtins.attrNames shells; shellDrvPaths = builtins.mapAttrs (_: shell: shell.drvPath) shells;}' \
+    "$template_root#devShells.x86_64-linux")
+  nix_shell_darwin_proof=(nix eval --offline --json --apply \
+    'shells: {shellNames = builtins.attrNames shells; shellDrvPaths = builtins.mapAttrs (_: shell: shell.drvPath) shells;}' \
+    "$template_root#devShells.aarch64-darwin")
   ci_shell_success='the repo-locked ci shell owns every production command and evaluates on Darwin'
 else
   nixpkgs_revision=4382ed2b7a6839d4280a9b386db49cbc5907414d
@@ -878,10 +887,22 @@ let
     pkgs-unstable = pkgs;
   };
   env = import (templateRoot + "/nix/env.nix") { inherit pkgs packages; };
+  shells = import (templateRoot + "/nix/shells.nix") {
+    inherit pkgs packages env;
+    shellHook = "";
+  };
+  packageName = package: package.pname or package.name;
 in
-import (templateRoot + "/nix/shells.nix") {
-  inherit pkgs packages env;
-  shellHook = "";
+shells // {
+  proof = {
+    activeMain = map packageName (
+      env.main ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux env.mainLinux
+    );
+    nscName = packages.nsc.name;
+    nscOut = packages.nsc.outPath;
+    shellDrvPaths = builtins.mapAttrs (_: shell: shell.drvPath) shells;
+    shellNames = builtins.attrNames shells;
+  };
 }
 NIX
 
@@ -898,8 +919,73 @@ NIX
   nix_shell_develop=(nix develop --offline --impure --ignore-environment \
     --keep-env-var HOME --file "$ci_shell_composition" \
     "${nix_composition_args[@]}" ci)
+  nix_shell_linux_proof=(nix eval --offline --impure --json \
+    --file "$ci_shell_composition" "${nix_composition_args[@]}" \
+    --argstr system x86_64-linux proof)
+  nix_shell_darwin_proof=(nix eval --offline --impure --json \
+    --file "$ci_shell_composition" "${nix_composition_args[@]}" \
+    --argstr system aarch64-darwin proof)
+  nix_shell_proof_has_main=true
   ci_shell_success='the synthetic offline ci shell for the flake-less template owns every production command and evaluates on Darwin'
 fi
+
+validate_shell_proof() {
+  local label=${1:?label required} target_system=${2:?system required}
+  local strict_main=${3:?strict-main flag required} proof=${4:?proof required}
+  local expected_main='[]'
+  case $target_system in
+    x86_64-linux) expected_main='["git","kubectl","iproute2","glibc"]' ;;
+    aarch64-darwin) expected_main='["git","kubectl"]' ;;
+    *) fail "unsupported shell-proof system: $target_system" ;;
+  esac
+  jq -e --argjson strictMain "$strict_main" --argjson expectedMain "$expected_main" '
+    .shellNames == ["cd","ci","default","releaser"] and
+    (.shellDrvPaths | keys) == ["cd","ci","default","releaser"] and
+    ([.shellDrvPaths[] |
+      type == "string" and test("^/nix/store/[a-z0-9]{32}-nix-shell\\.drv$")] | all) and
+    (if $strictMain then
+      .activeMain == $expectedMain and
+      .nscName == "nsc-0.0.532" and
+      (.nscOut | type == "string" and
+        test("^/nix/store/[a-z0-9]{32}-nsc-0\\.0\\.532$"))
+    else true end)
+  ' <<<"$proof" >/dev/null || fail "$label lost its exact $target_system shell composition"
+}
+
+if ! linux_shell_proof=$("${nix_shell_linux_proof[@]}"); then
+  fail 'the resolved shell set could not be inspected on x86_64-linux'
+fi
+if ! darwin_shell_proof=$("${nix_shell_darwin_proof[@]}"); then
+  fail 'the resolved shell set could not be inspected on aarch64-darwin'
+fi
+validate_shell_proof canonical x86_64-linux "$nix_shell_proof_has_main" "$linux_shell_proof"
+validate_shell_proof canonical aarch64-darwin "$nix_shell_proof_has_main" "$darwin_shell_proof"
+
+nsc_shell_assertion=$scratch/assert-nsc-shell
+cat >"$nsc_shell_assertion" <<'ASSERT_NSC'
+#!/usr/bin/env bash
+set -euo pipefail
+resolved=$(command -v nsc)
+[[ ${DIENE_NSC_BIN-} == "$resolved" ]]
+[[ $DIENE_NSC_BIN == /nix/store/*-nsc-0.0.532/bin/nsc ]]
+nsc_root=${DIENE_NSC_BIN%/bin/nsc}
+[[ ${DIENE_NSC_IDENTITY_FILE-} == "$nsc_root/share/diene/nsc-identity.json" ]]
+[[ -x $DIENE_NSC_BIN && -r $DIENE_NSC_IDENTITY_FILE ]]
+for command_name in git kubectl ip ss getent; do
+  command_path=$(command -v "$command_name")
+  [[ $command_path == /nix/store/* ]]
+done
+setup_hook=$nsc_root/nix-support/setup-hook
+grep -Fxq "export DIENE_NSC_BIN=$DIENE_NSC_BIN" "$setup_hook"
+grep -Fxq "export DIENE_NSC_IDENTITY_FILE=$DIENE_NSC_IDENTITY_FILE" "$setup_hook"
+binary_digest="sha256:$(sha256sum "$DIENE_NSC_BIN" | awk '{print $1}')"
+jq -e --arg binaryDigest "$binary_digest" '
+  .version == "v0.0.532" and
+  .artifactDigest == "sha256:b2ec7146c72aa24c95930135259dd6ba8a25fdc4dae2fc92346286ac71bea0fc" and
+  .binaryDigest == $binaryDigest
+' "$DIENE_NSC_IDENTITY_FILE" >/dev/null
+ASSERT_NSC
+chmod 0500 "$nsc_shell_assertion"
 
 if ! "${nix_shell_build[@]}" >/dev/null; then
   fail 'the resolved ci shell derivation could not be built offline'
@@ -913,6 +999,8 @@ grep -Eq '^/nix/store/[a-z0-9]{32}-[^/]+\.drv$' "$scratch/ci-shell-darwin-drv" |
 # This single-quoted program is evaluated by the pure inner Bash, not here.
 # shellcheck disable=SC2016
 if ! "${nix_shell_develop[@]}" --command bash -ceu '
+    assertion=${1:?assertion required}
+    shift
     failed=0
     for command_name do
       if ! resolved=$(command -v "$command_name" 2>/dev/null); then
@@ -930,8 +1018,9 @@ if ! "${nix_shell_develop[@]}" --command bash -ceu '
       esac
       printf "%s=%s\n" "$command_name" "$resolved"
     done
+    "$assertion"
     exit "$failed"
-  ' bash "${ci_shell_commands[@]}" >"$scratch/ci-shell-commands"; then
+  ' bash "$nsc_shell_assertion" "${ci_shell_commands[@]}" >"$scratch/ci-shell-commands"; then
   fail 'the resolved ci shell does not own the complete production command inventory'
 fi
 [[ $(wc -l <"$scratch/ci-shell-commands") -eq ${#ci_shell_commands[@]} ]] ||
@@ -942,11 +1031,73 @@ grep -Fq 'version = "0.0.532"' "$template_root/nix/packages.nix" ||
   fail 'the declared CI shell does not pin nsc v0.0.532'
 grep -Fq 'sha256-suxxRscqokyVkwE1JZ3Wuool/cTa4vySNGKGrHG+oPw=' \
   "$template_root/nix/packages.nix" || fail 'the measured x86_64 nsc release hash is absent'
-# The Nix interpolation is intentionally matched literally.
-# shellcheck disable=SC2016
-grep -Fq 'DIENE_NSC_BIN = "${packages.nsc}/bin/nsc"' "$template_root/nix/shells.nix" ||
-  fail 'the CI shell does not select the immutable nsc store executable'
-ok 'the declared shell selects the hash-pinned measured Namespace CLI'
+grep -Fq 'setupHook = pkgs-2605.writeText "diene-nsc-setup-hook"' \
+  "$template_root/nix/packages.nix" || fail 'the pinned nsc setup hook is absent'
+grep -Fq 'export DIENE_NSC_BIN=@out@/bin/nsc' "$template_root/nix/packages.nix" ||
+  fail 'the nsc setup hook does not bind the immutable store executable'
+grep -Fq 'export DIENE_NSC_IDENTITY_FILE=@out@/share/diene/nsc-identity.json' \
+  "$template_root/nix/packages.nix" || fail 'the nsc setup hook does not bind its identity record'
+if rg -n 'inherit[[:space:]]+nsc|^[[:space:]]+nsc$' "$template_root/nix/packages.nix" \
+  >"$scratch/inherited-nsc"; then
+  sed -n '1,80p' "$scratch/inherited-nsc" >&2
+  fail 'packages.nix still permits the channel nsc to replace the measured assignment'
+fi
+ok 'every declared shell selects the hash-pinned measured Namespace CLI through its setup hook'
+
+source_template_root=$(cd -- "$template_root/../.." && pwd)
+generated_fixture_root=$source_template_root/cyan/fixtures/expected
+if [[ -f $source_template_root/cyan.yaml && -d $generated_fixture_root &&
+  $template_root -ef $source_template_root/templates/base ]]; then
+  [[ -n ${ci_shell_composition:-} ]] ||
+    fail 'the source fixture proof requires the real flake-less composition expression'
+  generated_fixture_count=0
+  for fixture_root in "$generated_fixture_root"/*; do
+    [[ -d $fixture_root ]] || continue
+    for nix_file in env.nix packages.nix shells.nix; do
+      [[ -f $fixture_root/nix/$nix_file ]] ||
+        fail "generated fixture ${fixture_root##*/} lost nix/$nix_file"
+    done
+    [[ $(rg -c '^[[:space:]]+(default|ci|cd|releaser) = pkgs\.mkShell \{' \
+      "$fixture_root/nix/shells.nix") -eq 4 ]] ||
+      fail "generated fixture ${fixture_root##*/} lost one of the four shells"
+    [[ $(rg -c 'pkgs\.lib\.optionals pkgs\.stdenv\.hostPlatform\.isLinux mainLinux' \
+      "$fixture_root/nix/shells.nix") -eq 4 ]] ||
+      fail "generated fixture ${fixture_root##*/} lost Linux-only inputs from a shell"
+
+    fixture_composition_args=(
+      --argstr templateRoot "$fixture_root"
+      --argstr nixpkgsSource "$nixpkgs_source"
+      --argstr atomipkgsSource "$atomipkgs_source"
+    )
+    if ! fixture_linux_proof=$(nix eval --offline --impure --json \
+      --file "$ci_shell_composition" "${fixture_composition_args[@]}" \
+      --argstr system x86_64-linux proof); then
+      fail "generated fixture ${fixture_root##*/} does not evaluate on x86_64-linux"
+    fi
+    if ! fixture_darwin_proof=$(nix eval --offline --impure --json \
+      --file "$ci_shell_composition" "${fixture_composition_args[@]}" \
+      --argstr system aarch64-darwin proof); then
+      fail "generated fixture ${fixture_root##*/} does not evaluate on aarch64-darwin"
+    fi
+    validate_shell_proof "generated fixture ${fixture_root##*/}" x86_64-linux true \
+      "$fixture_linux_proof"
+    validate_shell_proof "generated fixture ${fixture_root##*/}" aarch64-darwin true \
+      "$fixture_darwin_proof"
+
+    for shell_name in default ci cd releaser; do
+      nix develop --offline --impure --ignore-environment --keep-env-var HOME \
+        --file "$ci_shell_composition" "${fixture_composition_args[@]}" \
+        --argstr system x86_64-linux "$shell_name" --command "$nsc_shell_assertion" ||
+        fail "generated fixture ${fixture_root##*/} shell $shell_name lost its exact runtime inputs"
+    done
+    generated_fixture_count=$((generated_fixture_count + 1))
+  done
+  [[ $generated_fixture_count -eq 9 ]] ||
+    fail "expected nine generated fixture proofs, got $generated_fixture_count"
+  ok 'all nine generated shapes preserve Linux/Darwin parity, four shells, and pinned nsc identity'
+else
+  ok 'the consumer shell preserves Linux/Darwin parity, four shells, and pinned nsc identity'
+fi
 
 for input in lane repository_id repository_key source_sha garden_lock_digest artifact_digest \
   artifact_provenance_ref artifact_attestation_digest journey_manifest vendor_manifest action_id \

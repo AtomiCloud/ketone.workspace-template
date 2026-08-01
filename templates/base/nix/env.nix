@@ -19,7 +19,9 @@ with packages;
     # shell that runs them, rather than inherit whichever venue versions exist.
     git
     kubectl
-  ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+  ];
+
+  mainLinux = [
     # The Namespace guest path is Linux-only; keeping these conditional also
     # preserves the parent flake's aarch64-darwin shell evaluation.
     iproute2

@@ -1,26 +1,20 @@
 { pkgs, packages, env, shellHook }:
 with env;
-let
-  pinnedNamespaceCli = {
-    DIENE_NSC_BIN = "${packages.nsc}/bin/nsc";
-    DIENE_NSC_IDENTITY_FILE = "${packages.nsc}/share/diene/nsc-identity.json";
-  };
-in
 {
-  default = pkgs.mkShell (pinnedNamespaceCli // {
-    buildInputs = system ++ main ++ lint ++ dev;
+  default = pkgs.mkShell {
+    buildInputs = system ++ main ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux mainLinux ++ lint ++ dev;
     inherit shellHook;
-  });
-  ci = pkgs.mkShell (pinnedNamespaceCli // {
-    buildInputs = system ++ main ++ lint;
+  };
+  ci = pkgs.mkShell {
+    buildInputs = system ++ main ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux mainLinux ++ lint;
     inherit shellHook;
-  });
-  cd = pkgs.mkShell (pinnedNamespaceCli // {
-    buildInputs = system ++ main;
+  };
+  cd = pkgs.mkShell {
+    buildInputs = system ++ main ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux mainLinux;
     inherit shellHook;
-  });
-  releaser = pkgs.mkShell (pinnedNamespaceCli // {
-    buildInputs = system ++ main ++ lint ++ releaser;
+  };
+  releaser = pkgs.mkShell {
+    buildInputs = system ++ main ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux mainLinux ++ lint ++ releaser;
     inherit shellHook;
-  });
+  };
 }
