@@ -18,7 +18,7 @@ jobs:
   # so no Namespace instance is created for an incomplete repository.
   authorize-runtime:
     name: Authorize protected runtime
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
@@ -84,7 +84,7 @@ jobs:
     name: Artifact Build
     if: needs.authorize-runtime.outputs.enabled == 'true'
     needs: authorize-runtime
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -147,7 +147,7 @@ jobs:
     name: Environment Profile Contract
     if: needs.authorize-runtime.outputs.enabled == 'true'
     needs: [authorize-runtime, artifact-build]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     concurrency:
       group: profile-${{ fromJSON(github.repository_id) }}-${{ needs.authorize-runtime.outputs.source_sha }}

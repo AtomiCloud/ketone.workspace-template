@@ -38,12 +38,12 @@ jobs:
   # a runtime step.
   contract:
     name: Input Contract
-    # ubuntu-26.04 is not yet available in this venue; this is the ratified
-    # recorded 24.04 fallback, not a silent primary-label substitution.
-    runs-on: ubuntu-24.04
+    # The measured GitHub-hosted venue is Ubuntu 26.04. This contract job has
+    # no Namespace authority, so its reported orchestrator venue is hosted.
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
-    env: &runtime-env
+    env: &github-hosted-env
       DIENE_LANE: ${{ inputs.lane }}
       GITHUB_REPOSITORY_ID: ${{ inputs.repository_id }}
       GITHUB_REPOSITORY: ${{ inputs.repository_key }}
@@ -63,8 +63,8 @@ jobs:
       DIENE_NSC_DURATION: 2h
       DIENE_ADMITTED_K3S_VERSION: v1.33.1+k3s1
       DIENE_K3S_SERVICE_CIDR: 10.143.0.0/16
-      DIENE_ORCHESTRATOR_VENUE: namespace
-      DIENE_ORCHESTRATOR_LABEL: nscloud-ubuntu-26.04-amd64-16x32
+      DIENE_ORCHESTRATOR_VENUE: github-hosted
+      DIENE_ORCHESTRATOR_LABEL: ubuntu-26.04
       DIENE_CONNECTED_EGRESS_JSON: ${{ vars.DIENE_CONNECTED_EGRESS_JSON }}
       DIENE_EGRESS_CANARY_IMAGE: ${{ vars.DIENE_EGRESS_CANARY_IMAGE }}
       DIENE_EGRESS_L7_ENFORCER_BIN: ${{ vars.DIENE_EGRESS_L7_ENFORCER_BIN }}
@@ -128,8 +128,40 @@ jobs:
       group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-ditto-build-local
       cancel-in-progress: false
     permissions: { contents: read, id-token: write }
-    runs-on: nscloud-ubuntu-26.04-amd64-16x32
-    env: *runtime-env
+    # The three cache-consuming Ditto lanes must all request the measured S31
+    # cache label triple. The anchor makes that shared venue deliberate.
+    runs-on: &cache-attached-namespace-runner
+      - nscloud-ubuntu-26.04-amd64-16x32-with-cache
+      - nscloud-cache-size-50gb
+      - nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64
+    env: &cache-attached-namespace-env
+      DIENE_LANE: ${{ inputs.lane }}
+      GITHUB_REPOSITORY_ID: ${{ inputs.repository_id }}
+      GITHUB_REPOSITORY: ${{ inputs.repository_key }}
+      GITHUB_SHA: ${{ inputs.source_sha }}
+      DIENE_GARDEN_LOCK_DIGEST: ${{ inputs.garden_lock_digest }}
+      DIENE_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      DIENE_ARTIFACT_PROVENANCE_REF: ${{ inputs.artifact_provenance_ref }}
+      DIENE_ARTIFACT_ATTESTATION_DIGEST: ${{ inputs.artifact_attestation_digest }}
+      DIENE_JOURNEY_MANIFEST: ${{ inputs.journey_manifest }}
+      DIENE_VENDOR_MANIFEST: ${{ inputs.vendor_manifest }}
+      DIENE_ACTION_ID: ${{ inputs.action_id }}
+      DIENE_CLOSURE_DIGEST: ${{ inputs.closure_digest }}
+      DIENE_CLOSURE_BUNDLE_REF: ${{ inputs.closure_bundle_ref }}
+      DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST: ${{ inputs.closure_signature_bundle_digest }}
+      DIENE_CLOSURE_TRUST_ROOT_DIGEST: ${{ inputs.closure_trust_root_digest }}
+      DIENE_TRUSTED_RUNTIME_CONTEXT: protected-base
+      DIENE_NSC_DURATION: 2h
+      DIENE_ADMITTED_K3S_VERSION: v1.33.1+k3s1
+      DIENE_K3S_SERVICE_CIDR: 10.143.0.0/16
+      DIENE_ORCHESTRATOR_VENUE: namespace
+      DIENE_ORCHESTRATOR_LABEL: nscloud-ubuntu-26.04-amd64-16x32-with-cache
+      DIENE_CONNECTED_EGRESS_JSON: ${{ vars.DIENE_CONNECTED_EGRESS_JSON }}
+      DIENE_EGRESS_CANARY_IMAGE: ${{ vars.DIENE_EGRESS_CANARY_IMAGE }}
+      DIENE_EGRESS_L7_ENFORCER_BIN: ${{ vars.DIENE_EGRESS_L7_ENFORCER_BIN }}
+      DIENE_EGRESS_PROBE_BIN: ${{ vars.DIENE_EGRESS_PROBE_BIN }}
+      DIENE_VENDOR_CREDENTIAL_BROKER_BIN: ${{ vars.DIENE_VENDOR_CREDENTIAL_BROKER_BIN }}
+      DIENE_FIXTURE_ID: ${{ inputs.lane == 'fleet-independence' && 'bootstrap-fleet-independence-v1' || '' }}
     outputs: &core-outputs
       subject_digest: ${{ steps.run.outputs.subject_digest }}
       receipt_id: ${{ steps.run.outputs.receipt_id }}
@@ -180,8 +212,8 @@ jobs:
       group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-ditto-target-pull
       cancel-in-progress: false
     permissions: { contents: read, packages: read, id-token: write }
-    runs-on: nscloud-ubuntu-26.04-amd64-16x32
-    env: *runtime-env
+    runs-on: *cache-attached-namespace-runner
+    env: *cache-attached-namespace-env
     outputs: *core-outputs
     steps: *core-runtime-steps
 
@@ -195,8 +227,8 @@ jobs:
       group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-ditto-vendor-${{ inputs.action_id }}
       cancel-in-progress: false
     permissions: { contents: read, id-token: write }
-    runs-on: nscloud-ubuntu-26.04-amd64-16x32
-    env: *runtime-env
+    runs-on: *cache-attached-namespace-runner
+    env: *cache-attached-namespace-env
     outputs:
       subject_digest: ${{ steps.run.outputs.subject_digest }}
       receipt_id: ${{ steps.run.outputs.receipt_id }}
@@ -213,8 +245,37 @@ jobs:
       group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-absol
       cancel-in-progress: false
     permissions: { contents: read, id-token: write }
-    runs-on: nscloud-ubuntu-26.04-amd64-16x32
-    env: *runtime-env
+    # Absol and fleet-independence are intentionally cacheless: this exact
+    # bare venue must never acquire the -with-cache or S31 cache labels.
+    runs-on: &cacheless-namespace-runner nscloud-ubuntu-26.04-amd64-16x32
+    env: &cacheless-namespace-env
+      DIENE_LANE: ${{ inputs.lane }}
+      GITHUB_REPOSITORY_ID: ${{ inputs.repository_id }}
+      GITHUB_REPOSITORY: ${{ inputs.repository_key }}
+      GITHUB_SHA: ${{ inputs.source_sha }}
+      DIENE_GARDEN_LOCK_DIGEST: ${{ inputs.garden_lock_digest }}
+      DIENE_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      DIENE_ARTIFACT_PROVENANCE_REF: ${{ inputs.artifact_provenance_ref }}
+      DIENE_ARTIFACT_ATTESTATION_DIGEST: ${{ inputs.artifact_attestation_digest }}
+      DIENE_JOURNEY_MANIFEST: ${{ inputs.journey_manifest }}
+      DIENE_VENDOR_MANIFEST: ${{ inputs.vendor_manifest }}
+      DIENE_ACTION_ID: ${{ inputs.action_id }}
+      DIENE_CLOSURE_DIGEST: ${{ inputs.closure_digest }}
+      DIENE_CLOSURE_BUNDLE_REF: ${{ inputs.closure_bundle_ref }}
+      DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST: ${{ inputs.closure_signature_bundle_digest }}
+      DIENE_CLOSURE_TRUST_ROOT_DIGEST: ${{ inputs.closure_trust_root_digest }}
+      DIENE_TRUSTED_RUNTIME_CONTEXT: protected-base
+      DIENE_NSC_DURATION: 2h
+      DIENE_ADMITTED_K3S_VERSION: v1.33.1+k3s1
+      DIENE_K3S_SERVICE_CIDR: 10.143.0.0/16
+      DIENE_ORCHESTRATOR_VENUE: namespace
+      DIENE_ORCHESTRATOR_LABEL: nscloud-ubuntu-26.04-amd64-16x32
+      DIENE_CONNECTED_EGRESS_JSON: ${{ vars.DIENE_CONNECTED_EGRESS_JSON }}
+      DIENE_EGRESS_CANARY_IMAGE: ${{ vars.DIENE_EGRESS_CANARY_IMAGE }}
+      DIENE_EGRESS_L7_ENFORCER_BIN: ${{ vars.DIENE_EGRESS_L7_ENFORCER_BIN }}
+      DIENE_EGRESS_PROBE_BIN: ${{ vars.DIENE_EGRESS_PROBE_BIN }}
+      DIENE_VENDOR_CREDENTIAL_BROKER_BIN: ${{ vars.DIENE_VENDOR_CREDENTIAL_BROKER_BIN }}
+      DIENE_FIXTURE_ID: ${{ inputs.lane == 'fleet-independence' && 'bootstrap-fleet-independence-v1' || '' }}
     outputs: *core-outputs
     steps: *core-runtime-steps
 
@@ -228,8 +289,8 @@ jobs:
       group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-fleet-independence
       cancel-in-progress: false
     permissions: { contents: read }
-    runs-on: nscloud-ubuntu-26.04-amd64-16x32
-    env: *runtime-env
+    runs-on: *cacheless-namespace-runner
+    env: *cacheless-namespace-env
     outputs: *core-outputs
     steps: *core-runtime-steps
 
@@ -247,10 +308,10 @@ jobs:
       - environment-fleet-independence
     timeout-minutes: 20
     permissions: { contents: read }
-    # Workflow-owned verification currently uses the recorded GitHub-hosted
-    # 24.04 fallback because ubuntu-26.04 is not available in this venue.
-    runs-on: ubuntu-24.04
-    env: *runtime-env
+    # This proof-only verifier has no Namespace authority and runs on the
+    # measured GitHub-hosted Ubuntu 26.04 venue.
+    runs-on: ubuntu-26.04
+    env: *github-hosted-env
     steps:
       - uses: *checkout
         with: { ref: '${{ inputs.source_sha }}' }

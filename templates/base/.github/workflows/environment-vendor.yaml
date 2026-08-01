@@ -11,7 +11,7 @@ permissions: {}
 jobs:
   authorize-vendor:
     name: Authorize vendor action
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
@@ -57,7 +57,7 @@ jobs:
   artifact-build:
     name: Artifact Build
     needs: authorize-vendor
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -99,7 +99,7 @@ jobs:
   environment-profile-contract:
     name: Environment Profile Contract
     needs: [authorize-vendor, artifact-build]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     concurrency:
       group: profile-${{ fromJSON(github.repository_id) }}-${{ needs.authorize-vendor.outputs.source_sha }}

@@ -15,7 +15,7 @@ jobs:
   artifact-build:
     name: Artifact Build
     needs: precommit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -49,7 +49,7 @@ jobs:
   environment-contract-tests:
     name: Environment Contract Tests
     needs: precommit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -61,7 +61,7 @@ jobs:
     name: Environment Profile Contract
     if: github.event_name == 'pull_request' || github.ref_protected == true
     needs: [precommit, artifact-build]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     concurrency:
       group: profile-${{ fromJSON(github.repository_id) }}-${{ github.sha }}
