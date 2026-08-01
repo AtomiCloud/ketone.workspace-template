@@ -12,10 +12,20 @@ with packages;
   ];
 
   dev = [
-    git
   ];
 
   main = [
+    # Production lifecycle scripts must resolve these from every composed
+    # shell that runs them, rather than inherit whichever venue versions exist.
+    git
+    kubectl
+  ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+    # The Namespace guest path is Linux-only; keeping these conditional also
+    # preserves the parent flake's aarch64-darwin shell evaluation.
+    iproute2
+    # The connected-lane DNS fallback uses getent directly.  Keep its provider
+    # on the same pinned nixpkgs channel as the rest of the shell.
+    pkgs.getent
   ];
 
   lint = [
@@ -29,6 +39,8 @@ with packages;
     # Repository declarations and emitted reports are validated against real
     # JSON Schemas before they are trusted.
     check-jsonschema
+    # The contract harness performs bounded source-surface scans with rg.
+    pkgs.ripgrep
   ];
 
   releaser = [

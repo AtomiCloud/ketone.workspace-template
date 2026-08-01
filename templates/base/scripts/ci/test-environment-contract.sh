@@ -64,7 +64,7 @@ expect_precreate_refusal() {
   ok "$reason refuses before nsc create"
 }
 
-for command in jq yq check-jsonschema sha256sum tar grep sed awk find timeout rg base64 stat; do
+for command in jq yq check-jsonschema sha256sum tar grep sed awk find timeout rg base64 stat nix; do
   command -v "$command" >/dev/null 2>&1 || fail "$command is required for the contract suite"
 done
 
@@ -819,6 +819,124 @@ if rg -n 'runner-pin|host-policy|leaseId|DigitalOcean|JIT' --glob '!test-environ
   fail 'the active runtime surface still depends on shelved runner apparatus'
 fi
 ok 'active code contains no self-hosted, DO, nested-k3d, ingress, cache, or export path'
+
+printf '== resolved ci shell owns the production command surface ==\n'
+
+resolve_offline_flake_source() {
+  local reference=${1:?flake reference required}
+  local revision=${2:?flake revision required}
+  local expected_hash=${3:?flake hash required}
+  local metadata
+  metadata=$(nix flake prefetch --offline --json "$reference") ||
+    fail "the pinned flake source is not available offline: $reference"
+  jq -er --arg revision "$revision" --arg expectedHash "$expected_hash" '
+    select(.locked.rev == $revision and .locked.narHash == $expectedHash) |
+    .storePath | select(type == "string" and startswith("/nix/store/"))
+  ' <<<"$metadata" || fail "the offline flake source changed identity: $reference"
+}
+
+ci_shell_commands=(
+  awk base64 basename cat check-jsonschema chmod curl cut date dirname env find
+  getent git grep id install ip jq kubectl mktemp mv nc nsc pls pre-commit ps rm
+  rg sed sha256sum sleep sort ss stat tar timeout tr wc yq
+)
+nix_shell_build=()
+nix_shell_darwin_eval=()
+nix_shell_develop=()
+if [[ -f $template_root/flake.nix ]]; then
+  nix_system=$(nix eval --impure --raw --expr builtins.currentSystem) ||
+    fail 'the current Nix system could not be resolved'
+  nix_shell_build=(nix build --offline --no-link \
+    "$template_root#devShells.$nix_system.ci")
+  nix_shell_darwin_eval=(nix eval --offline --raw \
+    "$template_root#devShells.aarch64-darwin.ci.drvPath")
+  nix_shell_develop=(nix develop --offline --ignore-environment \
+    --keep-env-var HOME "$template_root#ci")
+  ci_shell_success='the repo-locked ci shell owns every production command and evaluates on Darwin'
+else
+  nixpkgs_revision=4382ed2b7a6839d4280a9b386db49cbc5907414d
+  nixpkgs_hash=sha256-iYL/bixrb6FlHFu/gIuBYzq6c6lM5AAXsXNSWXtIgQc=
+  atomipkgs_revision=964cc580004effe73eaf6739fb01d95414f4dd50
+  atomipkgs_hash=sha256-mrjPkZJlxoGUGjp1EF57TBIs1wIuGGib1ANvQJHb/2E=
+  nixpkgs_source=$(resolve_offline_flake_source \
+    "github:NixOS/nixpkgs/$nixpkgs_revision" "$nixpkgs_revision" "$nixpkgs_hash")
+  atomipkgs_source=$(resolve_offline_flake_source \
+    "github:AtomiCloud/nix-registry/$atomipkgs_revision" \
+    "$atomipkgs_revision" "$atomipkgs_hash")
+
+  ci_shell_composition=$scratch/ci-shell-composition.nix
+  cat >"$ci_shell_composition" <<'NIX'
+{ templateRoot, nixpkgsSource, atomipkgsSource, system ? builtins.currentSystem }:
+let
+  pkgs = import (builtins.storePath nixpkgsSource) { inherit system; };
+  atomi = (builtins.getFlake atomipkgsSource).packages.${system};
+  packages = import (templateRoot + "/nix/packages.nix") {
+    inherit pkgs atomi;
+    pkgs-2605 = pkgs;
+    # packages.nix currently takes no packages from this set.  Binding it to
+    # the same immutable source keeps this regression offline and bounded.
+    pkgs-unstable = pkgs;
+  };
+  env = import (templateRoot + "/nix/env.nix") { inherit pkgs packages; };
+in
+import (templateRoot + "/nix/shells.nix") {
+  inherit pkgs packages env;
+  shellHook = "";
+}
+NIX
+
+  nix_composition_args=(
+    --argstr templateRoot "$template_root"
+    --argstr nixpkgsSource "$nixpkgs_source"
+    --argstr atomipkgsSource "$atomipkgs_source"
+  )
+  nix_shell_build=(nix build --offline --impure --no-link \
+    --file "$ci_shell_composition" "${nix_composition_args[@]}" ci)
+  nix_shell_darwin_eval=(nix eval --offline --impure --raw \
+    --file "$ci_shell_composition" "${nix_composition_args[@]}" \
+    --argstr system aarch64-darwin ci.drvPath)
+  nix_shell_develop=(nix develop --offline --impure --ignore-environment \
+    --keep-env-var HOME --file "$ci_shell_composition" \
+    "${nix_composition_args[@]}" ci)
+  ci_shell_success='the synthetic offline ci shell for the flake-less template owns every production command and evaluates on Darwin'
+fi
+
+if ! "${nix_shell_build[@]}" >/dev/null; then
+  fail 'the resolved ci shell derivation could not be built offline'
+fi
+if ! "${nix_shell_darwin_eval[@]}" >"$scratch/ci-shell-darwin-drv"; then
+  fail 'the resolved ci shell does not evaluate for aarch64-darwin'
+fi
+grep -Eq '^/nix/store/[a-z0-9]{32}-[^/]+\.drv$' "$scratch/ci-shell-darwin-drv" ||
+  fail 'the aarch64-darwin ci shell evaluation emitted no derivation path'
+
+# This single-quoted program is evaluated by the pure inner Bash, not here.
+# shellcheck disable=SC2016
+if ! "${nix_shell_develop[@]}" --command bash -ceu '
+    failed=0
+    for command_name do
+      if ! resolved=$(command -v "$command_name" 2>/dev/null); then
+        printf "MISSING: %s\n" "$command_name" >&2
+        failed=1
+        continue
+      fi
+      case $resolved in
+        /nix/store/*) ;;
+        *)
+          printf "UNOWNED: %s=%s\n" "$command_name" "$resolved" >&2
+          failed=1
+          continue
+          ;;
+      esac
+      printf "%s=%s\n" "$command_name" "$resolved"
+    done
+    exit "$failed"
+  ' bash "${ci_shell_commands[@]}" >"$scratch/ci-shell-commands"; then
+  fail 'the resolved ci shell does not own the complete production command inventory'
+fi
+[[ $(wc -l <"$scratch/ci-shell-commands") -eq ${#ci_shell_commands[@]} ]] ||
+  fail 'the resolved ci shell command inventory was incomplete'
+ok "$ci_shell_success"
 
 grep -Fq 'version = "0.0.532"' "$template_root/nix/packages.nix" ||
   fail 'the declared CI shell does not pin nsc v0.0.532'
