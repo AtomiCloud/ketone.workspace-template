@@ -8,12 +8,11 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 source "$script_dir/environment-lib.sh"
 
-if [[ ${1:-} == --validate-inputs ]]; then
-  diene_validate_inputs
-  exit 0
-fi
-[[ ${1:-} == driver ]] || diene_die InputContractInvalid 'vendor executor accepts only driver mode'
-shift
+diene_vendor_driver_preflight() {
+  "$script_dir/environment-runner-preflight.sh" "$@"
+}
+
+vendor_driver_core() {
 state=${1:?fixed driver state directory required}
 diene_load_remote_inputs "$state"
 diene_validate_inputs
@@ -284,7 +283,7 @@ trap 'vendor_on_signal 130' INT
 
 started=$SECONDS
 export DIENE_PREFLIGHT_EVIDENCE="$evidence/preflight.json"
-"$script_dir/environment-runner-preflight.sh" --output "$DIENE_PREFLIGHT_EVIDENCE"
+diene_vendor_driver_preflight --output "$DIENE_PREFLIGHT_EVIDENCE"
 diene_checkpoint_append "$checkpoint" instance-preflight Pass \
   "$(diene_file_digest "$DIENE_PREFLIGHT_EVIDENCE")" false
 
@@ -366,3 +365,21 @@ diene_checkpoint_append "$checkpoint" vendor-action \
   "$(diene_sha256_text "$DIENE_ACTION_ID|$vendor_outcome|$action_seconds")" false
 [[ $vendor_outcome != Fail ]] || diene_die VendorActionFailed "$DIENE_ACTION_ID failed"
 diene_verify_endpoint_law "$evidence/endpoint-law.json"
+}
+
+environment_vendor_main() {
+  case ${1:-} in
+    --validate-inputs)
+      diene_validate_inputs
+      ;;
+    driver)
+      shift
+      vendor_driver_core "$@"
+      ;;
+    *) diene_die InputContractInvalid 'vendor executor accepts only driver mode' ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  environment_vendor_main "$@"
+fi

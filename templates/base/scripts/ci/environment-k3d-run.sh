@@ -461,18 +461,38 @@ orchestrator_finalize_report() {
     return "$finalize_rc"
   fi
 
+  [[ -f $ORCH_RECEIPT && ! -L $ORCH_RECEIPT ]] || {
+    rm -f -- "$final_bundle"
+    orchestrator_fail "$DIENE_REASON_EXIT" EvidenceCollectionFailed \
+      'terminal proof cannot be sealed without the exact Namespace receipt'
+    return "$DIENE_REASON_EXIT"
+  }
+  local report_digest lifecycle_digest checkpoint_digest
+  report_digest=$(diene_file_digest "$final_report")
+  lifecycle_digest=$(diene_file_digest "$lifecycle")
+  checkpoint_digest=$(diene_file_digest "$checkpoint")
+  # shellcheck disable=SC2016
+  diene_receipt_patch "$ORCH_RECEIPT" '
+    .checkpointChainDigest = $checkpointDigest |
+    .lifecycleDigest = $lifecycleDigest |
+    .terminalReportDigest = $terminalReportDigest
+  ' --arg checkpointDigest "$checkpoint_digest" --arg lifecycleDigest "$lifecycle_digest" \
+    --arg terminalReportDigest "$report_digest"
+  diene_schema_validate diene-ci-receipt-v1.schema.json "$ORCH_RECEIPT" 'terminal Namespace receipt'
+  if ((ORCH_FIRST_RC == 0)); then
+    diene_validate_terminal_receipt "$ORCH_RECEIPT" "$lifecycle" "$checkpoint" "$final_report"
+  fi
+
   local proof_dir="$ORCH_STATE/final-proof"
   install -d -m 0700 "$proof_dir"
   install -m 0600 "$final_report" "$proof_dir/$(basename -- "$final_report")"
   install -m 0600 "$lifecycle" "$proof_dir/namespace-lifecycle.json"
   install -m 0600 "$checkpoint" "$proof_dir/checkpoint-chain.json"
-  [[ ! -f $ORCH_RECEIPT ]] || install -m 0600 "$ORCH_RECEIPT" "$proof_dir/ci-receipt.json"
-  local -a final_members=("$(basename -- "$final_report")" namespace-lifecycle.json checkpoint-chain.json)
-  [[ ! -f $proof_dir/ci-receipt.json ]] || final_members+=(ci-receipt.json)
+  install -m 0600 "$ORCH_RECEIPT" "$proof_dir/ci-receipt.json"
+  local -a final_members=("$(basename -- "$final_report")" namespace-lifecycle.json \
+    checkpoint-chain.json ci-receipt.json)
   tar -cf "$final_bundle" -C "$proof_dir" "${final_members[@]}"
   chmod 0600 "$final_bundle"
-  local report_digest
-  report_digest=$(diene_file_digest "$final_report")
   printf 'subject_digest=%s\nreceipt_id=%s\n%s_report_digest=%s\nproof_bundle=%s\n' \
     "$DIENE_ARTIFACT_DIGEST" "$ORCH_RECEIPT_ID" "$ORCH_KIND" "$report_digest" "$final_bundle" \
     >>"${GITHUB_OUTPUT:-/dev/null}"
@@ -505,6 +525,9 @@ orchestrator_on_signal() {
 
 orchestrate() {
   diene_validate_inputs
+  if [[ $DIENE_LANE != ditto-vendor ]]; then
+    diene_select_journeys "$DIENE_JOURNEY_MANIFEST" >/dev/null
+  fi
   diene_require_command jq
   diene_require_command sha256sum
   diene_require_command tar
@@ -555,6 +578,9 @@ orchestrate() {
   ORCH_NSC_VERSION=$nsc_version
   ORCH_NSC_ARTIFACT_DIGEST=$nsc_artifact_digest
   ORCH_NSC_BINARY_DIGEST=$nsc_binary_digest
+  export DIENE_NSC_VERSION=$nsc_version
+  export DIENE_NSC_ARTIFACT_DIGEST=$nsc_artifact_digest
+  export DIENE_NSC_BINARY_DIGEST=$nsc_binary_digest
   orchestrator_write_remote_archive_validator "$ORCH_STATE/archive-validator.sh"
   validator_digest=$(diene_file_digest "$ORCH_STATE/archive-validator.sh")
   printf '%s  archive-validator.sh\n' "${validator_digest#sha256:}" \
@@ -703,6 +729,9 @@ orchestrate() {
       local collected_receipt=$ORCH_STATE/collected/evidence/ci-receipt.json
       diene_validate_receipt_owner "$collected_receipt" "$ORCH_CLUSTER_ID"
       install -m 0600 "$collected_receipt" "$ORCH_RECEIPT"
+    else
+      orchestrator_fail "$DIENE_REASON_EXIT" EvidenceCollectionFailed \
+        'collected driver proof omitted the exact Namespace receipt'
     fi
     if [[ -f $ORCH_STATE/collected/evidence/driver-status.json ]] &&
       ! jq -e '.outcome == "Pass" and .exitCode == 0' \
@@ -782,7 +811,7 @@ orchestrator_cleanup_command() {
     "exact cluster_id $cluster_id was handled after the primary lifecycle; a fresh run is required"
 }
 
-orchestrator_verify_lifecycle() {
+orchestrator_verify_lifecycle() (
   local bundle=${1:?proof bundle required}
   diene_validate_inputs
   diene_require_command jq
@@ -792,33 +821,46 @@ orchestrator_verify_lifecycle() {
   diene_archive_is_safe "$bundle" ||
     diene_die EvidenceCollectionFailed \
       'lifecycle proof contains an unsafe name, link, device, FIFO, socket, or other special member'
+  local schema=diene-environment-report-v1.schema.json
+  local report_member=diene-environment-report.v1.json
+  if [[ $DIENE_LANE == ditto-vendor ]]; then
+    schema=diene-vendor-report-v1.schema.json
+    report_member=diene-vendor-report.v1.json
+  fi
   local listing extract
   listing=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-lifecycle-list.XXXXXX")
   extract=$(mktemp -d "${RUNNER_TEMP:-/tmp}/diene-lifecycle-proof.XXXXXX")
-  trap 'rm -f -- "$listing"; chmod -R u+rwX "$extract" 2>/dev/null || true; rm -r -- "$extract" 2>/dev/null || true' RETURN
+  trap 'rm -f -- "$listing"; chmod -R u+rwX "$extract" 2>/dev/null || true; rm -r -- "$extract" 2>/dev/null || true' EXIT
   LC_ALL=C tar --list --quoting-style=escape --file "$bundle" >"$listing" ||
     diene_die EvidenceCollectionFailed 'lifecycle proof tar is unreadable'
-  awk '
-    !/^(diene-environment-report\.v1\.json|diene-vendor-report\.v1\.json|namespace-lifecycle\.json|checkpoint-chain\.json|ci-receipt\.json)$/ {bad=1}
-    END {exit bad ? 1 : 0}
-  ' "$listing" || diene_die EvidenceCollectionFailed 'lifecycle proof has an unexpected or unsafe member'
+  awk -v report="$report_member" '
+    $0 == report {reports++; next}
+    $0 == "namespace-lifecycle.json" {lifecycles++; next}
+    $0 == "checkpoint-chain.json" {checkpoints++; next}
+    $0 == "ci-receipt.json" {receipts++; next}
+    {bad=1}
+    END {
+      exit (bad || NR != 4 || reports != 1 || lifecycles != 1 || checkpoints != 1 || receipts != 1) ? 1 : 0
+    }
+  ' "$listing" ||
+    diene_die EvidenceCollectionFailed \
+      'lifecycle proof must contain exactly the terminal report, lifecycle, checkpoint, and receipt'
   tar --extract --no-same-owner --no-same-permissions --keep-old-files \
     -f "$bundle" -C "$extract" ||
     diene_die EvidenceCollectionFailed 'lifecycle proof could not be extracted safely'
   diene_tree_is_safe "$extract" ||
     diene_die EvidenceCollectionFailed 'lifecycle proof contains an unreadable or special object'
 
-  local schema=diene-environment-report-v1.schema.json
-  local report="$extract/diene-environment-report.v1.json"
-  if [[ $DIENE_LANE == ditto-vendor ]]; then
-    schema=diene-vendor-report-v1.schema.json
-    report="$extract/diene-vendor-report.v1.json"
-  fi
+  local report="$extract/$report_member"
   diene_schema_validate "$schema" "$report" \
     'workflow-owned terminal report'
   local lifecycle="$extract/namespace-lifecycle.json" checkpoint="$extract/checkpoint-chain.json"
-  [[ -f $lifecycle && -f $checkpoint ]] ||
-    diene_die EvidenceCollectionFailed 'terminal lifecycle or checkpoint evidence is absent'
+  local receipt="$extract/ci-receipt.json" nsc_identity
+  local lifecycle_nsc_version lifecycle_nsc_artifact_digest lifecycle_nsc_binary_digest
+  nsc_identity=$(diene_nsc_identity_record)
+  lifecycle_nsc_version=$(jq -r '.version' <<<"$nsc_identity")
+  lifecycle_nsc_artifact_digest=$(jq -r '.artifactDigest' <<<"$nsc_identity")
+  lifecycle_nsc_binary_digest=$(jq -r '.binaryDigest' <<<"$nsc_identity")
   local cluster_id receipt_id
   cluster_id=$(jq -er '.clusterId | select(type == "string" and length > 0)' "$lifecycle") ||
     diene_die NamespaceIdentityMismatch 'terminal lifecycle has no exact cluster_id'
@@ -826,10 +868,15 @@ orchestrator_verify_lifecycle() {
   diene_require_safe_id cluster_id "$cluster_id"
   jq -e \
     --arg sha "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
-    --arg lane "$DIENE_LANE" --arg receipt "$receipt_id" --arg cluster "$cluster_id" '
+    --arg lane "$DIENE_LANE" --arg receipt "$receipt_id" --arg cluster "$cluster_id" \
+    --arg nscVersion "$lifecycle_nsc_version" \
+    --arg nscArtifactDigest "$lifecycle_nsc_artifact_digest" \
+    --arg nscBinaryDigest "$lifecycle_nsc_binary_digest" '
     .repositoryRevision == $sha and .workflow.runId == $runId and
     .workflow.runAttempt == $runAttempt and .lane == $lane and .receiptId == $receipt and
     .instance.clusterId == $cluster and .namespaceLifecycle.clusterId == $cluster and
+    .tooling.nscVersion == $nscVersion and .tooling.nscArtifactDigest == $nscArtifactDigest and
+    .tooling.nscBinaryDigest == $nscBinaryDigest and
     .namespaceLifecycle.duration == "2h" and .namespaceLifecycle.ephemeral == true and
     .namespaceLifecycle.endpointUsed == false and .namespaceLifecycle.cacheAttached == false and
     .namespaceLifecycle.lateCleanupCanRewrite == false and
@@ -856,11 +903,12 @@ orchestrator_verify_lifecycle() {
     .checkpoints[-1].id == "final-clean-pass" and .checkpoints[-1].outcome == "Pass"
   ' "$checkpoint" >/dev/null ||
     diene_die FinalCleanPassRequired 'terminal checkpoint chain is not a clean full pass'
-  if [[ -f $extract/ci-receipt.json ]]; then
-    diene_validate_receipt_owner "$extract/ci-receipt.json" "$cluster_id"
-  fi
+  DIENE_NSC_VERSION=$lifecycle_nsc_version \
+    DIENE_NSC_ARTIFACT_DIGEST=$lifecycle_nsc_artifact_digest \
+    DIENE_NSC_BINARY_DIGEST=$lifecycle_nsc_binary_digest \
+    diene_validate_terminal_receipt "$receipt" "$lifecycle" "$checkpoint" "$report"
   printf 'NamespaceLifecycleVerified: %s\n' "$cluster_id"
-}
+)
 
 # ---------------------------------------------------------------------------
 # On-instance core driver mode.
@@ -1048,6 +1096,10 @@ driver_on_signal() {
   exit "$rc"
 }
 
+diene_core_driver_preflight() {
+  "$script_dir/environment-runner-preflight.sh" "$@"
+}
+
 driver_core() {
   DRIVER_STATE=${1:?fixed driver state directory required}
   diene_load_remote_inputs "$DRIVER_STATE"
@@ -1077,6 +1129,11 @@ driver_core() {
   : >"$DRIVER_RESULTS"
   : >"$DRIVER_COVERAGE"
   : >"$DRIVER_READINESS"
+  if [[ $DIENE_LANE == fleet-independence ]]; then
+    jq -cn '{id:"fleet-endpoint-resource-negative-probe",outcome:"Unavailable",
+      reasonCode:"FleetEndpointResourceNegativeProbeContractUnavailable",required:false}' \
+      >>"$DRIVER_COVERAGE"
+  fi
   DRIVER_RECEIPT="$DRIVER_STATE/receipts/exact.json"
   export DIENE_RECEIPT_DIR="$DRIVER_STATE/receipts"
   diene_validate_receipt_owner "$DRIVER_RECEIPT" "$DIENE_NSC_CLUSTER_ID"
@@ -1101,14 +1158,10 @@ driver_core() {
 
   local preflight="$DRIVER_RUNTIME_DIR/preflight.json"
   export DIENE_PREFLIGHT_EVIDENCE=$preflight
-  "$script_dir/environment-runner-preflight.sh" --output "$preflight"
+  diene_core_driver_preflight --output "$preflight"
   diene_checkpoint_append "$DRIVER_CHECKPOINT" instance-preflight Pass "$(diene_file_digest "$preflight")" false
 
   local manifest=$DIENE_JOURNEY_MANIFEST
-  [[ -f $manifest ]] || diene_die InputContractInvalid 'journey manifest missing'
-  diene_schema_validate diene-journeys-v1.schema.json "$manifest" 'journey manifest'
-  jq -e '[.journeys[].id] | length == (unique | length)' "$manifest" >/dev/null ||
-    diene_die InputContractInvalid 'journey IDs must be globally unique'
 
   local closure_verifier='' pull_proof=''
   if [[ $DIENE_LANE == absol ]]; then
@@ -1179,12 +1232,8 @@ driver_core() {
     done
   fi
 
-  local journeys_started=$SECONDS selection="$DRIVER_RUNTIME_DIR/selection.jsonl" fixture=${DIENE_FIXTURE_ID:-}
-  jq -c --arg lane "$DIENE_LANE" --arg profile "$profile" --arg mode "$build_mode" --arg fixture "$fixture" '
-    .journeys[] | select(any(.appliesTo[];
-      .lane == $lane and .profile == $profile and .buildMode == $mode and
-      ((.fixtureId // "") == $fixture)))
-  ' "$manifest" >"$selection"
+  local journeys_started=$SECONDS selection="$DRIVER_RUNTIME_DIR/selection.jsonl"
+  diene_select_journeys "$manifest" "$selection"
   local required_failure=0 entry_file="$DRIVER_RUNTIME_DIR/journey.json"
   while IFS= read -r entry; do
     printf '%s\n' "$entry" >"$entry_file"
@@ -1225,9 +1274,8 @@ driver_core() {
       '{id:$id,outcome:$outcome,reasonCode:$reason,required:$required,durationSeconds:$duration,
         fixturePackDigest:$digest}' >>"$DRIVER_RESULTS"
   done <"$selection"
-  [[ -s $DRIVER_RESULTS ]] || jq -nc \
-    '{id:"NoDeclaration",outcome:"NotApplicable",reasonCode:"NoDeclaration",required:false,durationSeconds:0}' \
-    >"$DRIVER_RESULTS"
+  [[ -s $DRIVER_RESULTS ]] ||
+    diene_die JourneySelectorUnsatisfied 'selected core journey set produced no executed result'
   DRIVER_JOURNEY_SECONDS=$((SECONDS - journeys_started))
   ((required_failure == 0)) || diene_die JourneyFailed 'a required journey did not pass'
   diene_checkpoint_append "$DRIVER_CHECKPOINT" journeys Pass \
@@ -1236,25 +1284,31 @@ driver_core() {
   diene_verify_endpoint_law "$DRIVER_RUNTIME_DIR/endpoint-law.json"
 }
 
-case ${1:-orchestrate} in
-  --validate-inputs)
-    diene_validate_inputs
-    ;;
-  orchestrate)
-    shift || true
-    orchestrate "$@"
-    ;;
-  cleanup)
-    shift
-    orchestrator_cleanup_command "$@"
-    ;;
-  lifecycle)
-    shift
-    orchestrator_verify_lifecycle "$@"
-    ;;
-  driver)
-    shift
-    driver_core "$@"
-    ;;
-  *) diene_die InputContractInvalid "unknown environment-k3d mode ${1:-}" ;;
-esac
+environment_k3d_main() {
+  case ${1:-orchestrate} in
+    --validate-inputs)
+      diene_validate_inputs
+      ;;
+    orchestrate)
+      shift || true
+      orchestrate "$@"
+      ;;
+    cleanup)
+      shift
+      orchestrator_cleanup_command "$@"
+      ;;
+    lifecycle)
+      shift
+      orchestrator_verify_lifecycle "$@"
+      ;;
+    driver)
+      shift
+      driver_core "$@"
+      ;;
+    *) diene_die InputContractInvalid "unknown environment-k3d mode ${1:-}" ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  environment_k3d_main "$@"
+fi

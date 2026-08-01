@@ -274,6 +274,38 @@ diene_refuse_forbidden_runtime_inputs() {
   esac
 }
 
+# Validate and select the exact core journey tuple once for both the pre-create
+# contract gate and the credential-free driver. When an output path is supplied
+# the selected entries are written as JSONL; validation-only callers stay silent.
+diene_select_journeys() {
+  local manifest=${1:?journey manifest required}
+  local output=${2:-}
+  [[ -f $manifest && ! -L $manifest ]] ||
+    diene_die InputContractInvalid 'journey manifest is absent or not a regular file'
+  diene_schema_validate diene-journeys-v1.schema.json "$manifest" 'journey manifest'
+  jq -e '[.journeys[].id] | length == (unique | length)' "$manifest" >/dev/null ||
+    diene_die InputContractInvalid 'journey IDs must be globally unique'
+
+  local lane=${DIENE_LANE:?lane required} profile build_mode fixture selection
+  [[ $lane != ditto-vendor ]] ||
+    diene_die InputContractInvalid 'vendor lane has no core journey selector'
+  profile=$(diene_runtime_profile "$lane")
+  build_mode=$(diene_build_mode "$lane")
+  fixture=${DIENE_FIXTURE_ID:-}
+  selection=$(jq -c --arg lane "$lane" --arg profile "$profile" \
+    --arg mode "$build_mode" --arg fixture "$fixture" '
+      .journeys[] | select(any(.appliesTo[];
+        .lane == $lane and .profile == $profile and .buildMode == $mode and
+        ((.fixtureId // "") == $fixture)))
+    ' "$manifest") || diene_die InputContractInvalid 'journey selection could not be evaluated'
+  [[ -n $selection ]] ||
+    diene_die JourneySelectorUnsatisfied \
+      "journey manifest has no declaration for $lane/$profile/$build_mode/${fixture:-<none>}"
+  if [[ -n $output ]]; then
+    printf '%s\n' "$selection" | diene_write_json "$output"
+  fi
+}
+
 diene_validate_inputs() {
   local lane=${DIENE_LANE:-}
   local repository_id=${GITHUB_REPOSITORY_ID:-}
@@ -416,8 +448,8 @@ diene_nsc_bin() {
   printf '%s\n' "$bin"
 }
 
-diene_nsc_identity() {
-  local bin identity_file identity output version version_count binary_digest
+diene_nsc_identity_record() {
+  local bin identity_file identity binary_digest
   bin=$(diene_nsc_bin)
   identity_file=${DIENE_NSC_IDENTITY_FILE:-}
   [[ $identity_file == /* && -f $identity_file && ! -L $identity_file ]] ||
@@ -433,6 +465,16 @@ diene_nsc_identity() {
       )
     ' "$identity_file") ||
     diene_die NamespaceLifecycleUnavailable 'pinned nsc identity record is malformed or has the wrong release'
+  binary_digest=$(diene_file_digest "$bin")
+  jq -e --arg digest "$binary_digest" '.binaryDigest == $digest' <<<"$identity" >/dev/null ||
+    diene_die NamespaceLifecycleUnavailable 'nsc executable digest disagrees with its immutable identity record'
+  printf '%s\n' "$identity"
+}
+
+diene_nsc_identity() {
+  local bin identity output version version_count
+  bin=$(diene_nsc_bin)
+  identity=$(diene_nsc_identity_record)
   if ! output=$("$bin" version 2>&1); then
     diene_die NamespaceLifecycleUnavailable 'pinned nsc version probe failed'
   fi
@@ -441,11 +483,8 @@ diene_nsc_identity() {
   [[ $version_count == 1 && $version == "$DIENE_NSC_EXPECTED_VERSION" ]] ||
     diene_die NamespaceLifecycleUnavailable \
       "nsc must be exactly $DIENE_NSC_EXPECTED_VERSION; refusing an unmeasured client"
-  binary_digest=$(diene_file_digest "$bin")
-  jq -e --arg version "$version" --arg digest "$binary_digest" '
-    .version == $version and .binaryDigest == $digest
-  ' <<<"$identity" >/dev/null ||
-    diene_die NamespaceLifecycleUnavailable 'nsc executable digest disagrees with its immutable identity record'
+  jq -e --arg version "$version" '.version == $version' <<<"$identity" >/dev/null ||
+    diene_die NamespaceLifecycleUnavailable 'nsc version disagrees with its immutable identity record'
   printf '%s\n' "$identity"
 }
 
@@ -584,23 +623,92 @@ diene_receipt_patch() {
 diene_validate_receipt_owner() {
   local receipt=${1:?receipt required}
   local cluster_id=${2:-}
+  local lane=${DIENE_LANE:?lane required} profile build_mode egress_profile
+  profile=$(diene_runtime_profile "$lane")
+  build_mode=$(diene_build_mode "$lane")
+  egress_profile=$(diene_egress_profile "$lane")
   diene_schema_validate diene-ci-receipt-v1.schema.json "$receipt" 'exact receipt'
   jq -e \
     --arg repositoryId "$GITHUB_REPOSITORY_ID" --arg repositoryKey "$GITHUB_REPOSITORY" \
     --arg sourceSha "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
     --arg receiptId "$(diene_receipt_id)" --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" \
+    --arg allocationKey "$(diene_allocation_key)" --arg generationKey "$(diene_generation_key)" \
     --arg clusterId "$cluster_id" --arg nscVersion "${DIENE_NSC_VERSION:-}" \
     --arg nscArtifactDigest "${DIENE_NSC_ARTIFACT_DIGEST:-}" \
-    --arg nscBinaryDigest "${DIENE_NSC_BINARY_DIGEST:-}" '
+    --arg nscBinaryDigest "${DIENE_NSC_BINARY_DIGEST:-}" --arg lane "$lane" \
+    --arg profile "$profile" --arg buildMode "$build_mode" --arg egressProfile "$egress_profile" \
+    --arg actionId "${DIENE_ACTION_ID:-}" '
       .owner.repositoryId == $repositoryId and .owner.repositoryKey == $repositoryKey and
       .owner.sourceSha == $sourceSha and .owner.runId == $runId and
       .owner.runAttempt == $runAttempt and .owner.receiptId == $receiptId and
+      .owner.allocationKey == $allocationKey and .owner.generationKey == $generationKey and
       .owner.workflowRef == $workflowRef and
+      .lane == $lane and .profile == $profile and .buildMode == $buildMode and
+      .namespace.egressProfile == $egressProfile and
+      (if $lane == "ditto-vendor" then .actionId == $actionId else has("actionId") | not end) and
       ($clusterId == "" or .namespace.clusterId == $clusterId) and
       ($nscVersion == "" or (.tooling.nscVersion == $nscVersion and
         .tooling.nscArtifactDigest == $nscArtifactDigest and
         .tooling.nscBinaryDigest == $nscBinaryDigest))
     ' "$receipt" >/dev/null || diene_die ReceiptOwnershipMismatch 'receipt owner tuple or exact cluster_id mismatch'
+}
+
+diene_validate_terminal_receipt() {
+  local receipt=${1:?receipt required}
+  local lifecycle=${2:?lifecycle required}
+  local checkpoint=${3:?checkpoint required}
+  local report=${4:?terminal report required}
+  [[ -f $receipt && ! -L $receipt && -f $lifecycle && ! -L $lifecycle &&
+    -f $checkpoint && ! -L $checkpoint &&
+    -f $report && ! -L $report ]] ||
+    diene_die ReceiptLifecycleIncomplete \
+      'terminal receipt bindings require regular receipt, lifecycle, checkpoint, and report files'
+
+  local cluster_id lifecycle_digest checkpoint_digest report_digest
+  cluster_id=$(jq -er '.clusterId | select(type == "string" and length > 0)' "$lifecycle") ||
+    diene_die ReceiptLifecycleIncomplete 'terminal lifecycle carries no exact cluster_id'
+  if ! (DIENE_REASON_FILE='' diene_validate_receipt_owner "$receipt" "$cluster_id" >/dev/null 2>&1); then
+    diene_die ReceiptLifecycleIncomplete \
+      'terminal receipt owner, lane, tool identity, or exact cluster binding is invalid'
+  fi
+  lifecycle_digest=$(diene_file_digest "$lifecycle")
+  checkpoint_digest=$(diene_file_digest "$checkpoint")
+  report_digest=$(diene_file_digest "$report")
+
+  jq -e --slurpfile lifecycle "$lifecycle" --slurpfile checkpoint "$checkpoint" '
+    .namespaceLifecycle == $lifecycle[0] and .checkpointChain == $checkpoint[0]
+  ' "$report" >/dev/null ||
+    diene_die ReceiptLifecycleIncomplete \
+      'terminal report does not embed the exact standalone lifecycle and checkpoint objects'
+
+  jq -e --slurpfile lifecycle "$lifecycle" --slurpfile report "$report" \
+    --arg lane "$DIENE_LANE" --arg profile "$(diene_runtime_profile "$DIENE_LANE")" \
+    --arg buildMode "$(diene_build_mode "$DIENE_LANE")" \
+    --arg lifecycleDigest "$lifecycle_digest" --arg checkpointDigest "$checkpoint_digest" \
+    --arg reportDigest "$report_digest" '
+      .lane == $lane and .profile == $profile and .buildMode == $buildMode and
+      .namespace.clusterId == $lifecycle[0].clusterId and
+      .namespace.duration == $lifecycle[0].duration and
+      .namespace.ephemeral == $lifecycle[0].ephemeral and
+      .namespace.cacheAttached == $lifecycle[0].cacheAttached and
+      .namespace.policy.applied == true and .namespace.policy.hostileProbes == "Pass" and
+      .namespace.policy.platformPerInstancePolicy == "pending-support-ask-4" and
+      .namespace.create.outcome == "Pass" and .namespace.destroy.outcome == "Pass" and
+      .namespace.absence.outcome == "Pass" and
+      ((.namespace.create | del(.observedAt)) == $lifecycle[0].create) and
+      .namespace.destroy == $lifecycle[0].destroy and
+      .namespace.absence == $lifecycle[0].absence and
+      .cleanup.outcome == "Pass" and
+      (.cleanup.debt | type == "array" and length == 0) and
+      .checkpointChainDigest == $checkpointDigest and
+      .lifecycleDigest == $lifecycleDigest and
+      .terminalReportDigest == $reportDigest and
+      .tooling.nscVersion == $report[0].tooling.nscVersion and
+      .tooling.nscArtifactDigest == $report[0].tooling.nscArtifactDigest and
+      .tooling.nscBinaryDigest == $report[0].tooling.nscBinaryDigest
+    ' "$receipt" >/dev/null ||
+    diene_die ReceiptLifecycleIncomplete \
+      'terminal receipt phases, cleanup, policy, identity, or digests are incomplete or unbound'
 }
 
 diene_discover_runtime() {
@@ -977,13 +1085,94 @@ diene_l7_enforcer_apply() {
   export DIENE_L7_EGRESS_ARMED DIENE_L7_EGRESS_EVIDENCE
 }
 
+diene_egress_probe_required_ids() {
+  case ${1:?probe scope required} in
+    preexisting-open) jq -cn '["preexisting-flow-established"]' ;;
+    preexisting-transition) jq -cn '["preexisting-flow-transition-denial"]' ;;
+    host) jq -cn '["host-metadata-denial","host-arbitrary-https-denial"]' ;;
+    pod) jq -cn '["pod-metadata-denial","pod-arbitrary-https-denial","pod-dns-denial"]' ;;
+    *) diene_die InterimPolicyUnavailable "unknown hostile probe scope $1" ;;
+  esac
+}
+
+diene_egress_probe_transcript_path() {
+  local scope=${1:?probe scope required}
+  diene_egress_probe_required_ids "$scope" >/dev/null
+  local staging=${DIENE_EVIDENCE_STAGING:-}
+  [[ $staging == /* && -d $staging && ! -L $staging ]] ||
+    diene_die InterimPolicyUnavailable \
+      'configured hostile probes require an absolute driver-owned evidence staging directory'
+  local dir="$staging/egress-probe"
+  install -d -m 0700 "$dir"
+  printf '%s/%s.json\n' "$dir" "$scope"
+}
+
+diene_consume_egress_probe_transcript() {
+  local scope=${1:?probe scope required}
+  local transcript=${2:?probe transcript required}
+  [[ -s $transcript && -f $transcript && ! -L $transcript ]] ||
+    diene_die InterimPolicyUnavailable \
+      "configured $scope hostile probe emitted no regular non-empty transcript"
+  local expected profile receipt observations
+  expected=$(diene_egress_probe_required_ids "$scope")
+  profile=$(diene_egress_profile "$DIENE_LANE")
+  receipt=$(diene_receipt_id)
+  observations=$(jq -ce --arg scope "$scope" --arg profile "$profile" \
+    --arg cluster "$DIENE_NSC_CLUSTER_ID" --arg receipt "$receipt" \
+    --argjson expected "$expected" '
+      select(
+        type == "object" and
+        (keys == ["apiVersion","clusterId","observations","profileId","receiptId","scope"]) and
+        .apiVersion == "diene.atomi.cloud/ci-egress-probe/v1" and
+        .scope == $scope and .profileId == $profile and .clusterId == $cluster and
+        .receiptId == $receipt and (.observations | type == "array") and
+        ([.observations[].id] | sort) == ($expected | sort) and
+        all(.observations[];
+          type == "object" and (keys == ["id","outcome","reasonCode","required"]) and
+          .outcome == "Pass" and .required == true and
+          (($scope == "preexisting-open" and
+              .reasonCode == "AdapterObservedFlowEstablished") or
+            ($scope != "preexisting-open" and
+              .reasonCode == "AdapterObservedDenial")))
+      ) | .observations
+    ' "$transcript") ||
+    diene_die InterimPolicyUnavailable \
+      "configured $scope hostile probe transcript has the wrong shape, binding, IDs, or verdict"
+  printf '%s\n' "$observations"
+}
+
+diene_run_egress_probe_adapter() {
+  local scope=${1:?probe scope required}
+  local image=${2:-}
+  local probe_bin=${DIENE_EGRESS_PROBE_BIN:-}
+  [[ -n $probe_bin ]] || diene_die InterimPolicyUnavailable 'hostile probe adapter is absent'
+  diene_require_command "$probe_bin"
+  local transcript staging profile receipt
+  transcript=$(diene_egress_probe_transcript_path "$scope")
+  staging=${DIENE_EVIDENCE_STAGING:?evidence staging required}
+  profile=$(diene_egress_profile "$DIENE_LANE")
+  receipt=$(diene_receipt_id)
+  rm -f -- "$transcript"
+  : >>"$staging/stdout"
+  : >>"$staging/stderr"
+  chmod 0600 "$staging/stdout" "$staging/stderr"
+  local -a argv=("$probe_bin" --scope "$scope" --profile "$profile" \
+    --cluster-id "$DIENE_NSC_CLUSTER_ID" --receipt "$receipt" --transcript "$transcript")
+  if [[ $scope == pod ]]; then
+    [[ -n $image ]] || diene_die InterimPolicyUnavailable 'pod hostile probe image is absent'
+    argv+=(--image "$image")
+  fi
+  "${argv[@]}" >>"$staging/stdout" 2>>"$staging/stderr" ||
+    diene_die InterimPolicyUnavailable "configured $scope hostile probe failed"
+  diene_consume_egress_probe_transcript "$scope" "$transcript"
+}
+
 diene_preflow_start() {
   local probe_bin=${DIENE_EGRESS_PROBE_BIN:-}
   if [[ -n $probe_bin ]]; then
-    diene_require_command "$probe_bin"
-    "$probe_bin" --scope preexisting-open --profile "$(diene_egress_profile "$DIENE_LANE")" \
-      --cluster-id "$DIENE_NSC_CLUSTER_ID" ||
-      diene_die InterimPolicyUnavailable 'could not establish the hostile pre-policy transition probe'
+    diene_run_egress_probe_adapter preexisting-open >/dev/null ||
+      diene_die InterimPolicyUnavailable \
+        'configured pre-existing-flow open probe did not produce valid evidence'
     DIENE_PREFLOW_ADAPTER=true
     export DIENE_PREFLOW_ADAPTER
     return 0
@@ -1014,11 +1203,10 @@ diene_preflow_start() {
 }
 
 diene_preflow_finish() {
-  local probe_bin=${DIENE_EGRESS_PROBE_BIN:-}
   if [[ ${DIENE_PREFLOW_ADAPTER:-false} == true ]]; then
-    "$probe_bin" --scope preexisting-transition --profile "$(diene_egress_profile "$DIENE_LANE")" \
-      --cluster-id "$DIENE_NSC_CLUSTER_ID" ||
-      diene_die InterimPolicyUnavailable 'a pre-existing hostile flow was grandfathered by the policy transition'
+    DIENE_PREFLOW_TRANSITION_RESULTS=$(diene_run_egress_probe_adapter preexisting-transition) ||
+      diene_die InterimPolicyUnavailable \
+        'configured pre-existing-flow transition probe did not produce valid denial evidence'
     return 0
   fi
   if printf 'GET / HTTP/1.0\r\nHost: forbidden.invalid\r\n\r\n' 1>&"$DIENE_PREFLOW_WRITE_FD" 2>/dev/null &&
@@ -1029,6 +1217,10 @@ diene_preflow_finish() {
   fi
   kill "$DIENE_PREFLOW_PID" 2>/dev/null || true
   wait "$DIENE_PREFLOW_PID" 2>/dev/null || true
+  DIENE_PREFLOW_TRANSITION_RESULTS=$(jq -cn '[
+    {id:"preexisting-flow-transition-denial",outcome:"Pass",
+     reasonCode:"NoGrandfatheredExternalFlow",required:true}
+  ]')
 }
 
 diene_policy_exec() {
@@ -1135,10 +1327,21 @@ diene_apply_interim_policy() {
     $ssh_client_port =~ ^[1-9][0-9]{0,4}$ && $ssh_server_port =~ ^[1-9][0-9]{0,4}$ ]] ||
     diene_die InterimPolicyUnavailable 'the active orchestration SSH 4-tuple is unavailable or non-IPv4'
 
-  local ipv6_disabled=0 policy_mode l7_attempted=$l7_evidence.attempted transaction_rc=0
-  [[ ! -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] || read -r ipv6_disabled </proc/sys/net/ipv6/conf/all/disable_ipv6
+  local ipv6_disabled=0 ipv6_armed=false policy_mode
+  local ipv6_disable_path=${DIENE_IPV6_DISABLE_PATH:-/proc/sys/net/ipv6/conf/all/disable_ipv6}
+  local l7_attempted=$l7_evidence.attempted transaction_rc=0
+  [[ ! -r $ipv6_disable_path ]] || read -r ipv6_disabled <"$ipv6_disable_path"
   policy_mode=$(diene_policy_mode "$DIENE_LANE")
-  rm -f -- "$l7_attempted"
+  rm -f -- "$transcript" "$l7_attempted"
+  if [[ $ipv6_disabled != 1 ]]; then
+    diene_require_command "$ip6tables_bin"
+    "$ip6tables_bin" --version | grep -F nf_tables >/dev/null ||
+      diene_die InterimPolicyUnavailable 'ip6tables is not using the measured nf_tables backend'
+    jq -e 'type == "array" and length >= 1' <<<"$pod6_cidrs" >/dev/null ||
+      diene_die InterimPolicyUnavailable \
+        'host IPv6 is enabled but no IPv6 pod CIDR was observed; refusing an unenforced IPv6 forwarding path'
+    ipv6_armed=true
+  fi
   (
     diene_policy_exec "$iptables_bin" -w 5 -N "$out_chain"
     diene_policy_exec "$iptables_bin" -w 5 -N "$forward_chain"
@@ -1169,11 +1372,7 @@ diene_apply_interim_policy() {
     diene_policy_exec "$iptables_bin" -w 5 -I OUTPUT 1 -j "$out_chain"
     diene_policy_exec "$iptables_bin" -w 5 -I FORWARD 1 -j "$forward_chain"
 
-    local ipv6_armed=false
-    if [[ $ipv6_disabled != 1 ]]; then
-      diene_require_command "$ip6tables_bin"
-      "$ip6tables_bin" --version | grep -F nf_tables >/dev/null ||
-        diene_die InterimPolicyUnavailable 'ip6tables is not using the measured nf_tables backend'
+    if [[ $ipv6_armed == true ]]; then
       diene_policy_exec "$ip6tables_bin" -w 5 -N "$out6_chain"
       diene_policy_exec "$ip6tables_bin" -w 5 -N "$forward6_chain"
       diene_policy_exec "$ip6tables_bin" -w 5 -A "$out6_chain" -o lo -j ACCEPT
@@ -1202,7 +1401,6 @@ diene_apply_interim_policy() {
       diene_policy_exec "$ip6tables_bin" -w 5 -A "$forward6_chain" -j RETURN
       diene_policy_exec "$ip6tables_bin" -w 5 -I OUTPUT 1 -j "$out6_chain"
       diene_policy_exec "$ip6tables_bin" -w 5 -I FORWARD 1 -j "$forward6_chain"
-      ipv6_armed=true
     fi
 
     [[ $policy_mode != allowlist ]] || : >"$l7_attempted"
@@ -1248,8 +1446,6 @@ diene_apply_interim_policy() {
     diene_die InterimPolicyUnavailable 'partial policy installation was completely rolled back'
   fi
 
-  local ipv6_armed=false
-  [[ $ipv6_disabled == 1 ]] || ipv6_armed=true
   DIENE_INTERIM_POLICY_OUTPUT_CHAIN=$out_chain
   DIENE_INTERIM_POLICY_FORWARD_CHAIN=$forward_chain
   DIENE_INTERIM_POLICY_OUTPUT6_CHAIN=$out6_chain
@@ -1283,22 +1479,21 @@ diene_remove_interim_policy() {
 
 diene_verify_hostile_egress() {
   local output=${1:?probe output required}
-  local profile probe_bin results
-  profile=$(diene_egress_profile "$DIENE_LANE")
+  local probe_bin results
   probe_bin=${DIENE_EGRESS_PROBE_BIN:-}
-  results='[]'
   diene_preflow_finish
-  results=$(jq -c '. + [{id:"preexisting-flow-transition-denial",outcome:"Pass",
-    reasonCode:"NoGrandfatheredExternalFlow",required:true}]' <<<"$results")
+  results=${DIENE_PREFLOW_TRANSITION_RESULTS:?pre-existing flow transition result required}
   if [[ -n $probe_bin ]]; then
-    "$probe_bin" --scope host --profile "$profile" --cluster-id "$DIENE_NSC_CLUSTER_ID" ||
-      diene_die InterimPolicyUnavailable 'host hostile negative probes did not all refuse'
-    results=$(jq -c '. + [
-      {id:"host-metadata-denial",outcome:"Pass",reasonCode:"ConnectionRefused",required:true},
-      {id:"host-arbitrary-https-denial",outcome:"Pass",reasonCode:"ConnectionRefused",required:true}]' <<<"$results")
-    "$probe_bin" --scope pod --profile "$profile" --cluster-id "$DIENE_NSC_CLUSTER_ID" \
-      --image "$DIENE_EGRESS_CANARY_IMAGE" ||
-      diene_die InterimPolicyUnavailable 'actual-pod hostile negative probes did not all refuse'
+    local host_results pod_results
+    host_results=$(diene_run_egress_probe_adapter host) ||
+      diene_die InterimPolicyUnavailable \
+        'configured host hostile probe did not produce valid denial evidence'
+    pod_results=$(diene_run_egress_probe_adapter pod "$DIENE_EGRESS_CANARY_IMAGE") ||
+      diene_die InterimPolicyUnavailable \
+        'configured pod hostile probe did not produce valid denial evidence'
+    results=$(jq -cn --argjson transition "$results" --argjson host "$host_results" \
+      --argjson pod "$pod_results" '$transition + $host + $pod') ||
+      diene_die InterimPolicyUnavailable 'hostile probe observations could not be combined'
   else
     diene_require_command curl
     if curl -fsS --connect-timeout 1 --max-time 2 http://169.254.169.254/ >/dev/null 2>&1; then
@@ -1326,13 +1521,19 @@ diene_verify_hostile_egress() {
     }
     "$kubectl_bin" delete pod "$pod" --wait=true --timeout=30s >/dev/null ||
       diene_die InterimPolicyUnavailable 'actual-pod egress canary cleanup failed'
+    results=$(jq -c '. + [
+      {id:"pod-metadata-denial",outcome:"Pass",reasonCode:"ForwardRefused",required:true},
+      {id:"pod-arbitrary-https-denial",outcome:"Pass",reasonCode:"ForwardRefused",required:true},
+      {id:"pod-dns-denial",outcome:"Pass",reasonCode:"ForwardRefused",required:true}]' <<<"$results")
   fi
-  results=$(jq -c '. + [
-    {id:"pod-metadata-denial",outcome:"Pass",reasonCode:"ForwardRefused",required:true},
-    {id:"pod-arbitrary-https-denial",outcome:"Pass",reasonCode:"ForwardRefused",required:true},
-    {id:"pod-dns-denial",outcome:"Pass",reasonCode:"ForwardRefused",required:true}]' <<<"$results")
   printf '%s\n' "$results" | diene_write_json "$output"
-  jq -e 'type == "array" and length >= 6 and all(.outcome == "Pass" and .required == true)' "$output" >/dev/null ||
+  jq -e '
+    type == "array" and
+    ([.[].id] | sort) == ["host-arbitrary-https-denial","host-metadata-denial",
+      "pod-arbitrary-https-denial","pod-dns-denial","pod-metadata-denial",
+      "preexisting-flow-transition-denial"] and
+    all(.[]; .outcome == "Pass" and .required == true)
+  ' "$output" >/dev/null ||
     diene_die InterimPolicyUnavailable 'hostile host/pod probe transcript is incomplete'
 }
 

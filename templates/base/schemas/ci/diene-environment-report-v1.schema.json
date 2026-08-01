@@ -390,7 +390,8 @@
         "orchestratorLabel": {
           "enum": [
             "ubuntu-26.04", "ubuntu-24.04",
-            "nscloud-ubuntu-26.04-amd64-16x32", "nscloud-ubuntu-24.04-amd64-16x32",
+            "nscloud-ubuntu-26.04-amd64-16x32", "nscloud-ubuntu-26.04-amd64-16x32-with-cache",
+            "nscloud-ubuntu-24.04-amd64-16x32",
             "local-contract-test"
           ]
         },

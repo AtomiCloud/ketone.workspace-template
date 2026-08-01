@@ -33,6 +33,8 @@
       "pattern": "^/"
     },
     "checkpointChainDigest": { "$ref": "#/$defs/digest" },
+    "lifecycleDigest": { "$ref": "#/$defs/digest" },
+    "terminalReportDigest": { "$ref": "#/$defs/digest" },
     "cleanup": { "$ref": "#/$defs/cleanup" }
   },
   "allOf": [
