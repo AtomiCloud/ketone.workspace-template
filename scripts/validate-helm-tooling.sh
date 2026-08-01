@@ -183,6 +183,12 @@ require_in_list() {
 # The tool must be inherited from the pinned channel: the named block has to bind
 # `with <source>;`, and the tool has to sit inside that block's `inherit ... ;`
 # declaration. An alias such as `kyverno = pkgs.hello;` is rejected.
+#
+# Both structural edges are anchored to the block's own indentation rather than to the
+# first token that merely looks like one, because the block may contain an inlined
+# derivation. Its closing `);` is deeper than the block's, and any `inherit` it declares
+# is deeper than the block's -- so a bare token scan would stop early (or accept a nested
+# declaration) instead of reading the block's real inherit list.
 require_inherited_from_channel() {
   local file="$1"
   local block="$2"
@@ -192,19 +198,32 @@ require_inherited_from_channel() {
 
   [[ -f "${file}" ]] || fail "missing ${file}"
   awk -v block="${block}" -v source="${source}" -v tool="${tool}" '
+    function indent_of(line) {
+      sub(/[^[:space:]].*$/, "", line)
+      return line
+    }
     BEGIN { code = 2 }
-    !inside && $0 ~ "^[[:space:]]*" block "[[:space:]]*=" { inside = 1; code = 3; next }
+    !inside && $0 ~ "^[[:space:]]*" block "[[:space:]]*=" {
+      inside = 1
+      code = 3
+      # The block ends at the first `);` sitting at exactly the opening indentation.
+      closer = "^" indent_of($0) "\\);[[:space:]]*$"
+      next
+    }
     !inside { next }
     !bound && $1 == "with" {
       if ($2 != source ";") exit
       bound = 1
       code = 4
+      # The attrset body sits one level in from the `with` binding, so only an `inherit`
+      # at that exact depth belongs to this block.
+      inherit_re = "^" indent_of($0) "  inherit[[:space:]]*$"
       next
     }
-    bound && $0 ~ /^[[:space:]]*inherit[[:space:]]*$/ { in_inherit = 1; next }
+    bound && $0 ~ inherit_re { in_inherit = 1; next }
     in_inherit && $1 == ";" { in_inherit = 0; next }
     in_inherit && $1 == tool { code = 0; exit }
-    $1 == ");" { exit }
+    $0 ~ closer { exit }
     END { exit code }
   ' "${file}" || status=$?
 
