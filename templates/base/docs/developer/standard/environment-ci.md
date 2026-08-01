@@ -182,7 +182,10 @@ linked publication targets or parents refuse before fetch. Acquisition failure
 therefore has no Namespace create side effect. The immutable URLs, byte counts,
 and digests have one source of truth in `environment-lib.sh`; the rolling
 endpoint, pipe-to-shell forms, alternate package URLs, upstream preference,
-force/plan overrides, and unpinned installer paths remain forbidden.
+force/plan overrides, and unpinned installer paths remain forbidden. Host
+acquisition refuses the retired `DIENE_CURL_BIN` channel and invokes `curl`
+only after resolving it to a regular executable `/nix/store/*/bin/curl`; fake
+downloaders exist only behind an explicit scratch-copy harness seam.
 
 Both assets and their checksum sidecars cross the existing ordered transfer
 chain. The fixed POSIX guest template materializes its expected digest and byte
@@ -190,17 +193,36 @@ pins only from the centrally validated contract, then requires each asset and
 its exact one-line sidecar to match those independent expected values before
 either can gain execute permission. An asset and sidecar altered together
 cannot self-authorize. The shell witness stays mode `0600` and is never run.
-The guest must be exactly `x86_64`, contain neither an ambient `nix` command nor
-pre-existing `/nix` state, and report `nix-installer 3.21.9` from the verified
-payload before installation. The installer proof retains raw stdout and stderr
-in separate private files and accepts only empty stderr plus the exact 21-byte,
-one-line stdout `nix-installer 3.21.9` followed by one newline. It executes only
-`install linux --no-confirm --init none`; the diagnostic endpoint is disabled
-through the environment without changing that argv. The exact default profile
-is sourced with shell error and unset-variable handling temporarily relaxed,
-then strict handling is restored before the retained toolchain guard. The
-identity field `profileSourced:true` means that exact profile returned success;
-an attempted source that returns nonzero is refused before identity acceptance.
+The guest must be exactly `x86_64` and begin with no ambient `nix`, `/nix`, or
+`/etc/nix` state. Before the first installer probe, the remote rail fixes its
+command `PATH`, captures the actual inherited environment, and refuses every
+exported name beginning `NIX`, including all current or future
+`NIX_INSTALLER_*`, `NIX_*`, and `NIXPKGS_*` controls. Diagnostics contain names
+only. An environment value with an embedded newline followed by a `NIX...=`
+shape can cause only a fail-closed over-refusal; it cannot hide a real matching
+name. Capture or parse failure is also red.
+
+Both installer invocations run under `env -i` with only fixed `PATH`, private
+`HOME`, `TMPDIR`, and `LC_ALL`; only the install invocation adds an empty
+`NIX_INSTALLER_DIAGNOSTIC_ENDPOINT`. Raw stdout and stderr remain separate, and
+acceptance still requires empty stderr plus the exact 21-byte, one-line stdout
+`nix-installer 3.21.9` followed by one newline. The measured argv remains
+exactly `install linux --no-confirm --init none`. After installation,
+`/etc/nix/nix.conf` must be a readable regular non-link file below a real
+`/etc/nix` directory, and its digest must remain unchanged through profile
+sourcing. The mandatory profile must be readable and regular and resolve to
+`/nix/store/*/etc/profile.d/nix-daemon.sh`. It is sourced unconditionally with
+error and unset-variable handling temporarily relaxed; its exact status is
+retained and strict handling restored. Missing, dangling, directory,
+out-of-store, and nonzero profile states refuse before `nix develop`.
+
+The develop exec deliberately does not use `env -i`, because it must hand the
+driver its admitted runtime inputs. Its Nix-family values can only have been
+created by the pinned profile after the inherited prefix-wide refusal. Those
+profile-created values and PATH are preserved, while `HOME` and
+`XDG_CONFIG_HOME` are reset to a private empty tree and `NIX_USER_CONF_FILES`
+points to a reviewed empty mode-0600 file. The identity field
+`profileSourced:true` means that exact profile returned success.
 
 Preflight independently verifies the fixed
 `/nix/var/nix/profiles/default/bin/nix` path before policy or application
@@ -210,16 +232,25 @@ resolved target must be a regular executable `/nix/store/*/bin/nix`; its digest,
 the installed `/nix/nix-installer` digest, and both still-uploaded artifact
 digests must agree with the admitted contract.
 
+The private mode-0600 `evidence/guest-nix/environment.txt` records the inherited
+boundary result, sorted names (never values) of profile-created `NIX*`
+variables, reviewed home/XDG/user-config paths, and the installed `nix.conf`
+digest. Capture, parsing, sorting, or publication failure is red. Preflight
+validates those fixed fields against the live config and binds the file's
+SHA-256 as `environmentDigest`.
+
 One canonical JSON object supplies the schema-free identity proof. The private
 `evidence/guest-nix/identity.json` receipt records both artifact identities and
 lengths, architecture, direct-binary execution mode, exact argv, installer and
 Nix versions, initialization and profile facts, resolved store path and digest,
-and installed-copy digest. Preflight embeds that same object plus the receipt's
-SHA-256 as `guestNix.identityReceiptDigest`; removing only that digest must make
-the two objects equal exactly. The existing `instance-preflight` checkpoint
-binds the complete preflight bytes, so the terminal proof carries both the
-mode-0600 receipt and its checkpoint-bound digest without expanding the
-schema-validated CI receipt or report.
+installed-copy digest, and environment-evidence digest. Preflight embeds that
+same object plus the receipt's SHA-256 as
+`guestNix.identityReceiptDigest`; removing only that digest must make the two
+objects equal exactly, and changing the environment evidence breaks agreement.
+The existing `instance-preflight` checkpoint binds the complete preflight
+bytes, so the terminal proof carries both private receipts and their
+checkpoint-bound digests without expanding the schema-validated CI receipt or
+report.
 
 The installer payload remains inside the mandatory outer leakage-scan surfaces;
 it has no scan exclusion. Transfer, shell entry, and scan wall-clock remain

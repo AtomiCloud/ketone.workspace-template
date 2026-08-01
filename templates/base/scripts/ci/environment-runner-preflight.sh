@@ -80,6 +80,10 @@ guest_nix_evidence=$(diene_guest_nix_evidence_dir) || exit $?
 guest_nix=$(diene_guest_nix_identity "${DIENE_GUEST_NIX_INPUT:?}" "$guest_nix_evidence" \
   "$DIENE_GUEST_NIX_BIN" "$DIENE_GUEST_NIX_STORE_ROOT" "$DIENE_GUEST_NIX_INSTALLED_COPY" \
   "${DIENE_GUEST_NIX_INSTALLER_PATH:?}" "${DIENE_GUEST_NIX_PAYLOAD_PATH:?}" "$(uname -m)") || exit $?
+guest_nix_environment_digest=$(jq -er '.environmentDigest' <<<"$guest_nix") ||
+  diene_die GuestNixIdentityUnexpected \
+    'guest Nix identity omitted the sanitized environment evidence digest'
+diene_require_digest guest-nix-environment-digest "$guest_nix_environment_digest"
 
 nodes=$($kubectl_bin get nodes -o json)
 jq -e '

@@ -246,15 +246,60 @@ orchestrator_fixed_remote_command() {
   remote_command=$(cat <<'REMOTE'
 set -eu
 umask 077
+guest_nix_inherited_nix_command=absent
+if command -v nix >/dev/null 2>&1; then
+  guest_nix_inherited_nix_command=present
+fi
+GUEST_NIX_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$GUEST_NIX_PATH
+export PATH
+LC_ALL=C
+export LC_ALL
+guest_nix_fail() { printf '%s: %s\n' "$1" "$2" >&2; exit 64; }
+
+# --- BEGIN guest nix environment contract ---
+# POSIX env prints NAME=VALUE per line, so an inherited name always begins a
+# line. An embedded NIX-shaped line in a value can only over-refuse, which is
+# the fail-closed direction; diagnostics intentionally print names, not values.
+guest_nix_inherited_nix_names() {
+  guest_nix_environment=$(env) || return 1
+  printf '%s\n' "$guest_nix_environment" |
+    sed -n 's/^\(NIX[A-Za-z0-9_]*\)=.*$/\1/p'
+}
+guest_nix_require_clean_nix_env() {
+  inherited=$(guest_nix_inherited_nix_names) ||
+    guest_nix_fail GuestNixInstallerUntrusted \
+      'the fixed-path inherited environment could not be enumerated'
+  [ -z "$inherited" ] ||
+    guest_nix_fail GuestNixInstallerUntrusted \
+      "inherited Nix-family environment variables are prohibited: $(printf '%s' "$inherited" | tr '\n' ' ')"
+}
+guest_nix_require_commands() {
+  for guest_nix_cmd in env sed tr id install cd sha256sum chmod wc cat printf uname \
+    readlink sort cut tar find awk mktemp rm; do
+    command -v "$guest_nix_cmd" >/dev/null 2>&1 ||
+      guest_nix_fail GuestNixInstallerUntrusted \
+        "a required guest command is absent from the fixed PATH: $guest_nix_cmd"
+  done
+}
+# --- END guest nix environment contract ---
+
+guest_nix_require_commands
+guest_nix_require_clean_nix_env
 test "$(id -u)" = 0
 install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out
+GUEST_NIX_HOME=/run/diene-ci/home
+install -d -m 0700 "$GUEST_NIX_HOME" "$GUEST_NIX_HOME/.config"
+HOME=$GUEST_NIX_HOME
+XDG_CONFIG_HOME=$GUEST_NIX_HOME/.config
+TMPDIR=/run/diene-ci/tmp
+export HOME XDG_CONFIG_HOME TMPDIR
 cd /run/diene-ci
 sha256sum -c archive-validator.sha256
 chmod 0500 archive-validator.sh
 ./archive-validator.sh source.tar source
 install -m 0600 receipt.json receipts/exact.json
 install -d -m 0700 evidence/guest-nix
-guest_nix_fail() { printf '%s: %s\n' "$1" "$2" >&2; exit 64; }
 guest_nix_pinned_asset_valid() {
   asset=$1
   sidecar=$2
@@ -289,13 +334,25 @@ guest_nix_source_profile() {
   set -eu
   return "$profile_rc"
 }
+guest_nix_hash_etc_config() {
+  [ -d /etc/nix ] && [ ! -L /etc/nix ] &&
+    [ -f /etc/nix/nix.conf ] && [ ! -L /etc/nix/nix.conf ] &&
+    [ -r /etc/nix/nix.conf ] || return 1
+  sha256sum /etc/nix/nix.conf | cut -d' ' -f1
+}
+guest_nix_plain_sha256_valid() {
+  [ "${#1}" -eq 64 ] || return 1
+  case $1 in *[!0-9a-f]*) return 1 ;; esac
+}
 guest_nix_installer_digest=__DIENE_GUEST_NIX_INSTALLER_DIGEST__
 guest_nix_installer_bytes=__DIENE_GUEST_NIX_INSTALLER_BYTES__
 guest_nix_payload_digest=__DIENE_GUEST_NIX_PAYLOAD_DIGEST__
 guest_nix_payload_bytes=__DIENE_GUEST_NIX_PAYLOAD_BYTES__
 [ "$(uname -m)" = x86_64 ] || guest_nix_fail GuestNixInstallerUnsupportedArch 'the guest architecture is not the pinned x86_64 target'
-if command -v nix >/dev/null 2>&1 || [ -e /nix ] || [ -L /nix ]; then
-  guest_nix_fail GuestNixPreexistingState 'the ephemeral guest already contains Nix or /nix state'
+if [ "$guest_nix_inherited_nix_command" = present ] || [ -e /nix ] || [ -L /nix ] ||
+  [ -e /etc/nix ] || [ -L /etc/nix ]; then
+  guest_nix_fail GuestNixPreexistingState \
+    'the ephemeral guest already contains Nix, /nix state, or /etc/nix state'
 fi
 guest_nix_pinned_asset_valid guest-nix-bootstrap.sh guest-nix-bootstrap.sha256 \
   "$guest_nix_installer_digest" "$guest_nix_installer_bytes" &&
@@ -307,36 +364,86 @@ guest_nix_pinned_asset_valid guest-nix-bootstrap.sh guest-nix-bootstrap.sha256 \
   printf '%s\n' 'executionMode=direct-pinned-binary' 'payloadDigestVerified=true'
 } >evidence/guest-nix/verified.txt
 chmod 0600 evidence/guest-nix/verified.txt guest-nix-bootstrap.sh guest-nix-installer
-if [ "${NIX_INSTALLER_NIX_PACKAGE_URL+x}" = x ] ||
-  [ "${NIX_INSTALLER_PREFER_UPSTREAM_NIX+x}" = x ] ||
-  [ "${NIX_INSTALLER_FORCE+x}" = x ] || [ "${NIX_INSTALLER_PLAN+x}" = x ] ||
-  [ "${NIX_INSTALLER_OVERRIDE_URL+x}" = x ] || [ "${NIX_INSTALLER_BINARY_ROOT+x}" = x ]; then
-  guest_nix_fail GuestNixInstallerUntrusted 'a prohibited installer payload, upstream, force, plan, or URL override is present'
-fi
-unset NIX_INSTALLER_NIX_PACKAGE_URL NIX_INSTALLER_PREFER_UPSTREAM_NIX NIX_INSTALLER_FORCE \
-  NIX_INSTALLER_PLAN NIX_INSTALLER_OVERRIDE_URL NIX_INSTALLER_BINARY_ROOT
 chmod 0500 guest-nix-installer
 installer_version_stdout=evidence/guest-nix/installer-version.txt
 installer_version_stderr=evidence/guest-nix/installer-version.stderr
 : >"$installer_version_stdout"
 : >"$installer_version_stderr"
 chmod 0600 "$installer_version_stdout" "$installer_version_stderr"
-if ! ./guest-nix-installer --version >"$installer_version_stdout" 2>"$installer_version_stderr"; then
+if ! env -i PATH="$GUEST_NIX_PATH" HOME="$GUEST_NIX_HOME" TMPDIR=/run/diene-ci/tmp LC_ALL=C \
+  ./guest-nix-installer --version >"$installer_version_stdout" 2>"$installer_version_stderr"; then
   guest_nix_fail GuestNixInstallerUntrusted 'the pinned installer version probe failed'
 fi
 guest_nix_exact_output_valid "$installer_version_stdout" "$installer_version_stderr" \
   'nix-installer 3.21.9' 21 ||
   guest_nix_fail GuestNixInstallerUntrusted 'the pinned installer version output is not exact'
 install_rc=0
-NIX_INSTALLER_DIAGNOSTIC_ENDPOINT='' ./guest-nix-installer install linux --no-confirm --init none \
+env -i PATH="$GUEST_NIX_PATH" HOME="$GUEST_NIX_HOME" TMPDIR=/run/diene-ci/tmp LC_ALL=C \
+  NIX_INSTALLER_DIAGNOSTIC_ENDPOINT= \
+  ./guest-nix-installer install linux --no-confirm --init none \
   >evidence/guest-nix/install.log 2>&1 || install_rc=$?
 chmod 0600 evidence/guest-nix/install.log
 [ "$install_rc" -eq 0 ] || guest_nix_fail GuestNixInstallFailed 'the pinned guest Nix installer failed'
-if [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
-  guest_nix_source_profile /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ||
-    guest_nix_fail GuestNixProfileSourceFailed 'the exact guest Nix profile returned nonzero while being sourced'
+guest_nix_etc_config_digest=$(guest_nix_hash_etc_config) ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the pinned installer did not create a safe regular /etc/nix/nix.conf'
+guest_nix_plain_sha256_valid "$guest_nix_etc_config_digest" ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the installed /etc/nix/nix.conf digest is malformed'
+guest_nix_profile=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+guest_nix_profile_resolved=$(readlink -f "$guest_nix_profile" 2>/dev/null || printf '')
+case $guest_nix_profile_resolved in
+  /nix/store/*/etc/profile.d/nix-daemon.sh) ;;
+  *) guest_nix_fail GuestNixIdentityUnexpected \
+    'the exact guest Nix profile does not resolve into the pinned Nix store' ;;
+esac
+[ -f "$guest_nix_profile" ] && [ -r "$guest_nix_profile" ] ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the exact guest Nix profile is absent, unreadable, or not a regular file'
+guest_nix_source_profile "$guest_nix_profile" ||
+  guest_nix_fail GuestNixProfileSourceFailed 'the exact guest Nix profile returned nonzero while being sourced'
+guest_nix_profile_environment=$(env) ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the post-profile environment could not be enumerated'
+guest_nix_profile_names_unsorted=$(printf '%s\n' "$guest_nix_profile_environment" |
+  sed -n 's/^\(NIX[A-Za-z0-9_]*\)=.*$/profileNixVar=\1/p') ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the post-profile Nix-family names could not be parsed'
+guest_nix_profile_names=$(printf '%s\n' "$guest_nix_profile_names_unsorted" | LC_ALL=C sort) ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the post-profile Nix-family names could not be sorted'
+if ! {
+  printf '%s\n' 'inheritedNixFamily=none'
+  if [ -n "$guest_nix_profile_names" ]; then
+    printf '%s\n' "$guest_nix_profile_names"
+  fi
+} >evidence/guest-nix/environment.txt; then
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the post-profile environment evidence could not be written'
 fi
-command -v nix >/dev/null 2>&1 || { printf "GuestNixToolchainAbsent: %s\n" "the instance provides no nix command for the driver entry" >&2; exit 64; }
+HOME=/run/diene-ci/home
+XDG_CONFIG_HOME=/run/diene-ci/home/.config
+NIX_USER_CONF_FILES=/run/diene-ci/nix-user.conf
+export HOME XDG_CONFIG_HOME NIX_USER_CONF_FILES
+: >"$NIX_USER_CONF_FILES"
+chmod 0600 "$NIX_USER_CONF_FILES"
+guest_nix_etc_config_digest_after_profile=$(guest_nix_hash_etc_config) ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the installed /etc/nix/nix.conf became unsafe before develop'
+[ "$guest_nix_etc_config_digest_after_profile" = "$guest_nix_etc_config_digest" ] ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the installed /etc/nix/nix.conf changed before develop'
+if ! {
+  printf 'home=%s\n' "$HOME"
+  printf 'xdgConfigHome=%s\n' "$XDG_CONFIG_HOME"
+  printf 'userConfFiles=%s\n' "$NIX_USER_CONF_FILES"
+  printf 'etcNixConf=%s\n' "$guest_nix_etc_config_digest"
+} >>evidence/guest-nix/environment.txt; then
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the reviewed Nix environment evidence could not be completed'
+fi
+chmod 0600 evidence/guest-nix/environment.txt
+[ -x /nix/var/nix/profiles/default/bin/nix ] || { printf "GuestNixToolchainAbsent: %s\n" "the instance provides no fixed-path nix command for the driver entry" >&2; exit 64; }
 if ! /nix/var/nix/profiles/default/bin/nix --version >evidence/guest-nix/version.txt \
   2>evidence/guest-nix/version.stderr; then
   guest_nix_fail GuestNixIdentityUnexpected 'the direct installed Nix identity probe failed'
