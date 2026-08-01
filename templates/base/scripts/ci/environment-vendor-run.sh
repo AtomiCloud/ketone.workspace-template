@@ -167,6 +167,8 @@ vendor_emit_report() {
     --arg generationKey "$(diene_generation_key)" --arg substrateName "$substrate_name" \
     --arg clusterId "$DIENE_NSC_CLUSTER_ID" --arg garden "$DIENE_GARDEN_LOCK_DIGEST" \
     --arg vendorDigest "$(diene_file_digest "$manifest")" --arg nscVersion "$DIENE_NSC_VERSION" \
+    --arg nscArtifactDigest "$DIENE_NSC_ARTIFACT_DIGEST" \
+    --arg nscBinaryDigest "$DIENE_NSC_BINARY_DIGEST" \
     --arg sourceDigest "$DIENE_SOURCE_ARCHIVE_DIGEST" \
     --arg subjectDigest "$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")" \
     --arg vendorOutcome "$vendor_outcome" --arg vendorReason "$vendor_reason" \
@@ -187,6 +189,7 @@ vendor_emit_report() {
        k3sVersion:$preflight[0].k3s.version,kubernetesVersion:$preflight[0].k3s.kubernetesVersion,
        nodeCount:$preflight[0].k3s.nodeCount,capacity:$preflight[0].k3s.capacity},
      tooling:{gardenLockDigest:$garden,journeyManifestDigest:$vendorDigest,nscVersion:$nscVersion,
+       nscArtifactDigest:$nscArtifactDigest,nscBinaryDigest:$nscBinaryDigest,
        sourceArchiveDigest:$sourceDigest,artifactSubjectDigest:$subjectDigest},
      vendorOutcome:{id:$actionId,outcome:$vendorOutcome,reasonCode:$vendorReason,required:$required,
        durationSeconds:$actionSeconds},

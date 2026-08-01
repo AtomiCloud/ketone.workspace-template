@@ -32,8 +32,15 @@ while (($#)); do
   esac
 done
 [[ -f $input && -n $output ]] || diene_die InputContractInvalid 'report input/output required'
+[[ $input != "$output" ]] || diene_die InputContractInvalid 'report output must not overwrite its input'
+if [[ -e $output || -L $output ]]; then
+  [[ -f $output || -L $output ]] ||
+    diene_die EvidenceLeakageInterfaceUnavailable 'report output target is an unsafe existing object'
+  rm -f -- "$output"
+fi
 diene_require_command jq
-diene_require_command grep
+grep_bin=${DIENE_GREP_BIN:-grep}
+diene_require_command "$grep_bin"
 diene_require_command base64
 diene_require_command sha256sum
 
@@ -67,6 +74,23 @@ esac
 encodings=()
 scanned=()
 
+require_scannable_surface() {
+  local target=${1:?scan target required}
+  if [[ -L $target ]]; then
+    diene_die EvidenceLeakageInterfaceUnavailable \
+      "the evidence surface $target is a link and cannot be scanned completely"
+  elif [[ -f $target ]]; then
+    [[ -r $target ]] || diene_die EvidenceLeakageInterfaceUnavailable \
+      "the evidence surface $target is unreadable"
+  elif [[ -d $target ]]; then
+    diene_tree_is_safe "$target" || diene_die EvidenceLeakageInterfaceUnavailable \
+      "the evidence surface $target contains an unreadable, linked, or special object"
+  else
+    diene_die EvidenceLeakageInterfaceUnavailable \
+      "the evidence surface $target is not a regular file or directory"
+  fi
+}
+
 scan_surfaces() {
   local canary=$1
   shift
@@ -80,14 +104,21 @@ scan_surfaces() {
   needles=("$canary" "$encoded" "$url_encoded" "$json_escaped" "$newline_normalized" "$kubeconfig_embedded")
   encodings=(raw base64 url-encoded json-escaped newline-normalized kubeconfig-embedded)
 
-  local needle target
+  local needle target grep_rc
   for target in "$@"; do
-    [[ -e $target ]] || continue
+    [[ -e $target || -L $target ]] || continue
+    require_scannable_surface "$target"
     scanned+=("$target")
     for needle in "${needles[@]}"; do
       [[ -n $needle ]] || continue
-      if grep -rFq -- "$needle" "$target" 2>/dev/null; then
+      if "$grep_bin" -rFq -- "$needle" "$target" 2>/dev/null; then
         return 1
+      else
+        grep_rc=$?
+      fi
+      if ((grep_rc != 1)); then
+        diene_die EvidenceLeakageInterfaceUnavailable \
+          "grep could not completely scan evidence surface $target"
       fi
     done
   done
