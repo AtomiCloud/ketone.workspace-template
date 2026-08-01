@@ -841,6 +841,124 @@ diene_refuse_driver_authority_crossover() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Admitted built-in Kubernetes substrate. This is the single source of truth
+# for the admitted full k3s version and for the exactly one Namespace create
+# feature derived from it, so the create selector and the version admitted to
+# the guest can no longer drift apart. Malformed or unsupported admission
+# fails before create.
+# ---------------------------------------------------------------------------
+DIENE_DEFAULT_ADMITTED_K3S_VERSION=v1.33.1+k3s1
+# Pinned nsc v0.0.532 `create --help` exposes exactly this Kubernetes feature
+# selector. A derived feature outside this set is unsupported admission, never
+# a silent platform-default create.
+DIENE_SUPPORTED_KUBERNETES_FEATURE=kubernetes:1.33
+
+# Concrete-value validators. A dotted-quad shape is not enough: every octet,
+# prefix length, and port must be a real in-range value, so a malformed
+# observation can never be carried into a policy rule or an admission compare.
+diene_ipv4_valid() {
+  local address=${1-} octet
+  [[ $address =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local -a octets=()
+  IFS=. read -r -a octets <<<"$address"
+  ((${#octets[@]} == 4)) || return 1
+  for octet in "${octets[@]}"; do
+    [[ $octet == 0 || $octet =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+    ((octet <= 255)) || return 1
+  done
+  return 0
+}
+
+diene_ipv4_cidr_valid() {
+  local cidr=${1-} address prefix
+  [[ $cidr =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+  address=${BASH_REMATCH[1]}
+  prefix=${BASH_REMATCH[3]}
+  [[ $prefix == 0 || $prefix =~ ^[1-9][0-9]?$ ]] || return 1
+  ((prefix <= 32)) || return 1
+  diene_ipv4_valid "$address"
+}
+
+diene_tcp_port_valid() {
+  [[ ${1-} =~ ^[1-9][0-9]{0,4}$ ]] || return 1
+  (($1 <= 65535))
+}
+
+# Prints "<admitted-full-version> <derived-namespace-feature>". An explicitly
+# supplied empty admission refuses, and so does a set-but-empty environment
+# admission; only a completely omitted argument with a completely unset
+# environment variable may fall back to the default.
+diene_k3s_admission() {
+  local admitted
+  if (($# >= 1)); then
+    admitted=$1
+  elif [[ -n ${DIENE_ADMITTED_K3S_VERSION+set} ]]; then
+    admitted=$DIENE_ADMITTED_K3S_VERSION
+  else
+    admitted=$DIENE_DEFAULT_ADMITTED_K3S_VERSION
+  fi
+  local number='(0|[1-9][0-9]*)'
+  local exact_version="^v$number\\.$number\\.$number\\+k3s$number\$"
+  [[ $admitted =~ $exact_version ]] ||
+    diene_die InputContractInvalid \
+      "admitted built-in k3s version ${admitted:-missing} is not the exact vMAJOR.MINOR.PATCH+k3sREV form"
+  local feature=kubernetes:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}
+  [[ $feature == "$DIENE_SUPPORTED_KUBERNETES_FEATURE" ]] ||
+    diene_die InputContractInvalid \
+      "admitted built-in k3s version $admitted derives unsupported Namespace feature $feature"
+  printf '%s %s\n' "$admitted" "$feature"
+}
+
+# Both independently observed runtime versions must equal the same admitted
+# full version. The k3s binary alone is not authority for the served
+# Kubernetes control plane, so neither observation may be skipped.
+diene_require_admitted_k3s_runtime() {
+  local admitted=${1-} observed_k3s=${2-} observed_kubernetes=${3-} admission
+  [[ -n $admitted ]] ||
+    diene_die InstancePostureUnavailable 'the admitted built-in k3s version is absent'
+  admission=$(diene_k3s_admission "$admitted")
+  admitted=${admission%% *}
+  [[ -n $observed_k3s && $observed_k3s == "$admitted" ]] ||
+    diene_die InstancePostureUnavailable \
+      "built-in k3s ${observed_k3s:-missing} does not match admitted $admitted"
+  [[ -n $observed_kubernetes && $observed_kubernetes == "$admitted" ]] ||
+    diene_die InstancePostureUnavailable \
+      "Kubernetes server ${observed_kubernetes:-missing} does not match admitted $admitted"
+}
+
+# The admitted service range must be read from the one API object that the
+# apiserver itself derives from --service-cluster-ip-range. A single ClusterIP,
+# a route, or a k3s argv/config guess cannot establish a range, so an
+# unobservable object is a precise red rather than an inferred value.
+diene_observe_admitted_service_cidr() {
+  local admitted=${1-}
+  [[ -n $admitted ]] ||
+    diene_die InstancePostureUnavailable 'the admitted built-in k3s service CIDR is absent'
+  diene_ipv4_cidr_valid "$admitted" ||
+    diene_die InputContractInvalid 'the admitted built-in k3s service CIDR is invalid'
+  local kubectl_bin=${DIENE_KUBECTL_BIN:-kubectl} observed cidr
+  observed=$("$kubectl_bin" get servicecidrs.networking.k8s.io kubernetes -o json) ||
+    diene_die ServiceCidrObservationUnavailable \
+      'the default networking.k8s.io/v1 ServiceCIDR object kubernetes is not observable'
+  jq -e '
+    .apiVersion == "networking.k8s.io/v1" and .kind == "ServiceCIDR" and
+    .metadata.name == "kubernetes" and
+    (.spec.cidrs | type == "array" and length == 1) and
+    (.spec.cidrs[0] | type == "string")
+  ' <<<"$observed" >/dev/null ||
+    diene_die ServiceCidrObservationUnavailable \
+      'the ServiceCIDR object is not one exact networking.k8s.io/v1 kubernetes range'
+  cidr=$(jq -r '.spec.cidrs[0]' <<<"$observed")
+  diene_ipv4_cidr_valid "$cidr" ||
+    diene_die ServiceCidrObservationUnavailable \
+      "the observed ServiceCIDR range $cidr is not a concrete IPv4 range"
+  [[ $cidr == "$admitted" ]] ||
+    diene_die InstancePostureUnavailable \
+      "observed service CIDR $cidr does not match admitted $admitted"
+  printf '%s\n' "$cidr"
+}
+
 diene_load_remote_inputs() {
   local state_dir=${1:?state directory required}
   [[ $state_dir == /run/diene-ci && ! -L $state_dir ]] ||
@@ -1286,6 +1404,216 @@ diene_remove_policy_artifacts() {
   ((failed == 0))
 }
 
+# The fixed numeric kernel socket read. The absolute iproute2 path is written
+# literally and there is deliberately no variable or environment seam for it: a
+# PATH-resolved or BusyBox `ss` is not the measured tool and must never be able
+# to supply an orchestration tuple.
+#
+# No `state established` filter is used on purpose. iproute2 drops the State
+# column whenever a state filter is supplied, which would leave the established
+# claim resting on the filter argument instead of on an observed value. This form
+# keeps the State column, so the parser reads ESTAB from the table itself.
+diene_orchestration_ss_observation() {
+  diene_require_command /sbin/ss
+  /sbin/ss -H -n -t -4
+}
+
+# Stable relative name of the retained same-session socket observation inside the
+# run's evidence staging tree. The name is fixed so a proof-bundle consumer can
+# locate the exact bytes the bound policy tuple was derived from.
+DIENE_ORCHESTRATION_OBSERVATION_RELPATH=orchestration/ss-observation.txt
+
+# Absolute path of that artifact, using the same driver-owned staging safety the
+# hostile-probe transcripts already require.
+diene_orchestration_observation_path() {
+  local staging=${DIENE_EVIDENCE_STAGING:-}
+  [[ $staging == /* && -d $staging && ! -L $staging ]] ||
+    diene_die InterimPolicyUnavailable \
+      'the retained orchestration observation requires an absolute driver-owned evidence staging directory'
+  local dir="$staging/${DIENE_ORCHESTRATION_OBSERVATION_RELPATH%/*}"
+  # A symlinked component would silently place same-session evidence outside the
+  # driver-owned tree while still reporting success, so the directory must be a
+  # real directory both before and after it is created.
+  [[ ! -L $dir ]] ||
+    diene_die InterimPolicyUnavailable \
+      'the orchestration observation directory is a symlink'
+  install -d -m 0700 "$dir" ||
+    diene_die InterimPolicyUnavailable \
+      'the orchestration observation directory could not be created'
+  [[ -d $dir && ! -L $dir ]] ||
+    diene_die InterimPolicyUnavailable \
+      'the orchestration observation directory is not a real driver-owned directory'
+  printf '%s/%s\n' "$staging" "$DIENE_ORCHESTRATION_OBSERVATION_RELPATH"
+}
+
+# Runs the fixed reader exactly once and atomically retains its exact stdout as a
+# regular mode-0600 artifact. The parser then consumes those retained bytes, so
+# the tuple written into the rules and the bytes kept in the proof bundle are one
+# observation rather than two separate reads of a table that can change between
+# them. Command, create, write, rename, or mode failure refuses here, which is
+# before any chain or hook exists.
+diene_retain_orchestration_observation() {
+  local target=${1:?observation artifact required}
+  local tmp="$target.tmp.$$"
+  # Refuse an unsafe target before anything is written. `mv file dir` would move
+  # the temporary file *into* an existing directory at the target path and report
+  # success, and a symlinked target would publish through the link, so neither
+  # may reach the publish step.
+  [[ ! -e $target || (-f $target && ! -L $target) ]] ||
+    diene_die InterimPolicyUnavailable \
+      'the orchestration observation path is not a regular file'
+  rm -f -- "$tmp" ||
+    diene_die InterimPolicyUnavailable 'a stale orchestration observation could not be cleared'
+  # The shell creates the redirection target before the reader runs, so every
+  # failure path below removes the partial file first. Otherwise a refusal would
+  # leave a stray temporary artifact in the run's evidence tree.
+  (
+    umask 077
+    diene_orchestration_ss_observation >"$tmp"
+  ) || {
+    rm -f -- "$tmp"
+    diene_die InterimPolicyUnavailable \
+      'the fixed numeric kernel socket observation could not be taken or retained'
+  }
+  [[ -f $tmp && ! -L $tmp ]] || {
+    rm -f -- "$tmp"
+    diene_die InterimPolicyUnavailable \
+      'the retained orchestration observation is not a regular file'
+  }
+  chmod 0600 -- "$tmp" || {
+    rm -f -- "$tmp"
+    diene_die InterimPolicyUnavailable \
+      'the retained orchestration observation could not be sealed'
+  }
+  mv -f -- "$tmp" "$target" || {
+    rm -f -- "$tmp"
+    diene_die InterimPolicyUnavailable \
+      'the retained orchestration observation could not be published'
+  }
+  [[ -f $target && ! -L $target && $(stat -c %a -- "$target") == 600 ]] ||
+    diene_die InterimPolicyUnavailable \
+      'the published orchestration observation is not a regular mode-0600 artifact'
+}
+
+# Pure parser for one numeric kernel socket observation supplied on stdin.
+# Prints "<client-ip> <client-port> <server-ip> <server-port> <selected-count>".
+#
+# Only iproute2's headerless five-column form is accepted; any other row shape
+# is a refusal rather than a skipped line. A row is a candidate only when its
+# observed state is exactly ESTAB and its local endpoint port is exactly 22, so a
+# BusyBox `ESTABLISHED` spelling, a header row, a TIME-WAIT or SYN-SENT socket,
+# and every other port contribute nothing. Exactly one candidate may exist; zero,
+# multiple, IPv6, wildcard, hostname, or service-name observations refuse.
+# Nothing widens the exception beyond that single flow: no conntrack state class,
+# subnet, gateway, route, or public endpoint is derived.
+diene_parse_orchestration_ss_observation() {
+  local line state recvq sendq local_endpoint peer_endpoint excess
+  local local_address local_port peer_address peer_port flow_count=0
+  local client='' client_port='' server='' server_port='' selected_row=''
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n ${line//[[:space:]]/} ]] || continue
+    read -r state recvq sendq local_endpoint peer_endpoint excess <<<"$line"
+    [[ -z ${excess:-} && -n $state && -n $recvq && -n $sendq &&
+      -n $local_endpoint && -n $peer_endpoint ]] ||
+      diene_die InterimPolicyUnavailable \
+        'the kernel socket observation is not the exact headerless five-column form'
+    [[ $state == ESTAB ]] || continue
+    [[ $recvq =~ ^[0-9]+$ && $sendq =~ ^[0-9]+$ ]] ||
+      diene_die InterimPolicyUnavailable \
+        'the established kernel socket row does not carry numeric queue depths'
+    [[ ${local_endpoint##*:} == 22 ]] || continue
+    local_address=${local_endpoint%:*}
+    local_port=${local_endpoint##*:}
+    peer_address=${peer_endpoint%:*}
+    peer_port=${peer_endpoint##*:}
+    { diene_ipv4_valid "$local_address" && [[ $local_address != 0.0.0.0 ]] &&
+      diene_ipv4_valid "$peer_address" && [[ $peer_address != 0.0.0.0 ]] &&
+      diene_tcp_port_valid "$peer_port"; } ||
+      diene_die InterimPolicyUnavailable \
+        'the observed port 22 socket is not a concrete in-range IPv4 client/server pair'
+    client=$peer_address
+    client_port=$peer_port
+    server=$local_address
+    server_port=$local_port
+    selected_row=$line
+    flow_count=$((flow_count + 1))
+  done
+  ((flow_count == 1)) ||
+    diene_die InterimPolicyUnavailable \
+      "the kernel socket table yielded $flow_count established IPv4 port 22 orchestration flows, not exactly one"
+  # The selected count is printed rather than merely asserted so the transcript
+  # can bind a measured value. The selected row is printed last, verbatim and
+  # unquoted, so a reviewer can locate the exact line of the retained artifact
+  # the bound tuple came from instead of having to re-run this parser.
+  printf '%s %s %s %s %s %s\n' \
+    "$client" "$client_port" "$server" "$server_port" "$flow_count" "$selected_row"
+}
+
+# Exactly one orchestration transport observation, printed as one compact JSON
+# object carrying the source, the canonical selected tuple, the selected-flow
+# count, a deterministic digest of the exact admitted observation, and, for the
+# kernel-socket source, the stable relative name of the retained bytes.
+#
+# The SSH environment stays the primary source. If the variable is set at all it
+# must validate exactly, so neither an empty nor a malformed value can fall
+# back, and `/sbin/ss` is then executed zero times. Only a completely unset
+# variable permits the fixed numeric kernel socket read, which is executed
+# exactly once and retained before it is parsed. Both sources yield the same
+# exact four values and the same port 22 server endpoint; every degenerate
+# observation fails before policy mutation.
+diene_observe_orchestration_ssh_tuple() {
+  local client client_port server server_port extra
+  local flow_count source digest artifact artifact_relpath='' parsed selected_row
+  local strict_tuple='^[0-9.]+ [0-9]+ [0-9.]+ [0-9]+$'
+  if [[ -n ${SSH_CONNECTION+set} ]]; then
+    # The whole value must be exactly one line of four space-separated numeric
+    # fields. A line read alone would silently accept a valid-looking first line
+    # followed by an injected second row, and a tab would smuggle extra fields.
+    [[ $SSH_CONNECTION =~ $strict_tuple ]] ||
+      diene_die InterimPolicyUnavailable \
+        'the active orchestration SSH 4-tuple is not exactly one line of four numeric fields'
+    read -r client client_port server server_port extra <<<"$SSH_CONNECTION"
+    { [[ -z ${extra:-} ]] && diene_ipv4_valid "$client" && [[ $client != 0.0.0.0 ]] &&
+      diene_ipv4_valid "$server" && [[ $server != 0.0.0.0 ]] &&
+      diene_tcp_port_valid "$client_port" && [[ $server_port == 22 ]]; } ||
+      diene_die InterimPolicyUnavailable \
+        'the active orchestration SSH 4-tuple is unavailable, non-IPv4, or not a port 22 server endpoint'
+    source=ssh-environment
+    flow_count=1
+    # The admitted one-line value is itself the whole observation, so it is both
+    # the selected row and the deterministic digest input. No artifact is
+    # retained because no kernel socket table was read.
+    selected_row=$SSH_CONNECTION
+    digest=$(diene_sha256_text "$SSH_CONNECTION") || exit $?
+  else
+    # Every step below propagates its own refusal exit code immediately. A
+    # command substitution does not trip `set -e` in the caller on its own, so
+    # without these guards a failed path, retention, hash, or parse would carry
+    # an empty value forward into the next step instead of refusing here.
+    artifact=$(diene_orchestration_observation_path) || exit $?
+    diene_retain_orchestration_observation "$artifact"
+    artifact_relpath=$DIENE_ORCHESTRATION_OBSERVATION_RELPATH
+    digest=$(diene_file_digest "$artifact") || exit $?
+    # The retained bytes are the parser's only input: no second observation.
+    parsed=$(diene_parse_orchestration_ss_observation <"$artifact") || exit $?
+    # The selected row is the unquoted remainder, so it survives its own spaces.
+    read -r client client_port server server_port flow_count selected_row <<<"$parsed"
+    source=kernel-ss
+  fi
+  jq -cn --arg source "$source" --arg client "$client" --argjson clientPort "$client_port" \
+    --arg server "$server" --argjson serverPort "$server_port" \
+    --argjson flowCount "$flow_count" --arg digest "$digest" \
+    --arg selectedRow "$selected_row" \
+    --arg artifact "$artifact_relpath" '
+      {source:$source,
+       tuple:{clientAddress:$client,clientPort:$clientPort,
+              serverAddress:$server,serverPort:$serverPort},
+       flowCount:$flowCount,selectedRow:$selectedRow,observationDigest:$digest,
+       observationArtifact:(if $artifact == "" then null else $artifact end)}' ||
+    diene_die InterimPolicyUnavailable \
+      'the orchestration transport observation could not be bound'
+}
+
 diene_apply_interim_policy() {
   local resolved=${1:?resolved egress contract required}
   local transcript=${2:?policy transcript required}
@@ -1320,12 +1648,18 @@ diene_apply_interim_policy() {
   service_cidr=$(jq -er '.network.serviceCidrs | select(length == 1) | .[0]' "$DIENE_PREFLIGHT_EVIDENCE") ||
     diene_die InterimPolicyUnavailable 'one observed service CIDR is required'
 
-  local ssh_client ssh_client_port ssh_server ssh_server_port extra
-  read -r ssh_client ssh_client_port ssh_server ssh_server_port extra <<<"${SSH_CONNECTION:-}"
-  [[ -z ${extra:-} && $ssh_client =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ &&
-    $ssh_server =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ &&
-    $ssh_client_port =~ ^[1-9][0-9]{0,4}$ && $ssh_server_port =~ ^[1-9][0-9]{0,4}$ ]] ||
-    diene_die InterimPolicyUnavailable 'the active orchestration SSH 4-tuple is unavailable or non-IPv4'
+  # The transport observation is taken, retained, and bound before any chain or
+  # hook exists, so every refusal above leaves no policy artifact behind.
+  # Only the four rule values are unpacked here; the source, count, digest, and
+  # retained-artifact name are bound into the transcript straight from the same
+  # observation object, so the rules and the proof cannot describe different
+  # flows.
+  local ssh_client ssh_client_port ssh_server ssh_server_port observation rule_tuple
+  observation=$(diene_observe_orchestration_ssh_tuple)
+  rule_tuple=$(jq -er '[.tuple.clientAddress,.tuple.clientPort,
+    .tuple.serverAddress,.tuple.serverPort] | @tsv' <<<"$observation") ||
+    diene_die InterimPolicyUnavailable 'the orchestration transport observation is unreadable'
+  read -r ssh_client ssh_client_port ssh_server ssh_server_port <<<"$rule_tuple"
 
   local ipv6_disabled=0 ipv6_armed=false policy_mode
   local ipv6_disable_path=${DIENE_IPV6_DISABLE_PATH:-/proc/sys/net/ipv6/conf/all/disable_ipv6}
@@ -1426,6 +1760,7 @@ diene_apply_interim_policy() {
       --arg mode "$policy_mode" --arg profile "$(diene_egress_profile "$DIENE_LANE")" \
       --arg clusterId "$DIENE_NSC_CLUSTER_ID" --arg podCidr "$pod_cidr" \
       --arg serviceCidr "$service_cidr" --arg rulesDigest "$rules_digest" \
+      --argjson orchestration "$observation" \
       --argjson ipv6Armed "$ipv6_armed" --argjson pod6Cidrs "$pod6_cidrs" '
         {mechanism:"interim-in-guest-iptables-nft",backend:"nf_tables",
          platformStatus:"platform per-instance policy pending (support ask #4)",
@@ -1433,7 +1768,14 @@ diene_apply_interim_policy() {
          output6Chain:$output6Chain,forward6Chain:$forward6Chain,ipv6Armed:$ipv6Armed,
          mode:$mode,profileId:$profile,clusterId:$clusterId,podCidr:$podCidr,pod6Cidrs:$pod6Cidrs,
          serviceCidr:$serviceCidr,rulesDigest:$rulesDigest,applied:true,
-         orchestrationException:"exact-ssh-4-tuple"}' | diene_write_json "$transcript" ||
+         orchestrationException:"exact-ssh-4-tuple",
+         orchestrationTupleSource:$orchestration.source,
+         orchestrationTuple:$orchestration.tuple,
+         orchestrationFlowCount:$orchestration.flowCount,
+         orchestrationSelectedRow:$orchestration.selectedRow,
+         orchestrationObservationDigest:$orchestration.observationDigest,
+         orchestrationObservationArtifact:$orchestration.observationArtifact}' |
+        diene_write_json "$transcript" ||
       diene_die InterimPolicyUnavailable 'policy transcript finalization failed'
   ) || transaction_rc=$?
   if ((transaction_rc != 0)); then

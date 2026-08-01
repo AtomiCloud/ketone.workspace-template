@@ -332,6 +332,19 @@ inputs=$state/inputs.json
 receipt=$state/receipt.json
 evidence=$state/evidence
 
+# The fake guest may not manufacture a runtime version of its own. Its reported
+# k3s/Kubernetes facts come from the admitted input, and the feature the outer
+# create actually selected must agree with that same admitted minor. Without
+# this cross-check the harness could stay green while production created a
+# platform-default substrate.
+admitted_k3s=$(jq -er '.admittedK3sVersion' "$inputs")
+[[ $admitted_k3s =~ ^v([0-9]+)\.([0-9]+)\.[0-9]+\+k3s[0-9]+$ ]] || exit 68
+admitted_feature=kubernetes:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}
+create_metadata=${FAKE_NSC_ROOT:?}/instances/$cluster_id/meta.json
+[[ -f $create_metadata ]] || exit 68
+[[ $(jq -er '.kubernetes_feature' "$create_metadata") == "$admitted_feature" ]] || exit 68
+[[ $(jq -er '.labels["nsc.kubernetes"]' "$create_metadata") == "${admitted_feature#kubernetes:}" ]] || exit 68
+
 # shellcheck disable=SC1091
 source "${TEMPLATE_SCRIPT_DIR:?}/environment-lib.sh"
 input_digest=$(diene_sha256_text "$(jq -cS . "$inputs")")
@@ -357,10 +370,10 @@ if [[ $scenario == checkpoint-broken ]]; then
   mv "$evidence/checkpoint-chain.json.tmp" "$evidence/checkpoint-chain.json"
 fi
 
-jq -n --arg cluster "$cluster_id" '
+jq -n --arg cluster "$cluster_id" --arg k3s "$admitted_k3s" '
   {outcome:"Pass",reasonCode:"NamespaceWolfiBuiltInK3sReady",clusterId:$cluster,
    identitySource:"cidfile-metadata-exact-id-ssh",os:{id:"wolfi",version:"rolling",uid:0},
-   k3s:{version:"v1.33.1+k3s1",kubernetesVersion:"v1.33.1+k3s1",nodeCount:1,
+   k3s:{version:$k3s,kubernetesVersion:$k3s,nodeCount:1,
         capacity:{cpu:"16",memory:"32Gi"}},
    network:{podCidrs:["10.142.0.0/16"],serviceCidrs:["10.143.0.0/16"],ipv6Disabled:false,
             namespaceIngress:false,publicBinding:false},storage:{defaultClass:"local-path"},
@@ -436,6 +449,7 @@ if [[ $lane == ditto-vendor ]]; then
     --arg nscVersion "$(jq -r '.nscVersion' "$inputs")" \
     --arg nscArtifactDigest "$(jq -r '.nscArtifactDigest' "$inputs")" \
     --arg nscBinaryDigest "$(jq -r '.nscBinaryDigest' "$inputs")" \
+    --arg k3s "$admitted_k3s" \
     --arg vendorDigest "$vendor_digest" --arg vendorOutcome "$vendor_outcome" \
     --arg vendorReason "$vendor_reason" --arg reportOutcome "$report_outcome" --arg reportReason "$report_reason" \
     --argjson required "$required" --slurpfile probes "$evidence/hostile-probes.json" \
@@ -445,8 +459,8 @@ if [[ $lane == ditto-vendor ]]; then
      profile:"ditto",buildMode:"build-local",actionId:$action,componentClass:"K9",
      permissionRule:"ditto-vendor-demo",receiptId:$receipt,
      instance:{allocationKey:$allocation,generationKey:$generation,substrateName:("diene-"+$allocation),
-       clusterId:$cluster,osId:"wolfi",osVersion:"rolling",k3sVersion:"v1.33.1+k3s1",
-       kubernetesVersion:"v1.33.1+k3s1",nodeCount:1,capacity:{cpu:"16",memory:"32Gi"}},
+       clusterId:$cluster,osId:"wolfi",osVersion:"rolling",k3sVersion:$k3s,
+       kubernetesVersion:$k3s,nodeCount:1,capacity:{cpu:"16",memory:"32Gi"}},
      tooling:{gardenLockDigest:$garden,journeyManifestDigest:$vendorDigest,nscVersion:$nscVersion,
        nscArtifactDigest:$nscArtifactDigest,nscBinaryDigest:$nscBinaryDigest,
        sourceArchiveDigest:"sha256:4444444444444444444444444444444444444444444444444444444444444444",
@@ -476,6 +490,7 @@ else
     --arg nscVersion "$(jq -r '.nscVersion' "$inputs")" \
     --arg nscArtifactDigest "$(jq -r '.nscArtifactDigest' "$inputs")" \
     --arg nscBinaryDigest "$(jq -r '.nscBinaryDigest' "$inputs")" \
+    --arg k3s "$admitted_k3s" \
     --arg journey "$journey_digest" --arg profileId "$profile_id" --arg reportOutcome "$report_outcome" \
     --arg reportReason "$report_reason" --slurpfile readiness "$evidence/readiness.json" \
     --slurpfile probes "$evidence/hostile-probes.json" --slurpfile chain "$evidence/checkpoint-chain.json" '
@@ -483,8 +498,8 @@ else
      workflow:{runId:$runId,runAttempt:$runAttempt,workflowRef:$workflow},lane:$lane,profile:$profile,buildMode:$mode,
      subject:{artifactDigest:$artifact,imageRef:$imageRef,producerWorkflowRef:$workflow},
      instance:{allocationKey:$allocation,generationKey:$generation,substrateName:("diene-"+$allocation),
-       clusterId:$cluster,osId:"wolfi",osVersion:"rolling",k3sVersion:"v1.33.1+k3s1",
-       kubernetesVersion:"v1.33.1+k3s1",nodeCount:1,capacity:{cpu:"16",memory:"32Gi"}},receiptId:$receipt,
+       clusterId:$cluster,osId:"wolfi",osVersion:"rolling",k3sVersion:$k3s,
+       kubernetesVersion:$k3s,nodeCount:1,capacity:{cpu:"16",memory:"32Gi"}},receiptId:$receipt,
      tooling:{gardenLockDigest:$garden,journeyManifestDigest:$journey,nscVersion:$nscVersion,
        nscArtifactDigest:$nscArtifactDigest,nscBinaryDigest:$nscBinaryDigest,
        sourceArchiveDigest:"sha256:4444444444444444444444444444444444444444444444444444444444444444",
@@ -562,10 +577,16 @@ case $command in
     purpose=
     unique_tag=
     labels=0
+    # The measured platform admits the Kubernetes minor only through this one
+    # feature selector. Anything else is a platform-default create, which is the
+    # exact defect this fake must refuse rather than silently absorb.
+    enable_count=0
+    enable=
     while (($#)); do
       case $1 in
         --ephemeral) ephemeral=true; shift ;;
         --duration) duration=$2; shift 2 ;;
+        --enable=*) enable_count=$((enable_count + 1)); enable=${1#--enable=}; shift ;;
         --wait_kube_system) wait_kube=true; shift ;;
         --cidfile) cidfile=$2; shift 2 ;;
         --output_json_to) metadata=$2; shift 2 ;;
@@ -579,11 +600,19 @@ case $command in
     done
     [[ $ephemeral == true && $duration == 2h && $wait_kube == true && $output == json &&
       -n $cidfile && -n $metadata && -n $purpose && -n $unique_tag && $labels -eq 3 ]] || exit 65
+    if ((enable_count != 1)) || [[ $enable != kubernetes:1.33 ]]; then
+      printf 'fake nsc: create requires exactly one --enable=kubernetes:1.33 (saw %s: %s)\n' \
+        "$enable_count" "${enable:-none}" >&2
+      exit 68
+    fi
     [[ $scenario != create-fail ]] || exit 41
     id="cluster-$(printf '%s' "$unique_tag" | sha256sum | cut -c1-16)"
     instance="$root/instances/$id"
     install -d -m 0700 "$instance/fs"
-    jq -n --arg id "$id" --arg tag "$unique_tag" '{cluster_id:$id,unique_tag:$tag}' >"$instance/meta.json"
+    jq -n --arg id "$id" --arg tag "$unique_tag" --arg feature "$enable" \
+      --arg minor "${enable#kubernetes:}" '
+      {cluster_id:$id,unique_tag:$tag,kubernetes_feature:$feature,
+       labels:{"nsc.kubernetes":$minor}}' >"$instance/meta.json"
     : >"$instance/live"
     install -d -m 0700 "$(dirname -- "$cidfile")" "$(dirname -- "$metadata")"
     if [[ $scenario == cid-mismatch ]]; then printf '%s\n' "${id}-wrong" >"$cidfile"; else printf '%s\n' "$id" >"$cidfile"; fi
@@ -621,6 +650,10 @@ case $command in
     state="$root/instances/$id/fs/run/diene-ci"
     [[ $remote_command == *'sha256sum -c archive-validator.sha256'* &&
       $remote_command == *'./archive-validator.sh source.tar source'* ]] || exit 67
+    # The fixed remote command must carry the exact fail-closed guest Nix guard.
+    # Nothing here bootstraps a toolchain; the driver rail stays real and the
+    # absence stays an explicit, stable diagnostic.
+    [[ $remote_command == *"${FAKE_GUEST_NIX_GUARD:?}"* ]] || exit 69
     if [[ $scenario == remote-source-special ]]; then
       cp "${FAKE_HOSTILE_SOURCE_ARCHIVE:?}" "$state/source.tar"
     fi
@@ -651,6 +684,12 @@ case $command in
 esac
 NSC
 chmod 0755 "$fake_nsc"
+
+# The exact fail-closed guest Nix guard the production remote command must
+# carry, verbatim. The fake ssh leg refuses any drift from this text and the
+# guard is separately executed below, so the diagnostic is proved by behaviour
+# rather than by a comment.
+guest_nix_guard='command -v nix >/dev/null 2>&1 || { printf "GuestNixToolchainAbsent: %s\n" "the instance provides no nix command for the driver entry" >&2; exit 64; }'
 
 fake_nsc_identity=$scratch/nsc-identity.json
 fake_nsc_binary_digest="sha256:$(sha256sum "$fake_nsc" | awk '{print $1}')"
@@ -689,6 +728,7 @@ prepare_run() {
   export DIENE_ORCHESTRATOR_FALLBACK_REASON='' DIENE_NSC_BIN=$fake_nsc
   export DIENE_NSC_IDENTITY_FILE=$fake_nsc_identity
   export FAKE_NSC_ROOT=$nsc_root FAKE_NSC_LOG=$nsc_root/log FAKE_GUEST_BIN=$fake_guest
+  export FAKE_GUEST_NIX_GUARD=$guest_nix_guard
   export TEMPLATE_SCRIPT_DIR=$work/scripts/ci RUNNER_TEMP=$runner DIENE_SCHEMA_DIR=$work/schemas/ci
   export DIENE_CORE_REPORT=$runner/diene-environment-report.v1.json
   export DIENE_VENDOR_REPORT=$runner/diene-vendor-report.v1.json
@@ -1892,8 +1932,18 @@ cp "$LAST_BUNDLE" "$happy_core_bundle"
 happy_cluster=$LAST_CLUSTER
 happy_log=$LAST_LOG
 
-grep -Eq '^create --ephemeral --duration 2h --wait_kube_system .*--output_json_to .*--output json .*--purpose .*--unique_tag .*--label .*--label .*--label ' \
+grep -Eq '^create --ephemeral --duration 2h --enable=kubernetes:1\.33 --wait_kube_system .*--output_json_to .*--output json .*--purpose .*--unique_tag .*--label .*--label .*--label ' \
   "$happy_log" || fail 'fake nsc did not observe the exact stable create surface'
+[[ $(grep -o -- '--enable=[^ ]*' "$happy_log" | wc -l) == 1 ]] ||
+  fail 'create did not pass exactly one Kubernetes feature selector'
+[[ $(grep -o -- '--enable=[^ ]*' "$happy_log") == '--enable=kubernetes:1.33' ]] ||
+  fail 'the create feature selector was not the exact derived admitted minor'
+jq -e '.kubernetes_feature == "kubernetes:1.33" and .labels["nsc.kubernetes"] == "1.33"' \
+  "$FAKE_NSC_ROOT/instances/$happy_cluster/meta.json" >/dev/null ||
+  fail 'create metadata did not retain the selected Kubernetes feature'
+if grep -Eq -- '(^| )--bare( |$)|--k3s[-_]image|--image( |=)|--ingress|--endpoint' "$happy_log"; then
+  fail 'create substituted a bare, replacement-image, ingress, or endpoint surface'
+fi
 [[ $(grep -Ec '^instance upload ' "$happy_log") == 7 ]] || fail 'immutable upload count is not exactly seven'
 [[ $(grep -Ec '^instance download ' "$happy_log") == 2 ]] || fail 'fixed proof download count is not exactly two'
 grep -Eq "^ssh ${happy_cluster} -T " "$happy_log" || fail 'driver did not use exact-id noninteractive ssh'
@@ -2493,6 +2543,14 @@ case "$*" in
       {items:[{spec:{podCIDR:($podCidrs | map(select(contains(":" ) | not))[0]),podCIDRs:$podCidrs},
       status:{conditions:[{type:"Ready",status:"True"}],capacity:{cpu:"16",memory:"32Gi"}}}]}'
     ;;
+  'get servicecidrs.networking.k8s.io kubernetes -o json')
+    [[ ${FAKE_SERVICE_CIDR_MODE:-happy} != unavailable ]] || exit 1
+    jq -n --arg api "${FAKE_SERVICE_CIDR_API:-networking.k8s.io/v1}" \
+      --arg kind "${FAKE_SERVICE_CIDR_KIND:-ServiceCIDR}" \
+      --arg name "${FAKE_SERVICE_CIDR_NAME:-kubernetes}" \
+      --argjson cidrs "${FAKE_SERVICE_CIDRS:-[\"10.143.0.0/16\"]}" '
+      {apiVersion:$api,kind:$kind,metadata:{name:$name},spec:{cidrs:$cidrs}}'
+    ;;
   'get ingress -A -o json' | 'get gateway -A -o json') printf '%s\n' '{"items":[]}' ;;
   'get service -A -o json')
     printf '%s\n' '{"items":[{"metadata":{"name":"kgateway"},"spec":{"type":"ClusterIP","externalIPs":[]}}]}'
@@ -2576,8 +2634,20 @@ jq -e '.mechanism == "interim-in-guest-iptables-nft" and .backend == "nf_tables"
   .platformStatus == "platform per-instance policy pending (support ask #4)" and
   .outputChain != .forwardChain and .ipv6Armed == true and .podCidr == "10.142.0.0/16" and
   .pod6Cidrs == ["fd00:142::/64"] and .serviceCidr == "10.143.0.0/16" and
-  .orchestrationException == "exact-ssh-4-tuple" and .applied == true' \
+  .orchestrationException == "exact-ssh-4-tuple" and
+  .orchestrationTupleSource == "ssh-environment" and .applied == true' \
   "$policy_evidence/policy.json" >/dev/null || fail 'policy transcript lacks host/FORWARD/IPv6/exact-SSH facts'
+# The primary source binds the same canonical tuple, a measured selected count,
+# and a deterministic digest of the exact admitted one-line value, with no
+# retained artifact because no kernel socket table was read.
+jq -e --arg digest "sha256:$(printf '%s' '192.0.2.10 4242 10.0.0.2 22' | sha256sum | awk '{print $1}')" '
+  .orchestrationTuple == {clientAddress:"192.0.2.10",clientPort:4242,
+    serverAddress:"10.0.0.2",serverPort:22} and
+  .orchestrationFlowCount == 1 and
+  .orchestrationObservationDigest == $digest and
+  .orchestrationObservationArtifact == null' \
+  "$policy_evidence/policy.json" >/dev/null ||
+  fail 'the ssh-environment transcript did not bind the exact tuple, count, and observation digest'
 jq -e '.outcome == "Pass" and .defaultDenied == true and .dnsBound == true and
   .sniBound == true and .methodsBound == true' "$policy_evidence/l7.json" >/dev/null ||
   fail 'L7 enforcer did not attest the full declaration boundary'
@@ -2771,6 +2841,577 @@ jq -e '.ipv6Armed == false and .pod6Cidrs == [] and .applied == true' \
   fail 'the IPv6-disabled control transcript misreported IPv6 enforcement'
 assert_policy_state_absent "$ipv6_disabled_state" ipv6-disabled-control
 ok 'an explicitly IPv6-disabled host permits no pod6 CIDR and still proves complete removal'
+
+printf '== admitted built-in Kubernetes admission and the derived create selector ==\n'
+
+k3s_admission_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  if (($# >= 1)); then
+    diene_k3s_admission "$1"
+  else
+    diene_k3s_admission
+  fi
+)
+
+k3s_admission_empty_environment_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  export DIENE_ADMITTED_K3S_VERSION=''
+  diene_k3s_admission
+)
+
+k3s_admission_default_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  unset DIENE_ADMITTED_K3S_VERSION
+  diene_k3s_admission
+)
+
+[[ $(k3s_admission_case v1.33.1+k3s1) == 'v1.33.1+k3s1 kubernetes:1.33' ]] ||
+  fail 'the exact admitted version did not derive exactly one supported feature'
+[[ $(k3s_admission_default_case) == 'v1.33.1+k3s1 kubernetes:1.33' ]] ||
+  fail 'the omitted admission default is not the admitted v1.33.1+k3s1 substrate'
+for malformed_admission in '' v1.32.3+k3s1 v1.34.0+k3s1 1.33.1+k3s1 v1.33.1 v1.33+k3s1 \
+  'v1.33.1+k3s1 extra' v1.33.1+k3s v1.33.1-k3s1 v1.33.01+k3s1 v1.33.1+k3s01 v01.33.1+k3s1 \
+  v1.033.1+k3s1 V1.33.1+k3s1 v1.33.1+K3S1; do
+  expect_refusal InputContractInvalid k3s_admission_case "$malformed_admission"
+done
+expect_refusal InputContractInvalid k3s_admission_empty_environment_case
+ok 'one helper is the source of truth for the admitted version and its single derived feature'
+
+k3s_runtime_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  diene_require_admitted_k3s_runtime "${1-}" "${2-}" "${3-}"
+)
+
+k3s_runtime_case v1.33.1+k3s1 v1.33.1+k3s1 v1.33.1+k3s1 ||
+  fail 'the exact admitted runtime pair was refused'
+expect_refusal InstancePostureUnavailable k3s_runtime_case v1.33.1+k3s1 v1.32.3+k3s1 v1.32.3+k3s1
+expect_refusal InstancePostureUnavailable k3s_runtime_case v1.33.1+k3s1 v1.33.2+k3s1 v1.33.2+k3s1
+expect_refusal InstancePostureUnavailable k3s_runtime_case v1.33.1+k3s1 v1.33.1+k3s1 v1.32.3+k3s1
+expect_refusal InstancePostureUnavailable k3s_runtime_case v1.33.1+k3s1 v1.32.3+k3s1 v1.33.1+k3s1
+expect_refusal InstancePostureUnavailable k3s_runtime_case v1.33.1+k3s1 '' v1.33.1+k3s1
+expect_refusal InstancePostureUnavailable k3s_runtime_case v1.33.1+k3s1 v1.33.1+k3s1 ''
+expect_refusal InstancePostureUnavailable k3s_runtime_case '' v1.33.1+k3s1 v1.33.1+k3s1
+expect_refusal InputContractInvalid k3s_runtime_case not-a-version v1.33.1+k3s1 v1.33.1+k3s1
+ok 'both observed runtime versions must equal the same admitted version'
+
+# Binding regression: the helpers above are only worth their coverage if the real
+# in-guest preflight is the caller. Prove the production seam, and prove the
+# disproved k3s argv/config service-range scan is gone rather than demoted.
+runner_preflight=$template_root/scripts/ci/environment-runner-preflight.sh
+# The seams are matched as production source text, so they must stay unexpanded.
+# shellcheck disable=SC2016
+for required_seam in 'diene_require_admitted_k3s_runtime "${DIENE_ADMITTED_K3S_VERSION:-}"' \
+  'diene_observe_admitted_service_cidr "${DIENE_K3S_SERVICE_CIDR:-}"'; do
+  rg -qF -- "$required_seam" "$runner_preflight" ||
+    fail "the real runner preflight no longer calls $required_seam"
+done
+if rg -n -- '--service-cidr|/etc/rancher/k3s/config\.yaml|ps -eo' "$runner_preflight" \
+  >"$scratch/preflight-cidr-guess"; then
+  sed -n '1,40p' "$scratch/preflight-cidr-guess" >&2
+  fail 'the real runner preflight still guesses the service range from k3s argv or config'
+fi
+rg -qF -- "diene_die InstancePostureUnavailable 'the built-in k3s version is unavailable'" \
+  "$runner_preflight" ||
+  fail 'the real runner preflight does not map a failed k3s version observation to a stable reason'
+ok 'the real runner preflight binds both admission helpers and guesses no service range'
+
+fake_create_seq=0
+fake_create_argv() {
+  fake_create_seq=$((fake_create_seq + 1))
+  local root=$scratch/fake-create-$fake_create_seq
+  install -d -m 0700 "$root"
+  FAKE_NSC_ROOT=$root FAKE_NSC_LOG=$root/log FAKE_NSC_SCENARIO=happy \
+    "$fake_nsc" create --ephemeral --duration 2h "$@" --wait_kube_system \
+    --cidfile "$root/cluster.cid" --output_json_to "$root/create.json" --output json \
+    --purpose 'diene-ci-k3d/v1 ditto-build-local' --unique_tag "contract-tag-$fake_create_seq" \
+    --label diene_receipt=r --label diene_run=1 --label diene_attempt=1 \
+    >"$root/out.json" 2>"$root/err"
+}
+
+fake_create_argv --enable=kubernetes:1.33 ||
+  fail 'the fake create parser refused the exact derived feature selector'
+jq -e '.kubernetes_feature == "kubernetes:1.33"' \
+  "$scratch/fake-create-$fake_create_seq/instances/"*/meta.json >/dev/null ||
+  fail 'the fake create parser did not retain the selected feature semantically'
+if fake_create_argv; then
+  fail 'the fake create parser accepted a missing feature selector'
+fi
+for hostile_selector in kubernetes:1.32 kubernetes:1.34 kubernetes: kubernetes:1 1.33 \
+  KUBERNETES:1.33 kubernetes:1.33.1 'kubernetes:1.33 ' kubernetes:v1.33; do
+  if fake_create_argv "--enable=$hostile_selector"; then
+    fail "the fake create parser accepted the refused selector $hostile_selector"
+  fi
+done
+if fake_create_argv --enable=kubernetes:1.33 --enable=kubernetes:1.33; then
+  fail 'the fake create parser accepted a duplicate feature selector'
+fi
+if fake_create_argv --enable=kubernetes:1.33 --enable=kubernetes:1.32; then
+  fail 'the fake create parser accepted a second conflicting feature selector'
+fi
+if fake_create_argv --enable kubernetes:1.33; then
+  fail 'the fake create parser accepted a split feature selector'
+fi
+ok 'the fake create surface requires exactly one exact derived Kubernetes feature selector'
+
+printf '== the admitted service range comes from the one ServiceCIDR object ==\n'
+
+service_cidr_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  export DIENE_KUBECTL_BIN="$policy_tools/kubectl"
+  export FAKE_KUBECTL_LOG="$scratch/service-cidr-kubectl.log"
+  diene_observe_admitted_service_cidr "${1-}"
+)
+
+: >"$scratch/service-cidr-kubectl.log"
+[[ $(service_cidr_case 10.143.0.0/16) == 10.143.0.0/16 ]] ||
+  fail 'the exact admitted service range was not read from the ServiceCIDR object'
+grep -Fq -- 'get servicecidrs.networking.k8s.io kubernetes -o json' \
+  "$scratch/service-cidr-kubectl.log" ||
+  fail 'the service range was not read from the named networking.k8s.io ServiceCIDR object'
+expect_refusal InstancePostureUnavailable service_cidr_case ''
+expect_refusal InputContractInvalid service_cidr_case 10.143.0.0/33
+expect_refusal InputContractInvalid service_cidr_case 10.143.0.300/16
+expect_refusal InputContractInvalid service_cidr_case 10.143.0.0
+export FAKE_SERVICE_CIDR_MODE=unavailable
+expect_refusal ServiceCidrObservationUnavailable service_cidr_case 10.143.0.0/16
+unset FAKE_SERVICE_CIDR_MODE
+export FAKE_SERVICE_CIDR_API=networking.k8s.io/v1beta1
+expect_refusal ServiceCidrObservationUnavailable service_cidr_case 10.143.0.0/16
+unset FAKE_SERVICE_CIDR_API
+export FAKE_SERVICE_CIDR_KIND=ServiceCIDRList
+expect_refusal ServiceCidrObservationUnavailable service_cidr_case 10.143.0.0/16
+unset FAKE_SERVICE_CIDR_KIND
+export FAKE_SERVICE_CIDR_NAME=renamed
+expect_refusal ServiceCidrObservationUnavailable service_cidr_case 10.143.0.0/16
+unset FAKE_SERVICE_CIDR_NAME
+for hostile_cidrs in '[]' '["10.143.0.0/16","10.144.0.0/16"]' '["10.143.0.0/16","fd00:143::/108"]' \
+  '["fd00:143::/108"]' '["10.143.0.0/33"]' '["not-a-cidr"]' '[null]'; do
+  export FAKE_SERVICE_CIDRS=$hostile_cidrs
+  expect_refusal ServiceCidrObservationUnavailable service_cidr_case 10.143.0.0/16
+done
+export FAKE_SERVICE_CIDRS='["10.144.0.0/16"]'
+expect_refusal InstancePostureUnavailable service_cidr_case 10.143.0.0/16
+unset FAKE_SERVICE_CIDRS
+ok 'the ServiceCIDR observation fails closed rather than inferring a range'
+
+printf '== orchestration tuple sources and their fail-closed matrix ==\n'
+
+: >"$scratch/env-source-reader-calls"
+tuple_environment_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  # The primary source must execute the kernel socket reader zero times. This
+  # stub records every invocation so that claim is proved by behaviour; it is a
+  # test-side override only and production keeps no such seam. Its log path comes
+  # from the environment because production declares its own `scratch` local that
+  # would otherwise shadow the harness global under `set -u`.
+  export FAKE_ENV_READER_LOG="$scratch/env-source-reader-calls"
+  # shellcheck disable=SC2329
+  diene_orchestration_ss_observation() {
+    printf 'called\n' >>"${FAKE_ENV_READER_LOG:?}"
+    printf '%s\n' 'ESTAB 0 0 10.0.0.2:22 198.51.100.99:5555'
+  }
+  export SSH_CONNECTION="${1-}"
+  diene_observe_orchestration_ssh_tuple
+)
+
+tuple_ss_case() (
+  cd -- "$work"
+  # shellcheck source=/dev/null
+  source ./scripts/ci/environment-lib.sh
+  printf '%s\n' "${1-}" | diene_parse_orchestration_ss_observation
+)
+
+# The primary source now emits one compact JSON object binding the canonical
+# tuple, the measured selected count, and a deterministic digest of the exact
+# admitted one-line value. No artifact is retained because nothing was read.
+env_tuple_observation=$(tuple_environment_case '192.0.2.10 4242 10.0.0.2 22')
+jq -e --arg digest "sha256:$(printf '%s' '192.0.2.10 4242 10.0.0.2 22' | sha256sum | awk '{print $1}')" '
+  .source == "ssh-environment" and
+  .tuple == {clientAddress:"192.0.2.10",clientPort:4242,
+    serverAddress:"10.0.0.2",serverPort:22} and
+  .flowCount == 1 and .observationDigest == $digest and
+  .selectedRow == "192.0.2.10 4242 10.0.0.2 22" and
+  .observationArtifact == null' <<<"$env_tuple_observation" >/dev/null ||
+  fail 'the valid SSH environment tuple was not bound exactly'
+for malformed_tuple in '' ' ' '192.0.2.10 4242 10.0.0.2' '192.0.2.10 4242 10.0.0.2 22 extra' \
+  '2001:db8::1 4242 10.0.0.2 22' '192.0.2.10 4242 fd00::2 22' '192.0.2.10 4242 10.0.0.2 2222' \
+  '192.0.2.10 99999 10.0.0.2 22' '192.0.2.300 4242 10.0.0.2 22' '192.0.2.10 ssh 10.0.0.2 22' \
+  '192.0.2.10 0 10.0.0.2 22' '192.0.2.10 4242 10.0.0.2 022' \
+  '0.0.0.0 4242 10.0.0.2 22' '192.0.2.10 4242 0.0.0.0 22' \
+  $'192.0.2.10 4242 10.0.0.2 22\ninjected 1 2 3' $'192.0.2.10 4242 10.0.0.2 22\n' \
+  $'192.0.2.10 4242 10.0.0.2 22\r' $'192.0.2.10\t4242\t10.0.0.2\t22' \
+  '192.0.2.10  4242 10.0.0.2 22'; do
+  expect_refusal InterimPolicyUnavailable tuple_environment_case "$malformed_tuple"
+done
+# Neither the admitted value nor any refusal above may consult the socket table.
+[[ ! -s $scratch/env-source-reader-calls ]] ||
+  fail 'the SSH environment source executed the kernel socket reader'
+ok 'a present SSH environment value is validated exactly and never falls back'
+
+# The fallback reader must stay bound to the fixed absolute iproute2 path, carry
+# no state filter, and expose no variable or environment seam a hostile guest
+# could redirect. The assertion is scoped structurally to that one function body:
+# diene_preflow_start legitimately probes a single destination with
+# `ss -Htn state established dst <host:port>`, and that unrelated pre-existing
+# flow command must never be conflated with this reader.
+assert_fixed_ss_reader() {
+  local lib=${1:?library path required} body expected_body
+  body=$(awk '/^diene_orchestration_ss_observation/,/^}$/' "$lib")
+  [[ -n $body ]] || return 71
+  # The state filter is checked first so a filtered reader reports that exact
+  # regression: iproute2 omits the State column whenever a filter is supplied,
+  # which would leave the established claim resting on the argument instead of on
+  # an observed value.
+  ! grep -Eq -- '(^|[^[:alnum:]_])state([[:space:]]|$)' <<<"$body" || return 74
+  ! grep -Eq -- 'DIENE_SS|ss_bin' <<<"$body" || return 75
+  grep -Fxq -- '  diene_require_command /sbin/ss' <<<"$body" || return 72
+  grep -Fxq -- '  /sbin/ss -H -n -t -4' <<<"$body" || return 76
+  # Whole-body equality, so no appended argv, extra command, redirection, or
+  # substitution can hide beside the two exact lines above.
+  expected_body=$(printf '%s\n' 'diene_orchestration_ss_observation() {' \
+    '  diene_require_command /sbin/ss' \
+    '  /sbin/ss -H -n -t -4' \
+    '}')
+  [[ $body == "$expected_body" ]] || return 73
+  return 0
+}
+
+production_lib=$template_root/scripts/ci/environment-lib.sh
+ss_reader_rc=0
+assert_fixed_ss_reader "$production_lib" || ss_reader_rc=$?
+[[ $ss_reader_rc == 0 ]] ||
+  fail "the production kernel socket reader is not the fixed unfiltered absolute invocation (code $ss_reader_rc)"
+rg -qF -- 'ss -Htn state established dst' "$production_lib" ||
+  fail 'the unrelated pre-existing flow probe was altered instead of leaving it untouched'
+
+# Negative regression: the tripwire must actually fire on each way the reader
+# could regress. A mutant identical to production would make these vacuous.
+ss_reader_probe=$scratch/ss-reader-probe
+install -d -m 0700 "$ss_reader_probe"
+ss_reader_mutant_case() {
+  local label=${1:?label required} expected=${2:?expected code required} script=${3:?sed script required}
+  local mutant=$ss_reader_probe/$label.sh rc=0
+  sed "$script" "$production_lib" >"$mutant"
+  ! cmp -s "$production_lib" "$mutant" ||
+    fail "the $label reader mutant is byte-identical to production, so its tripwire is vacuous"
+  assert_fixed_ss_reader "$mutant" || rc=$?
+  [[ $rc == "$expected" ]] ||
+    fail "the $label reader mutant returned $rc, expected tripwire code $expected"
+}
+
+ss_reader_mutant_case state-filter 74 's|^  /sbin/ss -H -n -t -4$|  /sbin/ss -H -n -t -4 state established|'
+ss_reader_mutant_case path-relative 76 's|^  /sbin/ss -H -n -t -4$|  ss -H -n -t -4|'
+ss_reader_mutant_case appended-argv 76 's|^  /sbin/ss -H -n -t -4$|  /sbin/ss -H -n -t -4 -p|'
+ss_reader_mutant_case appended-command 73 's|^  /sbin/ss -H -n -t -4$|  /sbin/ss -H -n -t -4\n  /sbin/ss -H -n -t -4 dst 0.0.0.0|'
+# The mutant injects that seam as literal source text, so it must not expand here.
+# shellcheck disable=SC2016
+ss_reader_mutant_case override-seam 75 's|^  diene_require_command /sbin/ss$|  diene_require_command "${DIENE_SS_BIN:-/sbin/ss}"|'
+ss_reader_mutant_case reader-absent 71 's|^diene_orchestration_ss_observation() {$|diene_renamed_socket_reader() {|'
+ok 'the kernel socket reader is the fixed unfiltered absolute /sbin/ss and its tripwire proves each regression'
+
+[[ $(tuple_ss_case 'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242') == '192.0.2.10 4242 10.0.0.2 22 1 ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' ]] ||
+  fail 'one exact established IPv4 port 22 socket did not yield the orchestration tuple'
+[[ $(tuple_ss_case 'ESTAB 0 0 127.0.0.1:6443 127.0.0.1:38122
+ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242
+ESTAB 0 0 10.142.0.5:443 10.142.0.9:51234') == '192.0.2.10 4242 10.0.0.2 22 1 ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' ]] ||
+  fail 'unrelated established sockets were not ignored while deriving the single port 22 flow'
+[[ $(tuple_ss_case 'TIME-WAIT 0 0 10.0.0.2:22 198.51.100.9:5555
+SYN-SENT 0 0 10.0.0.2:22 198.51.100.8:5556
+ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242') == '192.0.2.10 4242 10.0.0.2 22 1 ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' ]] ||
+  fail 'a non-established port 22 socket was counted as an orchestration flow'
+for hostile_observation in '' 'ESTAB 0 0 127.0.0.1:6443 127.0.0.1:38122' \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242
+ESTAB 0 0 10.0.0.2:22 198.51.100.7:5555' \
+  'ESTAB 0 0 [fd00::2]:22 [fd00::1]:4242' \
+  'ESTAB 0 0 0.0.0.0:22 192.0.2.10:4242' \
+  'ESTAB 0 0 10.0.0.2:22 0.0.0.0:4242' \
+  'ESTAB 0 0 *:22 192.0.2.10:4242' \
+  'ESTAB 0 0 10.0.0.2:2222 192.0.2.10:4242' \
+  'ESTAB 0 0 10.0.0.2:ssh 192.0.2.10:4242' \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:99999' \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.300:4242' \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242 users:((sshd,pid=1,fd=3))' \
+  'ESTAB 0 0 10.0.0.2:22' \
+  'ESTABLISHED 0 0 10.0.0.2:22 192.0.2.10:4242' \
+  'SYN-SENT 0 0 10.0.0.2:22 192.0.2.10:4242' \
+  'ESTAB x 0 10.0.0.2:22 192.0.2.10:4242' \
+  'State Recv-Q Send-Q Local Peer'; do
+  expect_refusal InterimPolicyUnavailable tuple_ss_case "$hostile_observation"
+done
+ok 'the numeric kernel socket parser admits exactly one concrete IPv4 port 22 flow'
+
+kernel_ss_policy_case() {
+  local label=${1:?label required} observation=${2:?observation required}
+  local mode=${3:-happy}
+  local state=$scratch/policy-$label-state evidence=$scratch/policy-$label-evidence
+  local tables=$scratch/policy-$label.log
+  local staging=$scratch/policy-$label-staging
+  local calls=$scratch/policy-$label-reader-calls
+  install -d -m 0700 "$state" "$evidence"
+  : >"$tables"
+  : >"$calls"
+  # Hostile staging shapes for the retained-observation artifact. Each one must
+  # refuse before any chain exists rather than degrade to an unretained tuple.
+  case $mode in
+    staging-missing) ;;
+    staging-symlink)
+      install -d -m 0700 "$scratch/policy-$label-target"
+      ln -sfn "$scratch/policy-$label-target" "$staging"
+      ;;
+    staging-unwritable) install -d -m 0500 "$staging" ;;
+    artifact-unsafe)
+      install -d -m 0700 "$staging/orchestration/ss-observation.txt"
+      ;;
+    artifact-target-symlink)
+      # A symlinked artifact path pointing at an existing file outside the tree
+      # must refuse rather than publish through the link.
+      install -d -m 0700 "$staging/orchestration"
+      printf 'ORIGINAL\n' >"$scratch/policy-$label-outside"
+      ln -sfn "$scratch/policy-$label-outside" "$staging/orchestration/ss-observation.txt"
+      ;;
+    observation-dir-symlink)
+      # A symlinked observation directory would place same-session evidence
+      # outside the driver-owned tree while still reporting success.
+      install -d -m 0700 "$staging" "$scratch/policy-$label-escape"
+      ln -sfn "$scratch/policy-$label-escape" "$staging/orchestration"
+      ;;
+    *) install -d -m 0700 "$staging" ;;
+  esac
+  jq -n '{network:{serviceCidrs:["10.143.0.0/16"]}}' >"$evidence/preflight.json"
+  (
+    cd -- "$work"
+    # shellcheck source=/dev/null
+    source ./scripts/ci/environment-lib.sh
+    diene_validate_inputs
+    unset SSH_CONNECTION
+    # Production reads the fixed absolute /sbin/ss and exposes no override. Only
+    # the reader is replaced here so the parser, retention, and policy path can
+    # be driven deterministically; the parser, retention, and every refusal stay
+    # the real ones. The exact production argv is proved separately and
+    # structurally by assert_fixed_ss_reader; this stub proves how many times the
+    # reader is invoked and that production passes it no arguments.
+    # The stub reads its inputs from the environment rather than from the
+    # caller's locals: production declares its own locals around this call, and a
+    # dynamically scoped name would be shadowed by them under `set -u`.
+    export FAKE_SS_OBSERVATION="$observation" FAKE_SS_MODE="$mode"
+    export FAKE_SS_CALL_LOG="$calls"
+    # shellcheck disable=SC2329
+    diene_orchestration_ss_observation() {
+      printf '[%s]\n' "$*" >>"${FAKE_SS_CALL_LOG:?}"
+      [[ ${FAKE_SS_MODE:?} != reader-fail ]] || return 3
+      printf '%s\n' "${FAKE_SS_OBSERVATION?}"
+    }
+    if [[ $mode == staging-relative ]]; then
+      export DIENE_EVIDENCE_STAGING="relative/staging"
+    else
+      export DIENE_EVIDENCE_STAGING="$staging"
+    fi
+    export DIENE_NSC_CLUSTER_ID="cluster-$label"
+    export DIENE_PREFLIGHT_EVIDENCE="$evidence/preflight.json"
+    export DIENE_KUBECTL_BIN="$policy_tools/kubectl" DIENE_IPTABLES_BIN="$policy_tools/iptables4"
+    export DIENE_IP6TABLES_BIN="$policy_tools/iptables6"
+    export DIENE_EGRESS_RESOLVER_BIN="$policy_tools/resolver"
+    export DIENE_IPV6_DISABLE_PATH="$ipv6_disabled_path" FAKE_NODE_POD_CIDRS='["10.142.0.0/16"]'
+    export FAKE_TABLE_STATE="$state" FAKE_TABLE_LOG="$tables"
+    export FAKE_KUBECTL_LOG="$policy_kubectl_log" FAKE_L7_LOG="$policy_l7_log"
+    diene_prepare_egress_contract "$evidence/contract.json"
+    diene_resolve_egress_contract "$evidence/contract.json" "$evidence/resolved.json"
+    diene_apply_interim_policy "$evidence/resolved.json" "$evidence/policy.json" "$evidence/l7.json"
+    diene_remove_interim_policy
+  ) >"$scratch/policy-$label.out" 2>"$scratch/policy-$label.err"
+}
+
+prepare_run 7106
+kernel_ss_policy_case kernel-ss 'ESTAB 0 0 127.0.0.1:6443 127.0.0.1:38122
+ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' || {
+  sed -n '1,160p' "$scratch/policy-kernel-ss.err" >&2
+  fail 'the kernel socket orchestration source refused a valid single observation'
+}
+jq -e '.orchestrationException == "exact-ssh-4-tuple" and
+  .orchestrationTupleSource == "kernel-ss" and .applied == true' \
+  "$scratch/policy-kernel-ss-evidence/policy.json" >/dev/null ||
+  fail 'the kernel socket transcript lost the exact tuple claim or its recorded source'
+
+# The literal reader ran exactly once, with no arguments, and was not consulted a
+# second time for the parse: one observation backs both the rules and the proof.
+[[ $(wc -l <"$scratch/policy-kernel-ss-reader-calls") == 1 ]] ||
+  fail 'the kernel socket reader was not executed exactly once per policy activation'
+[[ $(cat "$scratch/policy-kernel-ss-reader-calls") == '[]' ]] ||
+  fail 'production passed arguments to the fixed kernel socket reader'
+
+# The retained artifact is a regular mode-0600 file holding the exact observed
+# bytes, and the transcript binds its stable relative name and true digest.
+kernel_ss_artifact=$scratch/policy-kernel-ss-staging/orchestration/ss-observation.txt
+[[ -f $kernel_ss_artifact && ! -L $kernel_ss_artifact ]] ||
+  fail 'the same-session socket observation was not retained as a regular artifact'
+[[ $(stat -c %a -- "$kernel_ss_artifact") == 600 ]] ||
+  fail 'the retained socket observation is not mode 0600'
+[[ $(cat "$kernel_ss_artifact") == 'ESTAB 0 0 127.0.0.1:6443 127.0.0.1:38122
+ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' ]] ||
+  fail 'the retained socket observation is not the exact observed bytes'
+[[ -z $(find "$scratch/policy-kernel-ss-staging/orchestration" -name '*.tmp.*' -print -quit) ]] ||
+  fail 'the retention left a temporary observation file behind'
+kernel_ss_artifact_digest="sha256:$(sha256sum -- "$kernel_ss_artifact" | awk '{print $1}')"
+jq -e --arg digest "$kernel_ss_artifact_digest" '
+  .orchestrationTuple == {clientAddress:"192.0.2.10",clientPort:4242,
+    serverAddress:"10.0.0.2",serverPort:22} and
+  .orchestrationFlowCount == 1 and
+  .orchestrationSelectedRow == "ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242" and
+  .orchestrationObservationDigest == $digest and
+  .orchestrationObservationArtifact == "orchestration/ss-observation.txt"' \
+  "$scratch/policy-kernel-ss-evidence/policy.json" >/dev/null ||
+  fail 'the kernel-ss transcript did not bind the retained artifact name, digest, tuple, count, and selected row'
+# The bound selected row must be a real, unique line of the retained artifact, so
+# a reviewer can point at the exact observed flow without re-running the parser.
+kernel_ss_selected_row=$(jq -r '.orchestrationSelectedRow' \
+  "$scratch/policy-kernel-ss-evidence/policy.json")
+[[ $(grep -Fxc -- "$kernel_ss_selected_row" "$kernel_ss_artifact") == 1 ]] ||
+  fail 'the bound selected row is not exactly one line of the retained observation'
+grep -Fxq -- "$kernel_ss_selected_row" "$kernel_ss_artifact" ||
+  fail 'the bound selected row does not appear verbatim in the retained observation'
+# The bound tuple must be the tuple the rules actually used, recomputed from the
+# retained bytes rather than taken on trust from the transcript.
+[[ $(tuple_ss_case "$(cat "$kernel_ss_artifact")") == '192.0.2.10 4242 10.0.0.2 22 1 ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' ]] ||
+  fail 'reparsing the retained bytes does not reproduce the bound orchestration tuple'
+grep -Eq -- '-p tcp -s 10\.0\.0\.2 -d 192\.0\.2\.10 --sport 22 --dport 4242 -m conntrack --ctstate ESTABLISHED -j ACCEPT' \
+  "$scratch/policy-kernel-ss.log" ||
+  fail 'the kernel socket source did not yield the identical exact four-value SSH rule'
+! grep -Fq -- 'ESTABLISHED,RELATED' "$scratch/policy-kernel-ss.log" ||
+  fail 'the kernel socket source installed a blanket established-flow exemption'
+if grep -Eq -- '0\.0\.0\.0/0|::/0|-d 10\.0\.0\.0/30|--ctstate RELATED|-d 10\.0\.0\.1( |$)' \
+  "$scratch/policy-kernel-ss.log"; then
+  fail 'the kernel socket source allowed a route, gateway, subnet, or related-flow class'
+fi
+assert_policy_state_absent "$scratch/policy-kernel-ss-state" kernel-ss
+
+prepare_run 7107
+if kernel_ss_policy_case kernel-ss-zero 'ESTAB 0 0 127.0.0.1:6443 127.0.0.1:38122'; then
+  fail 'a kernel socket table without an established port 22 flow activated policy'
+fi
+grep -Fq -- InterimPolicyUnavailable "$scratch/policy-kernel-ss-zero.err" ||
+  fail 'the degenerate kernel socket observation lost its stable refusal'
+[[ ! -e $scratch/policy-kernel-ss-zero-evidence/policy.json ]] ||
+  fail 'a refused tuple observation still emitted a policy transcript'
+assert_policy_state_absent "$scratch/policy-kernel-ss-zero-state" kernel-ss-zero
+ok 'both orchestration tuple sources yield the same exact rule and refuse before any mutation'
+
+# Every way the same-session retention can fail must refuse before any chain,
+# hook, or transcript exists, rather than fall back to an unretained tuple.
+kernel_ss_refusal_case() {
+  local label=${1:?label required} mode=${2:?mode required}
+  local observation=${3:-'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242'}
+  prepare_run "$4"
+  if kernel_ss_policy_case "$label" "$observation" "$mode"; then
+    fail "the $mode kernel socket observation activated policy"
+  fi
+  grep -Fq -- InterimPolicyUnavailable "$scratch/policy-$label.err" ||
+    fail "the $mode observation lost its stable InterimPolicyUnavailable refusal"
+  [[ ! -e $scratch/policy-$label-evidence/policy.json ]] ||
+    fail "the $mode observation still emitted a policy transcript"
+  assert_policy_state_absent "$scratch/policy-$label-state" "$label"
+}
+
+kernel_ss_refusal_case kernel-ss-reader-fail reader-fail \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' 7140
+kernel_ss_refusal_case kernel-ss-staging-missing staging-missing \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' 7141
+kernel_ss_refusal_case kernel-ss-staging-relative staging-relative \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' 7142
+kernel_ss_refusal_case kernel-ss-staging-symlink staging-symlink \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' 7143
+kernel_ss_refusal_case kernel-ss-staging-unwritable staging-unwritable \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' 7144
+kernel_ss_refusal_case kernel-ss-artifact-unsafe artifact-unsafe \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' 7145
+kernel_ss_refusal_case kernel-ss-dir-symlink observation-dir-symlink \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' 7148
+# The refusal must also mean nothing was written through the symlink.
+[[ -z $(find "$scratch/policy-kernel-ss-dir-symlink-escape" -type f -print -quit 2>/dev/null) ]] ||
+  fail 'a symlinked observation directory let same-session evidence escape the driver-owned tree'
+kernel_ss_refusal_case kernel-ss-target-symlink artifact-target-symlink \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' 7149
+[[ $(cat "$scratch/policy-kernel-ss-target-symlink-outside") == ORIGINAL ]] ||
+  fail 'a symlinked observation target let the retention publish through the link'
+kernel_ss_refusal_case kernel-ss-multiple multiple \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242
+ESTAB 0 0 10.0.0.2:22 198.51.100.7:5555' 7146
+kernel_ss_refusal_case kernel-ss-malformed malformed \
+  'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242 users:((sshd,pid=1,fd=3))' 7147
+# A refused observation must not leave a half-written or world-readable artifact.
+for refused_label in kernel-ss-reader-fail kernel-ss-multiple kernel-ss-malformed \
+  kernel-ss-artifact-unsafe kernel-ss-target-symlink; do
+  refused_artifact=$scratch/policy-$refused_label-staging/orchestration
+  if [[ -d $refused_artifact ]]; then
+    [[ -z $(find "$refused_artifact" -name '*.tmp.*' -print -quit) ]] ||
+      fail "the refused $refused_label observation left a temporary artifact behind"
+    while IFS= read -r retained; do
+      [[ $(stat -c %a -- "$retained") == 600 ]] ||
+        fail "the refused $refused_label observation left a non-0600 artifact"
+    done < <(find "$refused_artifact" -type f)
+  fi
+done
+chmod -R u+rwX "$scratch/policy-kernel-ss-staging-unwritable-staging" 2>/dev/null || true
+ok 'observation, staging, retention, and parse failures all refuse before any policy artifact exists'
+
+printf '== the fixed remote command refuses an absent guest nix ==\n'
+
+nix_guard_probe=$scratch/nix-guard-probe.sh
+{
+  printf '%s\n' '#!/usr/bin/env bash' 'set -eu'
+  printf '%s\n' "$guest_nix_guard"
+  printf '%s\n' 'printf "GuestNixToolchainPresent\n"'
+} >"$nix_guard_probe"
+chmod 0755 "$nix_guard_probe"
+nix_guard_bin=$scratch/nix-guard-bin
+install -d -m 0700 "$nix_guard_bin"
+nix_guard_rc=0
+env -i "PATH=$nix_guard_bin" "$BASH" "$nix_guard_probe" \
+  >"$scratch/nix-guard-absent.out" 2>"$scratch/nix-guard-absent.err" || nix_guard_rc=$?
+[[ $nix_guard_rc == 64 ]] ||
+  fail "the fixed guest nix guard did not refuse an absent toolchain with the stable reason exit (got $nix_guard_rc)"
+grep -Fq -- 'GuestNixToolchainAbsent:' "$scratch/nix-guard-absent.err" ||
+  fail 'the absent guest toolchain produced no stable GuestNixToolchainAbsent diagnostic'
+[[ ! -s $scratch/nix-guard-absent.out ]] ||
+  fail 'the refused guest entry still produced driver output'
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$nix_guard_bin/nix"
+chmod 0755 "$nix_guard_bin/nix"
+env -i "PATH=$nix_guard_bin" "$BASH" "$nix_guard_probe" \
+  >"$scratch/nix-guard-present.out" 2>"$scratch/nix-guard-present.err" ||
+  fail 'the guest nix guard refused an instance that does provide nix'
+grep -Fxq -- GuestNixToolchainPresent "$scratch/nix-guard-present.out" ||
+  fail 'the guest nix guard did not fall through to the driver entry'
+# The harness itself carries these tokens inside this very pattern, so only the
+# production driver rail is scanned for an ambient bootstrap.
+if rg -n --glob '!test-*.sh' \
+  'curl[^|]*\|[[:space:]]*(sh|bash)|nix-installer|install\.determinate\.systems|nixos\.org/nix/install' \
+  "$template_root/scripts/ci" >"$scratch/guest-nix-bootstrap"; then
+  sed -n '1,120p' "$scratch/guest-nix-bootstrap" >&2
+  fail 'the driver rail attempts an ambient guest Nix bootstrap'
+fi
+nix_guard_binding_root=$scratch/nix-guard-binding
+install -d -m 0700 "$nix_guard_binding_root/instances/cluster-0000000000000000/fs"
+: >"$nix_guard_binding_root/instances/cluster-0000000000000000/live"
+nix_guard_binding_rc=0
+FAKE_NSC_ROOT=$nix_guard_binding_root FAKE_NSC_LOG=$nix_guard_binding_root/log \
+  FAKE_GUEST_NIX_GUARD=$guest_nix_guard FAKE_GUEST_BIN=$fake_guest \
+  "$fake_nsc" ssh cluster-0000000000000000 -T \
+  'set -eu; sha256sum -c archive-validator.sha256; ./archive-validator.sh source.tar source; exec nix develop' \
+  >/dev/null 2>&1 || nix_guard_binding_rc=$?
+[[ $nix_guard_binding_rc == 69 ]] ||
+  fail 'the fake ssh leg does not bind the fixed guest nix guard to production text'
+ok 'the fixed remote command emits a stable GuestNixToolchainAbsent red and bootstraps nothing'
 
 printf '== resolver, hostile probe, and vendor broker fail closed ==\n'
 
@@ -3231,12 +3872,15 @@ direct_fake_preflight() {
   done
   [[ -n $output ]] || return 127
   printf 'preflight %s\n' "$DIENE_LANE" >>"${FAKE_DRIVER_EVENT_LOG:?}"
-  jq -n --arg cluster "$DIENE_NSC_CLUSTER_ID" '
+  # Even this controlled unit stub may not invent a runtime version or service
+  # range; both come from the admitted inputs under test.
+  jq -n --arg cluster "$DIENE_NSC_CLUSTER_ID" --arg k3s "${DIENE_ADMITTED_K3S_VERSION:?}" \
+    --arg serviceCidr "${DIENE_K3S_SERVICE_CIDR:?}" '
     {outcome:"Pass",reasonCode:"NamespaceWolfiBuiltInK3sReady",clusterId:$cluster,
      identitySource:"controlled-direct-driver-unit-input",os:{id:"wolfi",version:"rolling",uid:0},
-     k3s:{version:"v1.33.1+k3s1",kubernetesVersion:"v1.33.1+k3s1",nodeCount:1,
+     k3s:{version:$k3s,kubernetesVersion:$k3s,nodeCount:1,
        capacity:{cpu:"16",memory:"32Gi"}},
-     network:{podCidrs:["10.142.0.0/16","fd00:142::/64"],serviceCidrs:["10.143.0.0/16"],
+     network:{podCidrs:["10.142.0.0/16","fd00:142::/64"],serviceCidrs:[$serviceCidr],
        ipv6Disabled:false,namespaceIngress:false,publicBinding:false},
      storage:{defaultClass:"local-path"},
      policyBackend:{mechanism:"iptables",backend:"nf_tables",version:"iptables v1.8.13 (nf_tables)"},

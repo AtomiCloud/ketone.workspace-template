@@ -114,7 +114,10 @@ validate protected trust, immutable subject, closure, declarations and fixtures
   -> require exact nsc v0.0.532 plus release-artifact and executable digests
   -> reject unsafe source names, links, hardlinks, FIFOs, devices and special entries
   -> materialize the exact egress contract
-  -> nsc create --ephemeral --duration 2h --wait_kube_system
+  -> derive the admitted full k3s version and its single Kubernetes feature
+     selector from one helper, refusing malformed or unsupported admission
+  -> nsc create --ephemeral --duration 2h --enable=kubernetes:1.33
+       --wait_kube_system
        --cidfile <file> --output_json_to <file> --output json
   -> require cidfile == create metadata .cluster_id
   -> bind that exact cluster_id to the run/attempt receipt
@@ -160,8 +163,16 @@ Preflight must prove all of the following before application mutation:
 - UID 0 on Wolfi;
 - iptables 1.8.x on the `nf_tables` backend (the standalone `nft` program is
   not required);
-- admitted k3s `v1.33.1+k3s1`, one Ready node, observed pod CIDR, admitted
-  `10.143.0.0/16` service CIDR, and recorded CPU/memory capacity;
+- the admitted full runtime version, checked independently twice: `k3s
+  --version` and the Kubernetes server `gitVersion` must both equal
+  `v1.33.1+k3s1`. The create selector `--enable=kubernetes:1.33` is derived from
+  that same admitted value, so a platform-default minor cannot pass;
+- one Ready node, observed pod CIDR, and recorded CPU/memory capacity;
+- the admitted `10.143.0.0/16` service CIDR, read from the one
+  `networking.k8s.io/v1` `ServiceCIDR` object named `kubernetes`. Namespace
+  exposes neither k3s argv nor a k3s config file on the measured instance, and a
+  single ClusterIP or route cannot establish a range, so an unobservable object
+  is a precise red rather than an inferred value;
 - exactly one default StorageClass named `local-path`; and
 - no Ingress, Gateway, LoadBalancer Service, external IP, wildcard/LAN/public
   bind, or Namespace-generated application endpoint.
@@ -195,7 +206,44 @@ Every run:
 2. freezes declared DNS to literal addresses before policy activation;
 3. hooks receipt-scoped host `OUTPUT` and pod `FORWARD` chains;
 4. preserves only loopback/local cluster routes and the exact active SSH
-   return 4-tuple, never a blanket `ESTABLISHED,RELATED` exception;
+   return 4-tuple, never a blanket `ESTABLISHED,RELATED` exception. That tuple
+   comes from `SSH_CONNECTION` whenever the variable is set at all. It is then
+   the only source: it must be exactly one line of four space-separated numeric
+   fields whose client and server are concrete non-wildcard IPv4 addresses,
+   whose client port is in range, and whose server port is exactly 22. An empty,
+   malformed, wrong-port, or multi-line value refuses and never falls back.
+   Only when the variable is completely unset may `/sbin/ss` be read
+   numerically, and only a single ESTABLISHED IPv4 TCP socket with a
+   concrete local port 22 is admitted; zero, multiple, IPv6, wildcard, or
+   wrong-port observations refuse before any chain exists. That read carries no
+   `state` filter on purpose, because iproute2 omits the State column whenever
+   one is supplied, which would rest the established claim on the argument
+   rather than on an observed value.
+
+   On that fallback the literal `/sbin/ss -H -n -t -4` runs **exactly once**
+   and its exact stdout is atomically retained as a regular mode-0600
+   `orchestration/ss-observation.txt` inside the run's evidence staging tree.
+   The parser consumes those retained bytes, so the flow written into the rules
+   and the bytes kept in the proof bundle are one observation rather than two
+   reads of a table that can change between them. Observation, create, write,
+   rename, mode, hash, or bind failure refuses before any chain exists.
+
+   The policy transcript records `orchestrationTupleSource` as
+   `ssh-environment` or `kernel-ss` alongside the unchanged
+   `orchestrationException: exact-ssh-4-tuple` claim, and binds the observation
+   so it is independently checkable rather than merely asserted:
+   `orchestrationTuple` (the canonical selected client/server address and port),
+   `orchestrationFlowCount` (the measured selected-flow count, exactly one),
+   `orchestrationSelectedRow` (the exact observed line the tuple was derived
+   from), `orchestrationObservationDigest`, and
+   `orchestrationObservationArtifact` — the retained artifact's stable relative
+   name for `kernel-ss`, or `null` for `ssh-environment`, where the admitted
+   one-line value is itself the whole observation and its digest is the binding.
+   A reader can therefore recompute the digest from the proof bundle, find the
+   selected row verbatim in the retained bytes, and confirm the exact tuple the
+   rules used without re-running the parser. The observation directory must be a
+   real driver-owned directory: a symlinked component refuses rather than
+   writing same-session evidence outside the tree;
 5. rejects metadata and undeclared egress, including a flow opened before the
    policy transition;
 6. proves hostile metadata/arbitrary HTTPS probes on the host and in an actual

@@ -20,7 +20,7 @@ while (($#)); do
   esac
 done
 
-for command in jq stat id ip ps awk sed grep; do
+for command in jq stat id ip awk sed grep; do
   diene_require_command "$command"
 done
 kubectl_bin=${DIENE_KUBECTL_BIN:-kubectl}
@@ -60,12 +60,15 @@ if [[ $ipv6_disabled != 1 ]]; then
     diene_die InstancePostureUnavailable 'ip6tables is not the measured nf_tables backend'
 fi
 
-k3s_version=$(k3s --version | awk '/^k3s version / {print $3; exit}')
-[[ -n $k3s_version && $k3s_version == "${DIENE_ADMITTED_K3S_VERSION:-}" ]] ||
-  diene_die InstancePostureUnavailable \
-    "built-in k3s $k3s_version does not match admitted ${DIENE_ADMITTED_K3S_VERSION:-missing}"
+k3s_version=$(k3s --version | awk '/^k3s version / {print $3; exit}') ||
+  diene_die InstancePostureUnavailable 'the built-in k3s version is unavailable'
 kubernetes_version=$($kubectl_bin version -o json | jq -er '.serverVersion.gitVersion') ||
   diene_die InstancePostureUnavailable 'Kubernetes server version is unavailable'
+# Both observations must equal the same admitted full version before any policy
+# or application mutation. The k3s binary is not authority for the served
+# control plane, so a split runtime is a refusal, not a warning.
+diene_require_admitted_k3s_runtime "${DIENE_ADMITTED_K3S_VERSION:-}" \
+  "$k3s_version" "$kubernetes_version"
 
 nodes=$($kubectl_bin get nodes -o json)
 jq -e '
@@ -79,29 +82,12 @@ cpu=$(jq -er '.items[0].status.capacity.cpu' <<<"$nodes")
 memory=$(jq -er '.items[0].status.capacity.memory' <<<"$nodes")
 pod_cidrs=$(jq -c '[.items[0].spec.podCIDRs[]?] | if length == 0 then [.items[0].spec.podCIDR] else . end' <<<"$nodes")
 
-# Namespace currently starts k3s with an explicit service CIDR. Parse that
-# observed process/config value and require it to equal the compatibility-lock
-# admission copied by the orchestrator; never infer a service range merely
-# from a single ClusterIP.
-service_cidr=
-while IFS= read -r command_line; do
-  if [[ $command_line =~ --service-cidr=([^[:space:]]+) ]]; then
-    service_cidr=${BASH_REMATCH[1]}
-    break
-  fi
-  if [[ $command_line =~ --service-cidr[[:space:]]+([^[:space:]]+) ]]; then
-    service_cidr=${BASH_REMATCH[1]}
-    break
-  fi
-done < <(ps -eo args=)
-if [[ -z $service_cidr && -r /etc/rancher/k3s/config.yaml ]]; then
-  service_cidr=$(awk -F: '$1 ~ /^[[:space:]]*service-cidr[[:space:]]*$/ {
-    sub(/^[[:space:]]+/, "", $2); gsub(/"/, "", $2); gsub(/\047/, "", $2); print $2; exit
-  }' /etc/rancher/k3s/config.yaml)
-fi
-[[ -n $service_cidr && $service_cidr == "${DIENE_K3S_SERVICE_CIDR:-}" ]] ||
-  diene_die InstancePostureUnavailable \
-    "observed service CIDR ${service_cidr:-missing} does not match admitted ${DIENE_K3S_SERVICE_CIDR:-missing}"
+# The admitted service range is read from the one API object the apiserver
+# derives from --service-cluster-ip-range. Namespace does not expose k3s argv or
+# a k3s config file on the measured instance, and a single ClusterIP or a route
+# cannot establish a range, so an unobservable object is a precise red instead
+# of an inferred value.
+service_cidr=$(diene_observe_admitted_service_cidr "${DIENE_K3S_SERVICE_CIDR:-}")
 service_cidrs=$(jq -cn --arg cidr "$service_cidr" '[$cidr]')
 
 storage=$($kubectl_bin get storageclass -o json)

@@ -594,7 +594,16 @@ orchestrate() {
   trap 'orchestrator_on_signal 143' TERM HUP
   trap 'orchestrator_on_signal 130' INT
 
-  local -a create=("$nsc_bin" create --ephemeral --duration 2h --wait_kube_system \
+  # One admission computed once. The create feature selector and the version
+  # admitted to the guest are derived from the same validated value, so the
+  # platform default can no longer silently supply a different minor.
+  local k3s_admission admitted_k3s k3s_feature
+  k3s_admission=$(diene_k3s_admission)
+  admitted_k3s=${k3s_admission%% *}
+  k3s_feature=${k3s_admission##* }
+
+  local -a create=("$nsc_bin" create --ephemeral --duration 2h "--enable=$k3s_feature" \
+    --wait_kube_system \
     --cidfile "$ORCH_STATE/cluster.cid" --output_json_to "$ORCH_STATE/create.json" --output json \
     --purpose "diene-ci-k3d/v1 $DIENE_LANE" --unique_tag "$ORCH_RECEIPT_ID" \
     --label "diene_receipt=$ORCH_RECEIPT_ID" --label "diene_run=$GITHUB_RUN_ID" \
@@ -638,7 +647,7 @@ orchestrate() {
     --arg contractDigest "$contract_digest" --arg canaryImage "$DIENE_EGRESS_CANARY_IMAGE" \
     --arg l7 "${DIENE_EGRESS_L7_ENFORCER_BIN:-}" --arg probe "${DIENE_EGRESS_PROBE_BIN:-}" \
     --arg vendorBroker "${DIENE_VENDOR_CREDENTIAL_BROKER_BIN:-}" \
-    --arg k3s "${DIENE_ADMITTED_K3S_VERSION:-v1.33.1+k3s1}" \
+    --arg k3s "$admitted_k3s" \
     --arg serviceCidr "${DIENE_K3S_SERVICE_CIDR:-10.143.0.0/16}" \
     --arg venue "${DIENE_ORCHESTRATOR_VENUE:-namespace}" \
     --arg label "${DIENE_ORCHESTRATOR_LABEL:-nscloud-ubuntu-26.04-amd64-16x32}" \
@@ -692,7 +701,7 @@ orchestrate() {
   local remote_command ssh_started ssh_rc=0
   # The command is intentionally expanded only by the remote shell.
   # shellcheck disable=SC2016
-  remote_command='set -eu; umask 077; test "$(id -u)" = 0; install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out; cd /run/diene-ci; sha256sum -c archive-validator.sha256; chmod 0500 archive-validator.sh; ./archive-validator.sh source.tar source; install -m 0600 receipt.json receipts/exact.json; cd source; command -v nix >/dev/null; exec nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci'
+  remote_command='set -eu; umask 077; test "$(id -u)" = 0; install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out; cd /run/diene-ci; sha256sum -c archive-validator.sha256; chmod 0500 archive-validator.sh; ./archive-validator.sh source.tar source; install -m 0600 receipt.json receipts/exact.json; cd source; command -v nix >/dev/null 2>&1 || { printf "GuestNixToolchainAbsent: %s\n" "the instance provides no nix command for the driver entry" >&2; exit 64; }; exec nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci'
   ssh_started=$SECONDS
   "$nsc_bin" ssh "$ORCH_CLUSTER_ID" -T "$remote_command" \
     >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || ssh_rc=$?
