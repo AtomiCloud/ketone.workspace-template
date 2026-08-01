@@ -11,7 +11,7 @@ permissions: {}
 jobs:
   authorize-vendor:
     name: Authorize vendor action
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
@@ -44,9 +44,10 @@ jobs:
           test "$WORKFLOW_SHA" = "$SOURCE_SHA"
           base_workflow_ref="${WORKFLOW_REF%@*}@$SOURCE_SHA"
 
-          # The runner pin and the exact declared action are proven before any
-          # disposable self-hosted runner can be selected.
-          DIENE_VENDOR_MANIFEST=.diene/ci/vendors.v1.yaml DIENE_ACTION_ID="$ACTION_ID" \
+          # The exact declaration and production fixtures are proven before
+          # the reusable workflow can invoke nsc create.
+          DIENE_LANE=ditto-vendor DIENE_NSC_DURATION=2h \
+            DIENE_VENDOR_MANIFEST=.diene/ci/vendors.v1.yaml DIENE_ACTION_ID="$ACTION_ID" \
             nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-prerequisites
 
           printf 'source_sha=%s\nbase_workflow_ref=%s\n' "$SOURCE_SHA" "$base_workflow_ref" >>"$GITHUB_OUTPUT"
@@ -56,7 +57,7 @@ jobs:
   artifact-build:
     name: Artifact Build
     needs: authorize-vendor
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -98,7 +99,7 @@ jobs:
   environment-profile-contract:
     name: Environment Profile Contract
     needs: [authorize-vendor, artifact-build]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     concurrency:
       group: profile-${{ fromJSON(github.repository_id) }}-${{ needs.authorize-vendor.outputs.source_sha }}

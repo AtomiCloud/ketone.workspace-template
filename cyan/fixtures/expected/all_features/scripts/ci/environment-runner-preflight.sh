@@ -1,76 +1,149 @@
 #!/usr/bin/env bash
-# Runner posture gate. It binds the signed lease to this exact job — not just
-# to the run — so one lane can never execute against a lease minted for a
-# sibling lane of the same workflow run.
+# In-guest Namespace posture proof. The orchestrator has already bound the
+# exact cidfile/metadata cluster_id before this script runs over that same
+# exact-id SSH channel. This script proves the measured Wolfi/root,
+# single-node built-in-k3s, storage, network and iptables-nft facts before any
+# application or vendor mutation.
 set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 source "$script_dir/environment-lib.sh"
 
-diene_require_command jq
-diene_require_command stat
+output=${DIENE_PREFLIGHT_EVIDENCE:-${RUNNER_TEMP:-/tmp}/diene-runner-preflight.json}
+while (($#)); do
+  case $1 in
+    --output)
+      output=${2:?preflight output required}
+      shift 2
+      ;;
+    *) diene_die InputContractInvalid "unknown runner-preflight argument $1" ;;
+  esac
+done
 
-# Bootstrap exports the job-visible projection of the signed lease. That
-# projection is exactly mode 0440 at the .public.json path; the private lease
-# is never readable from a job, so accepting 0400/0600 here would refuse every
-# real job.
-lease=${DIENE_RUNNER_LEASE_FILE:-/run/diene-runner-lease.v1.public.json}
-[[ -f $lease ]] || diene_die RunnerIsolationUnavailable 'signed runner lease projection is absent'
-mode=$(stat -c %a "$lease")
-[[ $mode == 440 ]] ||
-  diene_die RunnerIsolationUnavailable "lease projection mode is $mode, expected the 0440 job-visible projection"
+for command in jq stat id ip ps awk sed grep; do
+  diene_require_command "$command"
+done
+kubectl_bin=${DIENE_KUBECTL_BIN:-kubectl}
+iptables_bin=${DIENE_IPTABLES_BIN:-/sbin/iptables}
+ip6tables_bin=${DIENE_IP6TABLES_BIN:-/sbin/ip6tables}
+diene_require_command "$kubectl_bin"
+diene_require_command "$iptables_bin"
+diene_require_command k3s
 
-# The deterministic job label is part of the trust tuple. Runtime labels are
-# the fixed four image labels plus exactly one job label.
-expected_job=${DIENE_EXPECTED_JOB_ID:-}
-[[ -n $expected_job ]] || diene_die RunnerIsolationUnavailable 'expected job identity is not declared'
-expected_label="diene-job-r${GITHUB_REPOSITORY_ID:-}-w${GITHUB_RUN_ID:-}-a${GITHUB_RUN_ATTEMPT:-}-j${expected_job}"
+[[ $(id -u) == 0 ]] ||
+  diene_die InstancePostureUnavailable 'Namespace Wolfi driver must run as root'
+diene_require_safe_id cluster_id "${DIENE_NSC_CLUSTER_ID:-}"
+[[ ${DIENE_CACHE_ATTACHED:-false} =~ ^(true|false)$ ]] ||
+  diene_die InstancePostureUnavailable 'cache attachment evidence is invalid'
+case ${DIENE_LANE:?} in
+  absol | fleet-independence)
+    [[ $DIENE_CACHE_ATTACHED == false ]] ||
+      diene_die InstancePostureUnavailable "$DIENE_LANE must not attach a shared cache"
+    ;;
+esac
 
-jq -e \
-  --arg repositoryId "${GITHUB_REPOSITORY_ID:-}" \
-  --arg repositoryKey "${GITHUB_REPOSITORY:-}" \
-  --arg runId "${GITHUB_RUN_ID:-}" \
-  --arg runAttempt "${GITHUB_RUN_ATTEMPT:-}" \
-  --arg sourceSha "${GITHUB_SHA:-}" \
-  --arg jobLabel "$expected_label" '
-  .apiVersion == "diene.atomi.cloud/ci-runner-lease/v1" and
-  (.repositoryId | tostring) == $repositoryId and .repositoryKey == $repositoryKey and
-  (.runId | tostring) == $runId and (.runAttempt | tostring) == $runAttempt and
-  .sourceSha == $sourceSha and .state == "Online" and
-  (.labels | length == 5) and
-  (.labels | index("diene-k3d-isolated-v1") != null) and
-  (.labels | index($jobLabel) != null) and
-  ([.labels[] | select(startswith("diene-job-"))] | length == 1)
-' "$lease" >/dev/null || diene_die RunnerIsolationUnavailable 'runner lease tuple or job label mismatch'
+[[ -r /etc/os-release ]] || diene_die InstancePostureUnavailable '/etc/os-release is absent'
+# shellcheck disable=SC1091
+source /etc/os-release
+[[ ${ID:-} == wolfi ]] || diene_die InstancePostureUnavailable "instance OS is ${ID:-unknown}, expected wolfi"
+os_version=${VERSION_ID:-rolling}
 
-if [[ ${DIENE_PREFLIGHT_HOST_CHECKS:-1} == 1 ]]; then
-  for command in uname nproc awk df docker nft unshare; do
-    diene_require_command "$command"
-  done
-  [[ $(uname -s) == Linux ]] || diene_die RunnerIsolationUnavailable 'Linux required'
-  [[ $(uname -r) == 6.8* ]] || diene_die RunnerIsolationUnavailable 'Linux 6.8 required'
-  [[ $(stat -fc %T /sys/fs/cgroup) == cgroup2fs ]] || diene_die RunnerIsolationUnavailable 'cgroup v2 required'
-  (($(nproc) >= 8)) || diene_die RunnerIsolationUnavailable '8 vCPU required'
-  (($(awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo) >= 30)) ||
-    diene_die RunnerIsolationUnavailable '32 GiB class memory required'
-  (($(df --output=avail -B1 "${RUNNER_TEMP:?}" | tail -n 1) >= 100 * 1024 * 1024 * 1024)) ||
-    diene_die RunnerIsolationUnavailable '100 GiB free disk required'
-  [[ $(docker version --format '{{.Server.Version}}') == 28.3.3 ]] ||
-    diene_die RunnerIsolationUnavailable 'Docker pin mismatch'
-  [[ -z $(docker ps -aq) && -z $(docker volume ls -q) ]] ||
-    diene_die RunnerIsolationUnavailable 'Docker state is not empty'
-  # The job identity holds CAP_NET_ADMIN and is explicitly denied
-  # CAP_SYS_ADMIN. Prove both directions: network administration must work, and
-  # the namespace-creating capabilities must NOT. Requiring `unshare` to
-  # succeed would demand CAP_SYS_ADMIN and so contradict the isolation model.
-  nft list ruleset >/dev/null ||
-    diene_die RunnerIsolationUnavailable 'job identity lacks CAP_NET_ADMIN for host policy'
-  if unshare --net true 2>/dev/null; then
-    diene_die RunnerIsolationUnavailable 'job identity holds CAP_SYS_ADMIN; isolation is not enforced'
-  fi
-  if command -v nsenter >/dev/null 2>&1 && nsenter --net=/proc/1/ns/net true 2>/dev/null; then
-    diene_die RunnerIsolationUnavailable 'job identity can enter another namespace; isolation is not enforced'
-  fi
+iptables_version=$($iptables_bin --version)
+[[ $iptables_version == *nf_tables* ]] ||
+  diene_die InstancePostureUnavailable 'iptables is not the measured nf_tables backend'
+ipv6_disabled=0
+[[ ! -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] ||
+  read -r ipv6_disabled </proc/sys/net/ipv6/conf/all/disable_ipv6
+if [[ $ipv6_disabled != 1 ]]; then
+  diene_require_command "$ip6tables_bin"
+  [[ $($ip6tables_bin --version) == *nf_tables* ]] ||
+    diene_die InstancePostureUnavailable 'ip6tables is not the measured nf_tables backend'
 fi
 
-printf 'RunnerProvisionerReady\n'
+k3s_version=$(k3s --version | awk '/^k3s version / {print $3; exit}')
+[[ -n $k3s_version && $k3s_version == "${DIENE_ADMITTED_K3S_VERSION:-}" ]] ||
+  diene_die InstancePostureUnavailable \
+    "built-in k3s $k3s_version does not match admitted ${DIENE_ADMITTED_K3S_VERSION:-missing}"
+kubernetes_version=$($kubectl_bin version -o json | jq -er '.serverVersion.gitVersion') ||
+  diene_die InstancePostureUnavailable 'Kubernetes server version is unavailable'
+
+nodes=$($kubectl_bin get nodes -o json)
+jq -e '
+  (.items | length) == 1 and
+  (.items[0].status.conditions | any(.type == "Ready" and .status == "True")) and
+  (.items[0].spec.podCIDR | type == "string" and length > 0)
+' <<<"$nodes" >/dev/null ||
+  diene_die InstancePostureUnavailable 'built-in k3s is not one Ready node with an observed pod CIDR'
+node_count=$(jq -r '.items | length' <<<"$nodes")
+cpu=$(jq -er '.items[0].status.capacity.cpu' <<<"$nodes")
+memory=$(jq -er '.items[0].status.capacity.memory' <<<"$nodes")
+pod_cidrs=$(jq -c '[.items[0].spec.podCIDRs[]?] | if length == 0 then [.items[0].spec.podCIDR] else . end' <<<"$nodes")
+
+# Namespace currently starts k3s with an explicit service CIDR. Parse that
+# observed process/config value and require it to equal the compatibility-lock
+# admission copied by the orchestrator; never infer a service range merely
+# from a single ClusterIP.
+service_cidr=
+while IFS= read -r command_line; do
+  if [[ $command_line =~ --service-cidr=([^[:space:]]+) ]]; then
+    service_cidr=${BASH_REMATCH[1]}
+    break
+  fi
+  if [[ $command_line =~ --service-cidr[[:space:]]+([^[:space:]]+) ]]; then
+    service_cidr=${BASH_REMATCH[1]}
+    break
+  fi
+done < <(ps -eo args=)
+if [[ -z $service_cidr && -r /etc/rancher/k3s/config.yaml ]]; then
+  service_cidr=$(awk -F: '$1 ~ /^[[:space:]]*service-cidr[[:space:]]*$/ {
+    sub(/^[[:space:]]+/, "", $2); gsub(/"/, "", $2); gsub(/\047/, "", $2); print $2; exit
+  }' /etc/rancher/k3s/config.yaml)
+fi
+[[ -n $service_cidr && $service_cidr == "${DIENE_K3S_SERVICE_CIDR:-}" ]] ||
+  diene_die InstancePostureUnavailable \
+    "observed service CIDR ${service_cidr:-missing} does not match admitted ${DIENE_K3S_SERVICE_CIDR:-missing}"
+service_cidrs=$(jq -cn --arg cidr "$service_cidr" '[$cidr]')
+
+storage=$($kubectl_bin get storageclass -o json)
+jq -e '
+  [.items[] | select(
+    .metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true" or
+    .metadata.annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true")]
+  | length == 1 and .[0].metadata.name == "local-path"
+' <<<"$storage" >/dev/null ||
+  diene_die InstancePostureUnavailable 'the sole default StorageClass is not local-path'
+
+ingress=$($kubectl_bin get ingress -A -o json 2>/dev/null || printf '{"items":[]}\n')
+gateways=$($kubectl_bin get gateway -A -o json 2>/dev/null || printf '{"items":[]}\n')
+services=$($kubectl_bin get service -A -o json)
+jq -e '(.items // []) | length == 0' <<<"$ingress" >/dev/null ||
+  diene_die EndpointLawViolation 'Kubernetes ingress exists before workload mutation'
+jq -e '(.items // []) | length == 0' <<<"$gateways" >/dev/null ||
+  diene_die EndpointLawViolation 'Gateway exists before workload mutation'
+jq -e '
+  (.items // []) | all(
+    .spec.type != "LoadBalancer" and ((.spec.externalIPs // []) | length == 0))
+' <<<"$services" >/dev/null ||
+  diene_die EndpointLawViolation 'public/external Service exists before workload mutation'
+
+jq -n \
+  --arg clusterId "$DIENE_NSC_CLUSTER_ID" --arg osId "$ID" --arg osVersion "$os_version" \
+  --arg k3sVersion "$k3s_version" --arg kubernetesVersion "$kubernetes_version" \
+  --arg cpu "$cpu" --arg memory "$memory" --arg iptablesVersion "$iptables_version" \
+  --argjson nodeCount "$node_count" --argjson podCidrs "$pod_cidrs" \
+  --argjson serviceCidrs "$service_cidrs" --argjson ipv6Disabled "$ipv6_disabled" \
+  --argjson cacheAttached "$DIENE_CACHE_ATTACHED" '
+  {outcome:"Pass",reasonCode:"NamespaceWolfiBuiltInK3sReady",
+   clusterId:$clusterId,identitySource:"cidfile-metadata-exact-id-ssh",
+   os:{id:$osId,version:$osVersion,uid:0},
+   k3s:{version:$k3sVersion,kubernetesVersion:$kubernetesVersion,nodeCount:$nodeCount,
+        capacity:{cpu:$cpu,memory:$memory}},
+   network:{podCidrs:$podCidrs,serviceCidrs:$serviceCidrs,ipv6Disabled:($ipv6Disabled == 1),
+            namespaceIngress:false,publicBinding:false},
+   storage:{defaultClass:"local-path"},
+   policyBackend:{mechanism:"iptables",backend:"nf_tables",version:$iptablesVersion},
+   cacheAttached:$cacheAttached,
+   platformStatus:"platform per-instance policy pending (support ask #4)"}' |
+  diene_write_json "$output"
+
+printf 'NamespaceInstanceReady: %s\n' "$DIENE_NSC_CLUSTER_ID"

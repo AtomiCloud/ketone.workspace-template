@@ -2,32 +2,16 @@
 with packages;
 {
   dev = [
-    git
     skopeo
   ];
 
   lint = [
     actionlint
     check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
-    check-jsonschema
     gitlint
     go-task
     infralint
+    pkgs.ripgrep
     pre-commit
     sg
     shellcheck
@@ -35,6 +19,13 @@ with packages;
   ];
 
   main = [
+    git
+    kubectl
+  ];
+
+  mainLinux = [
+    iproute2
+    pkgs.getent
   ];
 
   releaser = [
@@ -44,22 +35,7 @@ with packages;
   system = [
     atomiutils
     infrautils
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
-    pls
+    nsc
     pls
   ];
 }

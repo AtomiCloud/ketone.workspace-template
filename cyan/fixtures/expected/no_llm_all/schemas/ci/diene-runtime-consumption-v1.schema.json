@@ -2,10 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.atomi.cloud/diene/diene-runtime-consumption-v1.schema.json",
   "title": "Consumption view of the Garden-owned diene-runtime/v1 record",
-  "description": "goals/garden-k3d-profiles.md §2 makes `pls` the sole writer of diene-runtime/v1. This node never writes that record. This schema is a strict subset assertion over the fields this CI node reads when it discovers a Garden-emitted runtime file; it is NOT a re-declaration of the Garden schema, so unknown Garden-owned fields are accepted. If a discovered record does not satisfy this view, the lane refuses RuntimeEvidenceUnavailable rather than forging a substitute.",
+  "description": "goals/garden-k3d-profiles.md §2 makes pls the sole writer of diene-runtime/v1. This strict subset assertion remains compatible with the Garden-owned shape; the retained k3d value is opaque ABI and does not select the outer Namespace substrate. Exact Namespace cluster_id is bound separately by the CI-owned receipt and report.",
   "type": "object",
   "additionalProperties": true,
-  "required": ["apiVersion", "profile", "buildMode", "owner", "substrate", "artifact"],
+  "required": [
+    "apiVersion",
+    "profile",
+    "buildMode",
+    "owner",
+    "substrate",
+    "artifact"
+  ],
   "properties": {
     "apiVersion": { "const": "diene-runtime/v1" },
     "profile": { "enum": ["lapras", "ditto", "rotom", "absol", "eevee", "castform"] },
@@ -37,7 +44,9 @@
       "type": "object",
       "additionalProperties": true,
       "required": ["digest"],
-      "properties": { "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } }
+      "properties": {
+        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
     }
   }
 }

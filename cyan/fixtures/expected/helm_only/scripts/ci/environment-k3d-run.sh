@@ -1,563 +1,1314 @@
 #!/usr/bin/env bash
-# Core runtime lane driver: ditto-build-local, ditto-target-pull, absol and
-# fleet-independence. Lifecycle is delegated entirely to the ratified Garden
-# ABI (goals/garden-k3d-profiles.md §2); this script selects, proves and
-# reports, and never reimplements profile selection, k3d creation, receipt
-# ownership, readiness or teardown.
+# Retained environment-k3d compatibility entrypoint.
+#
+#   orchestrate (default): trusted ordinary-runner controller for the exact
+#     nsc create -> upload -> ssh -T -> collect -> destroy -> absence sequence.
+#   driver: copied, credential-free on-instance core driver. A vendor input is
+#     dispatched to environment-vendor-run.sh's driver mode.
+#
+# The two modes share source but not authority. The guest receives immutable
+# files only and cannot create/list/destroy Namespace instances.
 set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 source "$script_dir/environment-lib.sh"
 
-if [[ ${1:-} == --validate-inputs ]]; then
-  diene_validate_inputs
-  exit 0
-fi
-
-diene_validate_inputs
-[[ ${DIENE_LANE} != ditto-vendor ]] || diene_die InputContractInvalid 'vendor lane requires environment-vendor-run.sh'
-
-pls_bin=${DIENE_PLS_BIN:-pls}
-diene_require_command jq
-diene_require_command sha256sum
-diene_require_command timeout
-diene_require_command "$pls_bin"
-diene_require_command "${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}"
-
-profile=$(diene_runtime_profile "$DIENE_LANE")
-build_mode=$(diene_build_mode "$DIENE_LANE")
-allocation_key=$(diene_allocation_key)
-generation_key=$(diene_generation_key)
-receipt_id=$(diene_receipt_id)
-runtime_dir=$(diene_runtime_dir)
-
-export DIENE_REASON_FILE="$runtime_dir/reason"
-: >"$DIENE_REASON_FILE"
-
-# Runtime output is routed into mode-0600 staging instead of straight to the
-# GitHub log: a canary streamed to the live log is already published and cannot
-# be suppressed by a later scan.
-export DIENE_EVIDENCE_STAGING="$runtime_dir/evidence"
-install -d -m 0700 "$DIENE_EVIDENCE_STAGING"
-for surface in stdout stderr argv environ; do
-  : >"$DIENE_EVIDENCE_STAGING/$surface"
-  chmod 0600 "$DIENE_EVIDENCE_STAGING/$surface"
-done
-printf '%s\n' "$0" "$@" >"$DIENE_EVIDENCE_STAGING/argv"
-# A bounded environment snapshot, so a leak into the process environment is
-# detectable. The tracer itself is excluded: it is a marker for other values
-# escaping, and matching its own definition would make every run a false hit.
-env | grep -v '^DIENE_LEAK_CANARY=' | LC_ALL=C sort >"$DIENE_EVIDENCE_STAGING/environ"
-chmod 0600 "$DIENE_EVIDENCE_STAGING/argv" "$DIENE_EVIDENCE_STAGING/environ"
-
-lane_started=$SECONDS
-setup_seconds=0
-substrate_seconds=0
-readiness_seconds=0
-journeys_seconds=0
-teardown_seconds=0
-finalizer_wait=0
-substrate_name=""
-absence_proof=NotAttempted
-
-# The runner posture is proven before anything else touches the host.
-"${DIENE_RUNNER_PREFLIGHT_BIN:-$script_dir/environment-runner-preflight.sh}"
-
-# Every repository declaration is schema-validated before the first `pls` call.
-manifest=${DIENE_JOURNEY_MANIFEST}
-[[ -f $manifest ]] || diene_die InputContractInvalid 'journey manifest missing'
-diene_schema_validate diene-journeys-v1.schema.json "$manifest" 'journey manifest'
-jq -e '[.journeys[].id] | length == (unique | length)' "$manifest" >/dev/null ||
-  diene_die InputContractInvalid 'journey IDs must be globally stable and unique'
-journey_manifest_digest=$(diene_file_digest "$manifest")
-
-environment_lock=${DIENE_ENVIRONMENT_LOCK:-.diene/ci/environment-lock.v1.json}
-environment_lock_digest=""
-[[ ! -f $environment_lock ]] || environment_lock_digest=$(diene_file_digest "$environment_lock")
-
-results_file="$runtime_dir/journeys.json"
-coverage_file="$runtime_dir/coverage.json"
-readiness_file="$runtime_dir/readiness.json"
-: >"$results_file"
-: >"$coverage_file"
-: >"$readiness_file"
-
-record_coverage() {
-  jq -nc --arg id "$1" --arg reason "$2" \
-    '{id: $id, outcome: "Unavailable", reasonCode: $reason, required: false}' >>"$coverage_file"
-}
-
-# Garden ratifies no local-finalizer quiescence probe, so the profile's
-# finalizer window cannot be observed from here. It is recorded as explicit
-# unavailable coverage rather than simulated with an invented flag.
-record_coverage local-finalizer-window FinalizerQuiescenceInterfaceUnavailable
-
-# ---------------------------------------------------------------------------
-# Host egress posture, the armed receipt, and the traps all precede any
-# mutation, so a cancellation inside `pls env up` still converges.
-# ---------------------------------------------------------------------------
-
-# The posture this lane requires. It is not the lane's to grant: the lease
-# authorizes a mode from the stable job identity, and the check below refuses
-# any disagreement. The value is then the same one end to end — emitted in the
-# document, recorded on the receipt, reported in the evidence.
-policy_mode=closure-denied-network
-case $DIENE_LANE in
-  ditto-build-local | ditto-target-pull) policy_mode=allowlist ;;
-esac
-
-receipt=$(diene_arm_receipt "$receipt_id" "$DIENE_LANE" "$profile" "$build_mode" "$policy_mode")
-
-policy_applied=0
-cleanup_attempted=0
-cleanup_result=1
-teardown_transitions=()
-cleanup_debt=()
-
 json_array_of() {
   if (($# == 0)); then
     printf '[]\n'
-    return 0
-  fi
-  printf '%s\n' "$@" | jq -R . | jq -sc .
-}
-
-record_debt() {
-  cleanup_debt+=("$1")
-  diene_warn CleanupDebt "$1"
-}
-
-cleanup() {
-  local prior=${1:-0}
-  local -
-  if ((cleanup_attempted)); then
-    ((prior != 0)) && return "$prior"
-    return "$cleanup_result"
-  fi
-  cleanup_attempted=1
-  set +e
-  local teardown_started=$SECONDS
-  local failed=0
-
-  if "$script_dir/environment-receipt-sweep.sh" \
-    --repository-id "$GITHUB_REPOSITORY_ID" --run-id "$GITHUB_RUN_ID" \
-    --run-attempt "$GITHUB_RUN_ATTEMPT" --receipt-id "$receipt_id"; then
-    absence_proof=ReceiptDestroyed
-    teardown_transitions+=("ExactDown:Pass")
   else
-    failed=1
-    absence_proof=ReceiptRetainedAsDebt
-    teardown_transitions+=("ExactDown:Fail")
-    record_debt "exact receipt sweep did not converge for $receipt_id"
+    printf '%s\n' "$@" | jq -R . | jq -sc .
+  fi
+}
+
+phase_digest() {
+  diene_sha256_text "${1:?phase required}|${2:-}|${3:-}"
+}
+
+# ---------------------------------------------------------------------------
+# Orchestrator mode.
+# ---------------------------------------------------------------------------
+
+ORCH_STATE=
+ORCH_CLUSTER_ID=
+ORCH_RECEIPT=
+ORCH_RECEIPT_ID=
+ORCH_KIND=core
+ORCH_NSC_VERSION=
+ORCH_NSC_ARTIFACT_DIGEST=
+ORCH_NSC_BINARY_DIGEST=
+ORCH_PUBLICATION_SAFE=1
+ORCH_FIRST_RC=0
+ORCH_FIRST_REASON=
+ORCH_CLEANUP_DONE=0
+ORCH_FINALIZED=0
+ORCH_CREATE_OUTCOME=NotAttempted
+ORCH_CREATE_REASON=CreateNotAttempted
+ORCH_CREATE_SECONDS=0
+ORCH_CREATE_DIGEST=$DIENE_ZERO_DIGEST
+ORCH_TRANSFER_OUTCOME=NotAttempted
+ORCH_TRANSFER_REASON=TransferNotAttempted
+ORCH_TRANSFER_SECONDS=0
+ORCH_TRANSFER_DIGEST=$DIENE_ZERO_DIGEST
+ORCH_SSH_OUTCOME=NotAttempted
+ORCH_SSH_REASON=SshNotAttempted
+ORCH_SSH_SECONDS=0
+ORCH_SSH_DIGEST=$DIENE_ZERO_DIGEST
+ORCH_COLLECTION_OUTCOME=NotAttempted
+ORCH_COLLECTION_REASON=CollectionNotAttempted
+ORCH_COLLECTION_SECONDS=0
+ORCH_COLLECTION_DIGEST=$DIENE_ZERO_DIGEST
+ORCH_DESTROY_OUTCOME=NotAttempted
+ORCH_DESTROY_REASON=DestroyNotAttempted
+ORCH_DESTROY_SECONDS=0
+ORCH_DESTROY_DIGEST=$DIENE_ZERO_DIGEST
+ORCH_ABSENCE_OUTCOME=NotAttempted
+ORCH_ABSENCE_REASON=AbsenceNotAttempted
+ORCH_ABSENCE_SECONDS=0
+ORCH_ABSENCE_DIGEST=$DIENE_ZERO_DIGEST
+ORCH_STARTED=0
+
+orchestrator_fail() {
+  local rc=${1:?failure status required}
+  local reason=${2:?failure reason required}
+  if ((ORCH_FIRST_RC == 0)); then
+    ORCH_FIRST_RC=$rc
+    ORCH_FIRST_REASON=$reason
+  fi
+  diene_warn "$reason" "${3:-the Namespace lifecycle leg failed}"
+}
+
+orchestrator_patch_receipt_phase() {
+  local phase=${1:?phase required} outcome=${2:?outcome required}
+  local reason=${3:?reason required} seconds=${4:?seconds required} digest=${5:?digest required}
+  [[ -f ${ORCH_RECEIPT:-} ]] || return 0
+  diene_receipt_patch "$ORCH_RECEIPT" \
+    ".namespace.$phase = {outcome:\$outcome,reasonCode:\$reason,durationSeconds:\$seconds,receiptDigest:\$digest}" \
+    --arg outcome "$outcome" --arg reason "$reason" --argjson seconds "$seconds" --arg digest "$digest"
+}
+
+orchestrator_cleanup() {
+  ((ORCH_CLEANUP_DONE == 0)) || return 0
+  ORCH_CLEANUP_DONE=1
+  [[ -n $ORCH_CLUSTER_ID ]] || {
+    ORCH_DESTROY_OUTCOME=NotAttempted
+    ORCH_DESTROY_REASON=NoExactClusterId
+    ORCH_ABSENCE_OUTCOME=NotAttempted
+    ORCH_ABSENCE_REASON=NoExactClusterId
+    return 0
+  }
+  local nsc_bin started rc
+  nsc_bin=$(diene_nsc_bin)
+  started=$SECONDS
+  rc=0
+  "$nsc_bin" destroy --force "$ORCH_CLUSTER_ID" \
+    >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || rc=$?
+  ORCH_DESTROY_SECONDS=$((SECONDS - started))
+  ORCH_DESTROY_DIGEST=$(phase_digest destroy "$ORCH_CLUSTER_ID" "$rc")
+  if ((rc == 0)); then
+    ORCH_DESTROY_OUTCOME=Pass
+    ORCH_DESTROY_REASON=ExactClusterDestroyed
+  else
+    ORCH_DESTROY_OUTCOME=Fail
+    ORCH_DESTROY_REASON=NamespaceDestroyFailed
+    orchestrator_fail "$rc" NamespaceDestroyFailed "nsc destroy failed for exact cluster_id $ORCH_CLUSTER_ID"
+  fi
+  orchestrator_patch_receipt_phase destroy "$ORCH_DESTROY_OUTCOME" "$ORCH_DESTROY_REASON" \
+    "$ORCH_DESTROY_SECONDS" "$ORCH_DESTROY_DIGEST"
+
+  started=$SECONDS
+  if diene_nsc_wait_absent "$ORCH_CLUSTER_ID"; then
+    ORCH_ABSENCE_OUTCOME=Pass
+    ORCH_ABSENCE_REASON=ExactClusterAbsent
+  else
+    ORCH_ABSENCE_OUTCOME=Fail
+    ORCH_ABSENCE_REASON=NamespaceAbsenceUnproven
+    orchestrator_fail "$DIENE_REASON_EXIT" NamespaceAbsenceUnproven \
+      "exact cluster_id $ORCH_CLUSTER_ID remained present or list evidence was unavailable"
+  fi
+  ORCH_ABSENCE_SECONDS=$((SECONDS - started))
+  ORCH_ABSENCE_DIGEST=$(phase_digest absence "$ORCH_CLUSTER_ID" "$ORCH_ABSENCE_OUTCOME")
+  orchestrator_patch_receipt_phase absence "$ORCH_ABSENCE_OUTCOME" "$ORCH_ABSENCE_REASON" \
+    "$ORCH_ABSENCE_SECONDS" "$ORCH_ABSENCE_DIGEST"
+}
+
+orchestrator_safe_extract() {
+  local archive=${1:?archive required} target=${2:?target required}
+  if ! diene_archive_is_safe "$archive" evidence; then
+    ORCH_PUBLICATION_SAFE=0
+    diene_warn EvidenceLeakageInterfaceUnavailable \
+      'collected proof archive has an unsafe name, link, device, FIFO, socket, or other special member'
+    return "$DIENE_REASON_EXIT"
+  fi
+  [[ ! -e $target/evidence && ! -L $target/evidence ]] || {
+    ORCH_PUBLICATION_SAFE=0
+    diene_warn EvidenceLeakageInterfaceUnavailable 'collected evidence target already exists'
+    return "$DIENE_REASON_EXIT"
+  }
+  install -d -m 0700 "$target"
+  if ! tar --extract --no-same-owner --no-same-permissions --keep-old-files \
+    -f "$archive" -C "$target" || ! diene_tree_is_safe "$target"; then
+    ORCH_PUBLICATION_SAFE=0
+    diene_warn EvidenceLeakageInterfaceUnavailable \
+      'collected proof could not be extracted into a completely scannable regular tree'
+    return "$DIENE_REASON_EXIT"
+  fi
+}
+
+orchestrator_write_remote_archive_validator() {
+  local target=${1:?remote archive validator target required}
+  cat >"$target" <<'VALIDATOR'
+#!/bin/sh
+set -eu
+archive=${1:?archive required}
+target=${2:?target required}
+fail() {
+  printf '%s\n' "UntrustedSubject: $*" >&2
+  exit 64
+}
+[ -f "$archive" ] && [ ! -L "$archive" ] || fail 'source archive is not a regular file'
+listing=$(mktemp "${TMPDIR:-/tmp}/diene-archive-list.XXXXXX") || fail 'cannot allocate archive listing'
+types=$(mktemp "${TMPDIR:-/tmp}/diene-archive-types.XXXXXX") || {
+  rm -f -- "$listing"
+  fail 'cannot allocate archive type listing'
+}
+paths=$(mktemp "${TMPDIR:-/tmp}/diene-source-paths.XXXXXX") || {
+  rm -f -- "$listing" "$types"
+  fail 'cannot allocate extracted-tree listing'
+}
+cleanup() { rm -f -- "$listing" "$types" "$paths"; }
+trap cleanup EXIT HUP INT TERM
+LC_ALL=C tar -tf "$archive" >"$listing" || fail 'source archive cannot be listed'
+LC_ALL=C tar -tvf "$archive" >"$types" || fail 'source archive types cannot be listed'
+[ "$(wc -l <"$listing")" -gt 0 ] &&
+  [ "$(wc -l <"$listing")" -eq "$(wc -l <"$types")" ] || fail 'source archive listing is ambiguous'
+LC_ALL=C awk '
+  function unsafe(name, normalized, escaped) {
+    escaped = name
+    while (match(escaped, /\\[23][0-7][0-7]/))
+      escaped = substr(escaped, 1, RSTART - 1) "U" substr(escaped, RSTART + RLENGTH)
+    if (escaped ~ /\\/) return 1
+    if (name == "" || name ~ /^\// || name ~ /\/\//) return 1
+    normalized = name
+    sub(/\/$/, "", normalized)
+    if (normalized == "" || normalized == "." || normalized ~ /(^|\/)\.\.?(\/|$)/) return 1
+    if (seen[normalized]++) return 1
+    return 0
+  }
+  unsafe($0) { bad=1 }
+  END { exit bad ? 1 : 0 }
+' "$listing" || fail 'source archive contains an unsafe or non-normalized name'
+LC_ALL=C awk '
+  substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { bad=1 }
+  END { exit bad ? 1 : 0 }
+' "$types" || fail 'source archive contains a link or special member'
+[ ! -e "$target" ] && [ ! -L "$target" ] || fail 'source extraction target is not fresh'
+install -d -m 0700 "$target"
+tar -xf "$archive" -C "$target" || fail 'constrained source extraction failed'
+find "$target" -print >"$paths" || fail 'extracted source tree cannot be traversed'
+while IFS= read -r path; do
+  if [ -L "$path" ]; then
+    fail 'extracted source tree contains a link'
+  elif [ -f "$path" ]; then
+    [ -r "$path" ] || fail 'extracted source tree contains an unreadable file'
+  elif [ -d "$path" ]; then
+    [ -r "$path" ] && [ -x "$path" ] || fail 'extracted source tree contains an unreadable directory'
+  else
+    fail 'extracted source tree contains a special object'
+  fi
+done <"$paths"
+cleanup
+trap - EXIT HUP INT TERM
+VALIDATOR
+  chmod 0500 "$target"
+}
+
+orchestrator_synthetic_report() {
+  local target=${1:?synthetic report required}
+  local journey_digest=$DIENE_ZERO_DIGEST component=K9 permission=ditto-vendor-demo
+  if [[ -f ${DIENE_JOURNEY_MANIFEST:-} ]]; then
+    journey_digest=$(diene_file_digest "$DIENE_JOURNEY_MANIFEST")
+  fi
+  if [[ $ORCH_KIND == vendor ]]; then
+    component=$(jq -r --arg id "$DIENE_ACTION_ID" '.actions[] | select(.actionId == $id) | .componentClass' \
+      "$DIENE_VENDOR_MANIFEST")
+    permission=$(jq -r --arg id "$DIENE_ACTION_ID" '.actions[] | select(.actionId == $id) | .permissionRule' \
+      "$DIENE_VENDOR_MANIFEST")
+    jq -n \
+      --arg revision "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+      --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" --arg actionId "$DIENE_ACTION_ID" \
+      --arg component "$component" --arg permission "$permission" --arg receiptId "$ORCH_RECEIPT_ID" \
+      --arg allocationKey "$(diene_allocation_key)" --arg generationKey "$(diene_generation_key)" \
+      --arg garden "$DIENE_GARDEN_LOCK_DIGEST" --arg reason "${ORCH_FIRST_REASON:-NamespaceLifecycleFailed}" '
+      {apiVersion:"diene.atomi.cloud/ci-vendor-report/v1",repositoryRevision:$revision,
+       workflow:{runId:$runId,runAttempt:$runAttempt,workflowRef:$workflowRef},
+       lane:"ditto-vendor",profile:"ditto",buildMode:"build-local",actionId:$actionId,
+       componentClass:$component,permissionRule:$permission,receiptId:$receiptId,
+       instance:{allocationKey:$allocationKey,generationKey:$generationKey},
+       tooling:{gardenLockDigest:$garden,journeyManifestDigest:"sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+       vendorOutcome:{id:$actionId,outcome:"Fail",reasonCode:$reason,required:true,durationSeconds:0},
+       providerCleanup:{outcome:"Unavailable",reasonCode:"DriverEvidenceUnavailable",objectIds:[],
+         absenceProven:false,durableDebtRecord:("receipt:"+$receiptId)},
+       evidence:{leakageScan:{outcome:"Pass",reasonCode:"ScanPendingFinalisation",encodings:[],scannedPaths:[]},
+         egressCanary:{outcome:"Fail",reasonCode:"PolicyProofUnavailable"},
+         shipment:{outcome:"Unavailable",reasonCode:"CollectionIncomplete"}},
+       teardown:{outcome:"Fail",reasonCode:"LifecycleIncomplete",transitions:["NotAttempted"],
+         finalizerWaitSeconds:0,debt:["driver proof unavailable"],absenceProof:"NotAttempted"},
+       timings:{setupSeconds:0,substrateSeconds:0,readinessSeconds:0,journeysSeconds:0,teardownSeconds:0},
+       outcome:"Fail",reasonCode:$reason}' | diene_write_json "$target"
+  else
+    jq -n \
+      --arg revision "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+      --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" --arg lane "$DIENE_LANE" \
+      --arg profile "$(diene_runtime_profile "$DIENE_LANE")" --arg buildMode "$(diene_build_mode "$DIENE_LANE")" \
+      --arg artifact "$DIENE_ARTIFACT_DIGEST" --arg imageRef "$DIENE_SUBJECT_IMAGE_REF" \
+      --arg producer "$DIENE_SUBJECT_PRODUCER_WORKFLOW_REF" --arg receiptId "$ORCH_RECEIPT_ID" \
+      --arg allocationKey "$(diene_allocation_key)" --arg generationKey "$(diene_generation_key)" \
+      --arg garden "$DIENE_GARDEN_LOCK_DIGEST" --arg journey "$journey_digest" \
+      --arg reason "${ORCH_FIRST_REASON:-NamespaceLifecycleFailed}" '
+      {apiVersion:"diene.atomi.cloud/ci-environment-report/v1",repositoryRevision:$revision,
+       workflow:{runId:$runId,runAttempt:$runAttempt,workflowRef:$workflowRef},
+       lane:$lane,profile:$profile,buildMode:$buildMode,
+       subject:{artifactDigest:$artifact,imageRef:$imageRef,producerWorkflowRef:$producer},
+       instance:{allocationKey:$allocationKey,generationKey:$generationKey},receiptId:$receiptId,
+       tooling:{gardenLockDigest:$garden,journeyManifestDigest:$journey},readiness:null,
+       journeys:[],coverage:[],
+       evidence:{leakageScan:{outcome:"Pass",reasonCode:"ScanPendingFinalisation",encodings:[],scannedPaths:[]},
+         egressCanary:{outcome:"Fail",reasonCode:"PolicyProofUnavailable"},
+         shipment:{outcome:"Unavailable",reasonCode:"CollectionIncomplete"}},
+       teardown:{outcome:"Fail",reasonCode:"LifecycleIncomplete",transitions:["NotAttempted"],
+         finalizerWaitSeconds:0,debt:["driver proof unavailable"],absenceProof:"NotAttempted"},
+       timings:{setupSeconds:0,substrateSeconds:0,readinessSeconds:0,journeysSeconds:0,teardownSeconds:0},
+       outcome:"Fail",reasonCode:$reason}' | diene_write_json "$target"
+  fi
+}
+
+orchestrator_finalize_report() {
+  ((ORCH_FINALIZED == 0)) || return 0
+  ORCH_FINALIZED=1
+  [[ -n $ORCH_STATE ]] || return 0
+  if ((ORCH_PUBLICATION_SAFE == 0)); then
+    rm -f -- "${DIENE_CORE_REPORT:-$RUNNER_TEMP/diene-environment-report.v1.json}" \
+      "${DIENE_VENDOR_REPORT:-$RUNNER_TEMP/diene-vendor-report.v1.json}" \
+      "${DIENE_PROOF_BUNDLE:-$RUNNER_TEMP/diene-proof-bundle.tar}" 2>/dev/null || true
+    orchestrator_fail "$DIENE_REASON_EXIT" EvidenceLeakageInterfaceUnavailable \
+      'unsafe or unscannable collected evidence suppresses every report and proof artifact'
+    return "$DIENE_REASON_EXIT"
+  fi
+  local collected="$ORCH_STATE/collected/evidence"
+  local base_report="$collected/${ORCH_KIND}-report.driver.json"
+  if [[ ! -f $base_report ]]; then
+    base_report="$ORCH_STATE/${ORCH_KIND}-report.synthetic.json"
+    orchestrator_synthetic_report "$base_report"
   fi
 
-  # The job may only request deferred cleanup: the outer enforcement persists
-  # until root-owned runner teardown removes it, so a job that knows its own
-  # receipt cannot dissolve the boundary containing it. Exact removal is the
-  # runner lifecycle's evidence to record, not this lane's to claim.
-  if ((policy_applied)); then
-    if diene_host_policy_request_release "$receipt_id"; then
-      teardown_transitions+=("PolicyReleaseRequested:Deferred")
-    else
-      failed=1
-      teardown_transitions+=("PolicyReleaseRequested:Fail")
-      record_debt "the deferred host policy cleanup request was not accepted for $receipt_id"
+  local checkpoint="$collected/checkpoint-chain.json"
+  if [[ ! -f $checkpoint ]]; then
+    checkpoint="$ORCH_STATE/checkpoint-chain.failed.json"
+    local input_digest
+    input_digest=$(diene_sha256_text "$GITHUB_SHA|$DIENE_GARDEN_LOCK_DIGEST|$DIENE_ARTIFACT_DIGEST|$DIENE_LANE")
+    diene_checkpoint_init "$checkpoint" "$input_digest"
+    diene_checkpoint_append "$checkpoint" lifecycle-failure Fail \
+      "$(phase_digest lifecycle "${ORCH_FIRST_REASON:-NamespaceLifecycleFailed}" "$ORCH_CLUSTER_ID")" false
+    diene_checkpoint_seal "$checkpoint" false
+  else
+    if ! (diene_checkpoint_validate "$checkpoint"); then
+      orchestrator_fail "$DIENE_REASON_EXIT" CheckpointChainInvalid 'collected predecessor chain is invalid'
+    elif ! jq -e '
+      .validated == true and .resumedLegs == 0 and .finalCleanPass == true and
+      (.checkpoints | length) > 0 and
+      all(.checkpoints[]; .outcome == "Pass" and .resumed == false) and
+      .checkpoints[-1].id == "final-clean-pass" and
+      .checkpoints[-1].outcome == "Pass"
+    ' "$checkpoint" >/dev/null; then
+      orchestrator_fail "$DIENE_REASON_EXIT" FinalCleanPassRequired \
+        'collected evidence is not a final clean full pass with zero resumed or failed legs'
     fi
   fi
 
-  teardown_seconds=$((SECONDS - teardown_started))
-  cleanup_result=$failed
-  ((prior != 0)) && return "$prior"
-  return "$cleanup_result"
-}
+  local preflight="$collected/preflight.json" cluster_json os_id os_version k3s_version kubernetes_version
+  local node_count capacity probes
+  cluster_json=null
+  [[ -z $ORCH_CLUSTER_ID ]] || cluster_json=$(jq -cn --arg value "$ORCH_CLUSTER_ID" '$value')
+  os_id=null
+  os_version=null
+  k3s_version=null
+  kubernetes_version=null
+  node_count=null
+  capacity=null
+  if [[ -f $preflight ]]; then
+    os_id=$(jq -c '.os.id' "$preflight")
+    os_version=$(jq -c '.os.version' "$preflight")
+    k3s_version=$(jq -c '.k3s.version' "$preflight")
+    kubernetes_version=$(jq -c '.k3s.kubernetesVersion' "$preflight")
+    node_count=$(jq -c '.k3s.nodeCount' "$preflight")
+    capacity=$(jq -c '.k3s.capacity' "$preflight")
+  fi
+  probes='[{"id":"policy-proof-unavailable","outcome":"Fail","reasonCode":"NotCollected","required":true}]'
+  [[ ! -f $collected/hostile-probes.json ]] || probes=$(jq -c . "$collected/hostile-probes.json")
 
-emit_report() {
-  local verdict=$1
-  local reason=$2
-  local raw="$runtime_dir/core-report.raw.json"
-  local teardown_outcome=Pass
-  ((cleanup_result == 0)) || teardown_outcome=Fail
-  local transitions debt
-  transitions=$(json_array_of "${teardown_transitions[@]}")
-  debt=$(json_array_of "${cleanup_debt[@]}")
-  [[ -s $readiness_file ]] || printf 'null\n' >"$readiness_file"
+  local driver_outcome driver_nonblocking=false
+  driver_outcome=$(jq -r '.outcome' "$base_report")
+  if [[ $ORCH_KIND == vendor ]] && jq -e '
+    .outcome == "Unavailable" and .vendorOutcome.outcome == "Unavailable" and
+    .vendorOutcome.required == false
+  ' "$base_report" >/dev/null; then
+    driver_nonblocking=true
+  elif [[ $driver_outcome != Pass ]]; then
+    orchestrator_fail "$DIENE_REASON_EXIT" "$(jq -r '.reasonCode // "DriverFailed"' "$base_report")" \
+      'on-instance driver reported a red result'
+  fi
+  local lifecycle_outcome=Pass report_outcome=$driver_outcome report_reason=''
+  for outcome in "$ORCH_CREATE_OUTCOME" "$ORCH_TRANSFER_OUTCOME" "$ORCH_SSH_OUTCOME" \
+    "$ORCH_COLLECTION_OUTCOME" "$ORCH_DESTROY_OUTCOME" "$ORCH_ABSENCE_OUTCOME"; do
+    [[ $outcome == Pass ]] || lifecycle_outcome=Fail
+  done
+  if ((ORCH_FIRST_RC != 0)) || [[ $lifecycle_outcome != Pass ]] ||
+    [[ $driver_outcome != Pass && $driver_nonblocking != true ]]; then
+    report_outcome=Fail
+    report_reason=${ORCH_FIRST_REASON:-NamespaceLifecycleFailed}
+  elif [[ $driver_nonblocking == true ]]; then
+    report_reason=$(jq -r '.reasonCode' "$base_report")
+  fi
 
+  local lifecycle="$ORCH_STATE/namespace-lifecycle.json"
   jq -n \
-    --arg repositoryRevision "$GITHUB_SHA" \
-    --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
-    --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" \
-    --arg lane "$DIENE_LANE" --arg profile "$profile" --arg buildMode "$build_mode" \
-    --arg artifactDigest "$DIENE_ARTIFACT_DIGEST" \
-    --arg imageRef "${DIENE_SUBJECT_IMAGE_REF:-}" \
-    --arg producerWorkflowRef "${DIENE_SUBJECT_PRODUCER_WORKFLOW_REF:-}" \
-    --arg attestationDigest "${DIENE_ARTIFACT_ATTESTATION_DIGEST:-}" \
-    --arg closureDigest "${DIENE_CLOSURE_DIGEST:-}" \
-    --arg closureSignatureDigest "${DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST:-}" \
-    --arg closureTrustRootDigest "${DIENE_CLOSURE_TRUST_ROOT_DIGEST:-}" \
-    --arg allocationKey "$allocation_key" --arg generationKey "$generation_key" \
-    --arg substrateName "$substrate_name" \
-    --arg receiptId "$receipt_id" \
-    --arg gardenLockDigest "$DIENE_GARDEN_LOCK_DIGEST" \
-    --arg journeyManifestDigest "$journey_manifest_digest" \
-    --arg environmentLockDigest "$environment_lock_digest" \
-    --arg policyMode "$policy_mode" \
-    --arg teardownOutcome "$teardown_outcome" \
-    --arg absenceProof "$absence_proof" \
-    --arg verdict "$verdict" --arg reason "$reason" \
-    --argjson policyApplied "$policy_applied" \
-    --argjson shipmentReady "${DIENE_SHIPMENT_READY:-false}" \
-    --argjson shipmentRetained "${DIENE_SHIPMENT_RETAINED:-false}" \
-    --argjson finalizerWait "$finalizer_wait" \
-    --argjson setupSeconds "$setup_seconds" \
-    --argjson substrateSeconds "$substrate_seconds" \
-    --argjson readinessSeconds "$readiness_seconds" \
-    --argjson journeysSeconds "$journeys_seconds" \
-    --argjson teardownSeconds "$teardown_seconds" \
-    --argjson transitions "$transitions" \
-    --argjson debt "$debt" \
-    --slurpfile readiness "$readiness_file" \
-    --slurpfile journeys "$results_file" \
-    --slurpfile coverage "$coverage_file" \
-    '{
-      apiVersion: "diene.atomi.cloud/ci-environment-report/v1",
-      repositoryRevision: $repositoryRevision,
-      workflow: { runId: $runId, runAttempt: $runAttempt, workflowRef: $workflowRef },
-      lane: $lane, profile: $profile, buildMode: $buildMode,
-      subject: ({ artifactDigest: $artifactDigest, imageRef: $imageRef, producerWorkflowRef: $producerWorkflowRef }
-        + (if $attestationDigest == "" then {} else { provenanceAttestationDigest: $attestationDigest } end)
-        + (if $closureDigest == "" then {} else { closureDigest: $closureDigest } end)
-        + (if $closureSignatureDigest == "" then {} else { closureSignatureBundleDigest: $closureSignatureDigest } end)
-        + (if $closureTrustRootDigest == "" then {} else { closureTrustRootDigest: $closureTrustRootDigest } end)),
-      instance: ({ allocationKey: $allocationKey, generationKey: $generationKey }
-        + (if $substrateName == "" then {} else { substrateName: $substrateName } end)),
-      receiptId: $receiptId,
-      tooling: ({ gardenLockDigest: $gardenLockDigest, journeyManifestDigest: $journeyManifestDigest }
-        + (if $environmentLockDigest == "" then {} else { environmentLockDigest: $environmentLockDigest } end)),
-      readiness: ($readiness[0] // null),
-      journeys: $journeys,
-      coverage: $coverage,
-      evidence: {
-        leakageScan: { outcome: "Pass", reasonCode: "ScanPendingFinalisation", encodings: [], scannedPaths: [] },
-        egressCanary: {
-          outcome: (if $policyApplied == 1 then "Pass" else "Fail" end),
-          reasonCode: (if $policyApplied == 1
-                       then "OuterLayerDeniedMetadataAtApply"
-                       else "PostureNeverEstablished" end),
-          mode: $policyMode
-        },
-        shipment: {
-          outcome: (if ($shipmentReady and $shipmentRetained) then "Pass" else "Unavailable" end),
-          reasonCode: (if ($shipmentReady and $shipmentRetained) then "SealedAndAwaitingAcknowledgement"
-                       elif $shipmentReady then "AcknowledgementRetentionUnavailable"
-                       else "CourierEndpointUnavailable" end)
-        }
-      },
-      teardown: {
-        outcome: $teardownOutcome,
-        reasonCode: (if $teardownOutcome == "Pass" then "ExactReceiptDestroyed" else "CleanupDebt" end),
-        transitions: (if ($transitions | length) == 0 then ["NotAttempted"] else $transitions end),
-        finalizerWaitSeconds: $finalizerWait,
-        debt: $debt,
-        absenceProof: $absenceProof
-      },
-      timings: {
-        setupSeconds: $setupSeconds, substrateSeconds: $substrateSeconds,
-        readinessSeconds: $readinessSeconds, journeysSeconds: $journeysSeconds,
-        teardownSeconds: $teardownSeconds
-      },
-      outcome: $verdict
-    }
-    + (if $reason == "" then {} else { reasonCode: $reason } end)' \
-    >"$raw"
+    --argjson clusterId "$cluster_json" --arg venue "${DIENE_ORCHESTRATOR_VENUE:-namespace}" \
+    --arg label "${DIENE_ORCHESTRATOR_LABEL:-nscloud-ubuntu-26.04-amd64-16x32}" \
+    --arg fallback "${DIENE_ORCHESTRATOR_FALLBACK_REASON:-}" --arg outcome "$lifecycle_outcome" \
+    --arg createOutcome "$ORCH_CREATE_OUTCOME" --arg createReason "$ORCH_CREATE_REASON" \
+    --arg transferOutcome "$ORCH_TRANSFER_OUTCOME" --arg transferReason "$ORCH_TRANSFER_REASON" \
+    --arg sshOutcome "$ORCH_SSH_OUTCOME" --arg sshReason "$ORCH_SSH_REASON" \
+    --arg collectionOutcome "$ORCH_COLLECTION_OUTCOME" --arg collectionReason "$ORCH_COLLECTION_REASON" \
+    --arg destroyOutcome "$ORCH_DESTROY_OUTCOME" --arg destroyReason "$ORCH_DESTROY_REASON" \
+    --arg absenceOutcome "$ORCH_ABSENCE_OUTCOME" --arg absenceReason "$ORCH_ABSENCE_REASON" \
+    --arg createDigest "$ORCH_CREATE_DIGEST" --arg transferDigest "$ORCH_TRANSFER_DIGEST" \
+    --arg sshDigest "$ORCH_SSH_DIGEST" --arg collectionDigest "$ORCH_COLLECTION_DIGEST" \
+    --arg destroyDigest "$ORCH_DESTROY_DIGEST" --arg absenceDigest "$ORCH_ABSENCE_DIGEST" \
+    --argjson createSeconds "$ORCH_CREATE_SECONDS" --argjson transferSeconds "$ORCH_TRANSFER_SECONDS" \
+    --argjson sshSeconds "$ORCH_SSH_SECONDS" --argjson collectionSeconds "$ORCH_COLLECTION_SECONDS" \
+    --argjson destroySeconds "$ORCH_DESTROY_SECONDS" --argjson absenceSeconds "$ORCH_ABSENCE_SECONDS" '
+    def phase($outcome;$reason;$seconds;$digest):
+      {outcome:$outcome,reasonCode:$reason,durationSeconds:$seconds,receiptDigest:$digest};
+    {clusterId:$clusterId,duration:"2h",ephemeral:true,endpointUsed:false,cacheAttached:false,
+     orchestratorVenue:$venue,orchestratorLabel:$label,
+     fallbackReason:(if $fallback == "" then null else $fallback end),
+     create:phase($createOutcome;$createReason;$createSeconds;$createDigest),
+     transfer:phase($transferOutcome;$transferReason;$transferSeconds;$transferDigest),
+     ssh:phase($sshOutcome;$sshReason;$sshSeconds;$sshDigest),
+     collection:phase($collectionOutcome;$collectionReason;$collectionSeconds;$collectionDigest),
+     destroy:phase($destroyOutcome;$destroyReason;$destroySeconds;$destroyDigest),
+     absence:phase($absenceOutcome;$absenceReason;$absenceSeconds;$absenceDigest),
+     lateCleanupCanRewrite:false,outcome:$outcome}' | diene_write_json "$lifecycle"
 
-  local report=${DIENE_CORE_REPORT:-$RUNNER_TEMP/diene-environment-report.v1.json}
-  "$script_dir/environment-report.sh" --kind core --input "$raw" --output "$report"
+  local source_digest subject_digest proof_digest total_seconds raw final_report final_bundle
+  source_digest=$(diene_file_digest "$ORCH_STATE/source.tar")
+  subject_digest=$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")
+  proof_digest=$ORCH_COLLECTION_DIGEST
+  total_seconds=$((SECONDS - ORCH_STARTED))
+  raw="$ORCH_STATE/${ORCH_KIND}-report.outer.raw.json"
+  jq \
+    --argjson lifecycle "$(jq -c . "$lifecycle")" --argjson checkpoint "$(jq -c . "$checkpoint")" \
+    --argjson clusterId "$cluster_json" --argjson osId "$os_id" --argjson osVersion "$os_version" \
+    --argjson k3sVersion "$k3s_version" --argjson kubernetesVersion "$kubernetes_version" \
+    --argjson nodeCount "$node_count" --argjson capacity "$capacity" --argjson probes "$probes" \
+    --arg nscVersion "$ORCH_NSC_VERSION" --arg nscArtifactDigest "$ORCH_NSC_ARTIFACT_DIGEST" \
+    --arg nscBinaryDigest "$ORCH_NSC_BINARY_DIGEST" --arg sourceDigest "$source_digest" \
+    --arg subjectDigest "$subject_digest" --arg proofDigest "$proof_digest" \
+    --arg profileId "$(diene_egress_profile "$DIENE_LANE")" --arg verdict "$report_outcome" \
+    --arg reason "$report_reason" --argjson createSeconds "$ORCH_CREATE_SECONDS" \
+    --argjson transferSeconds "$ORCH_TRANSFER_SECONDS" --argjson collectionSeconds "$ORCH_COLLECTION_SECONDS" \
+    --argjson destroySeconds "$ORCH_DESTROY_SECONDS" --argjson totalSeconds "$total_seconds" '
+    .instance += {clusterId:$clusterId,osId:$osId,osVersion:$osVersion,k3sVersion:$k3sVersion,
+      kubernetesVersion:$kubernetesVersion,nodeCount:$nodeCount,capacity:$capacity} |
+    .tooling += {nscVersion:$nscVersion,nscArtifactDigest:$nscArtifactDigest,
+      nscBinaryDigest:$nscBinaryDigest,sourceArchiveDigest:$sourceDigest,
+      artifactSubjectDigest:$subjectDigest} |
+    .namespaceLifecycle = $lifecycle | .checkpointChain = $checkpoint |
+    .evidence.egressCanary += {profileId:$profileId,enforcement:"interim-in-guest-iptables-nft",
+      platformStatus:"platform per-instance policy pending (support ask #4)",hostileProbes:$probes} |
+    .evidence.proofBundle = {outcome:(if $proofDigest == "sha256:0000000000000000000000000000000000000000000000000000000000000000" then "Fail" else "Pass" end),
+      reasonCode:(if $proofDigest == "sha256:0000000000000000000000000000000000000000000000000000000000000000" then "CollectionUnavailable" else "CollectedBeforeDestroy" end),
+      digest:$proofDigest,collectedBeforeDestroy:($proofDigest != "sha256:0000000000000000000000000000000000000000000000000000000000000000")} |
+    .timings += {createToKubernetesReadySeconds:$createSeconds,driverTransferSetupSeconds:$transferSeconds,
+      renderApplySeconds:(.timings.substrateSeconds // 0),collectionSeconds:$collectionSeconds,
+      destroySeconds:$destroySeconds,totalColdSeconds:$totalSeconds} |
+    .teardown.transitions += ["NamespaceDestroy:"+$lifecycle.destroy.outcome,
+      "NamespaceAbsence:"+$lifecycle.absence.outcome] |
+    .teardown.outcome = (if $verdict == "Fail" then "Fail" else "Pass" end) |
+    .teardown.absenceProof = (if $lifecycle.absence.outcome == "Pass" then "ReceiptDestroyed" else "ReceiptRetainedAsDebt" end) |
+    .outcome = $verdict |
+    if $verdict == "Pass" then del(.reasonCode) else .reasonCode = $reason end
+  ' "$base_report" | diene_write_json "$raw"
 
-  # Place the scanned report in the job-writable ingress as an untrusted
-  # candidate, with a manifest binding its exact name, kind, size and digest.
-  # The lane neither seals nor uploads: the enforcing table is still standing
-  # and denies the connections an upload needs, `release` is deferred by
-  # contract, and the sealed spool is root-only by construction.
-  if [[ -n ${evidence_ingress_dir:-} && -d ${evidence_ingress_dir:-} ]]; then
-    diene_stage_evidence_candidate "$evidence_ingress_dir" core "$report"
+  final_report=${DIENE_CORE_REPORT:-$RUNNER_TEMP/diene-environment-report.v1.json}
+  [[ $ORCH_KIND != vendor ]] || final_report=${DIENE_VENDOR_REPORT:-$RUNNER_TEMP/diene-vendor-report.v1.json}
+  final_bundle=${DIENE_PROOF_BUNDLE:-$RUNNER_TEMP/diene-proof-bundle.tar}
+  rm -f -- "$final_bundle"
+  export DIENE_PROOF_BUNDLE_DIR=$ORCH_STATE
+  local finalize_reason_file="$ORCH_STATE/report-finalize.reason" finalize_rc=0
+  DIENE_REASON_FILE="$finalize_reason_file" \
+    "$script_dir/environment-report.sh" --kind "$ORCH_KIND" --input "$raw" --output "$final_report" ||
+    finalize_rc=$?
+  if ((finalize_rc != 0)); then
+    local finalize_reason=EvidenceLeakDetected
+    [[ ! -s $finalize_reason_file ]] || IFS=$'\t' read -r finalize_reason _ <"$finalize_reason_file"
+    ORCH_PUBLICATION_SAFE=0
+    rm -f -- "${DIENE_CORE_REPORT:-$RUNNER_TEMP/diene-environment-report.v1.json}" \
+      "${DIENE_VENDOR_REPORT:-$RUNNER_TEMP/diene-vendor-report.v1.json}" "$final_bundle" 2>/dev/null || true
+    orchestrator_fail "$finalize_rc" "$finalize_reason" \
+      'final outer proof-bundle scan or schema validation failed; every publication artifact was suppressed'
+    return "$finalize_rc"
   fi
+
+  [[ -f $ORCH_RECEIPT && ! -L $ORCH_RECEIPT ]] || {
+    rm -f -- "$final_bundle"
+    orchestrator_fail "$DIENE_REASON_EXIT" EvidenceCollectionFailed \
+      'terminal proof cannot be sealed without the exact Namespace receipt'
+    return "$DIENE_REASON_EXIT"
+  }
+  local report_digest lifecycle_digest checkpoint_digest
+  report_digest=$(diene_file_digest "$final_report")
+  lifecycle_digest=$(diene_file_digest "$lifecycle")
+  checkpoint_digest=$(diene_file_digest "$checkpoint")
+  # shellcheck disable=SC2016
+  diene_receipt_patch "$ORCH_RECEIPT" '
+    .checkpointChainDigest = $checkpointDigest |
+    .lifecycleDigest = $lifecycleDigest |
+    .terminalReportDigest = $terminalReportDigest
+  ' --arg checkpointDigest "$checkpoint_digest" --arg lifecycleDigest "$lifecycle_digest" \
+    --arg terminalReportDigest "$report_digest"
+  diene_schema_validate diene-ci-receipt-v1.schema.json "$ORCH_RECEIPT" 'terminal Namespace receipt'
+  if ((ORCH_FIRST_RC == 0)); then
+    diene_validate_terminal_receipt "$ORCH_RECEIPT" "$lifecycle" "$checkpoint" "$final_report"
+  fi
+
+  local proof_dir="$ORCH_STATE/final-proof"
+  install -d -m 0700 "$proof_dir"
+  install -m 0600 "$final_report" "$proof_dir/$(basename -- "$final_report")"
+  install -m 0600 "$lifecycle" "$proof_dir/namespace-lifecycle.json"
+  install -m 0600 "$checkpoint" "$proof_dir/checkpoint-chain.json"
+  install -m 0600 "$ORCH_RECEIPT" "$proof_dir/ci-receipt.json"
+  local -a final_members=("$(basename -- "$final_report")" namespace-lifecycle.json \
+    checkpoint-chain.json ci-receipt.json)
+  tar -cf "$final_bundle" -C "$proof_dir" "${final_members[@]}"
+  chmod 0600 "$final_bundle"
+  printf 'subject_digest=%s\nreceipt_id=%s\n%s_report_digest=%s\nproof_bundle=%s\n' \
+    "$DIENE_ARTIFACT_DIGEST" "$ORCH_RECEIPT_ID" "$ORCH_KIND" "$report_digest" "$final_bundle" \
+    >>"${GITHUB_OUTPUT:-/dev/null}"
+  local core_digest='' vendor_digest=''
+  if [[ $ORCH_KIND == core ]]; then core_digest=$report_digest; else vendor_digest=$report_digest; fi
+  diene_validate_report_namespace "$DIENE_LANE" "$core_digest" "$vendor_digest"
+  ((ORCH_FIRST_RC == 0))
 }
 
-finalize() {
-  local prior=$1
-  local reason_code="" reason_detail=""
-  if [[ -s ${DIENE_REASON_FILE} ]]; then
-    IFS=$'\t' read -r reason_code reason_detail <"$DIENE_REASON_FILE" || true
-  fi
-  : "${reason_detail:-}"
-  cleanup "$prior" || true
-
-  local verdict=Pass
-  local reason=""
-  if ((prior != 0)); then
-    verdict=Fail
-    reason=${reason_code:-LaneFailed}
-  elif ((cleanup_result != 0)); then
-    verdict=Fail
-    reason=CleanupDebt
-  fi
-
-  # Evidence is published for red runs too: a failing lane that emits nothing
-  # is indistinguishable from a lane that never ran. A lane whose evidence
-  # cannot be published — an unscanned report, a positive canary, a schema
-  # violation — is never green.
-  local emit_rc=0
-  emit_report "$verdict" "$reason" || emit_rc=$?
-  ((emit_rc == 0)) || diene_warn EvidenceLeakDetected 'evidence could not be published; the lane cannot be green'
-
-  ((prior == 0)) || return "$prior"
-  ((emit_rc == 0)) || return "$DIENE_REASON_EXIT"
-  ((cleanup_result == 0)) || return "$DIENE_REASON_EXIT"
-  return 0
-}
-
-on_exit() {
+orchestrator_on_exit() {
   local prior=$?
-  local rc=0
-  trap - EXIT TERM INT
-  finalize "$prior" || rc=$?
+  trap - EXIT TERM INT HUP
+  ((prior == 0)) || orchestrator_fail "$prior" "${ORCH_FIRST_REASON:-NamespaceLifecycleFailed}" 'orchestrator exited non-zero'
+  orchestrator_cleanup
+  local final_rc=0
+  orchestrator_finalize_report || final_rc=$?
+  ((prior == 0 && ORCH_FIRST_RC == 0 && final_rc == 0)) || {
+    ((ORCH_FIRST_RC != 0)) && exit "$ORCH_FIRST_RC"
+    ((prior != 0)) && exit "$prior"
+    exit "$final_rc"
+  }
+  exit 0
+}
+
+orchestrator_on_signal() {
+  local rc=${1:?signal status required}
+  orchestrator_fail "$rc" OrchestratorCancelled 'signal received during Namespace lifecycle'
   exit "$rc"
 }
-on_signal() {
-  local status=${1:?signal status required}
-  trap - EXIT TERM INT
-  finalize "$status" || true
-  exit "$status"
+
+orchestrate() {
+  diene_validate_inputs
+  if [[ $DIENE_LANE != ditto-vendor ]]; then
+    diene_select_journeys "$DIENE_JOURNEY_MANIFEST" >/dev/null
+  fi
+  diene_require_command jq
+  diene_require_command sha256sum
+  diene_require_command tar
+  diene_require_command git
+  diene_require_command "${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}"
+  diene_require_command "$(diene_nsc_bin)"
+  ORCH_KIND=core
+  [[ $DIENE_LANE != ditto-vendor ]] || ORCH_KIND=vendor
+  ORCH_RECEIPT_ID=$(diene_receipt_id)
+  ORCH_STATE="${RUNNER_TEMP:?}/diene-namespace/$ORCH_RECEIPT_ID"
+  install -d -m 0700 "$ORCH_STATE" "$ORCH_STATE/staging" "$ORCH_STATE/collected"
+  export DIENE_EVIDENCE_STAGING="$ORCH_STATE/staging"
+  for surface in stdout stderr argv environ; do
+    : >"$DIENE_EVIDENCE_STAGING/$surface"
+    chmod 0600 "$DIENE_EVIDENCE_STAGING/$surface"
+  done
+  printf '%q ' "$0" "$@" >"$DIENE_EVIDENCE_STAGING/argv"
+  printf '\n' >>"$DIENE_EVIDENCE_STAGING/argv"
+  env | grep -v '^DIENE_LEAK_CANARY=' | LC_ALL=C sort >"$DIENE_EVIDENCE_STAGING/environ"
+
+  # All cheap refusals and immutable materialization happen before traps can
+  # observe a created cluster because no substrate exists yet.
+  "$script_dir/environment-profile-contract.sh" --validate-prerequisites
+  diene_prepare_egress_contract "$ORCH_STATE/egress-contract.json"
+  if [[ -n ${DIENE_SOURCE_ARCHIVE:-} ]]; then
+    [[ -f $DIENE_SOURCE_ARCHIVE && ! -L $DIENE_SOURCE_ARCHIVE ]] ||
+      diene_die InputContractInvalid 'provided source archive is not a regular file'
+    install -m 0600 "$DIENE_SOURCE_ARCHIVE" "$ORCH_STATE/source.tar"
+  else
+    git cat-file -e "$GITHUB_SHA^{commit}" || diene_die UntrustedSubject 'source SHA does not resolve'
+    git archive --format=tar --output="$ORCH_STATE/source.tar" "$GITHUB_SHA"
+    chmod 0600 "$ORCH_STATE/source.tar"
+  fi
+  # Materialize one complete listing. Piping the listing into an early-exit
+  # matcher is timing-sensitive under pipefail because the reader can close
+  # early and make tar report SIGPIPE/141 even when the member is present.
+  diene_require_archive_members "$ORCH_STATE/source.tar" \
+    scripts/ci/environment-k3d-run.sh \
+    schemas/ci/diene-environment-report-v1.schema.json
+
+  local nsc_bin nsc_identity nsc_version nsc_artifact_digest nsc_binary_digest
+  local source_digest subject_digest contract_digest validator_digest create_started create_rc
+  nsc_bin=$(diene_nsc_bin)
+  nsc_identity=$(diene_nsc_identity)
+  nsc_version=$(jq -r '.version' <<<"$nsc_identity")
+  nsc_artifact_digest=$(jq -r '.artifactDigest' <<<"$nsc_identity")
+  nsc_binary_digest=$(jq -r '.binaryDigest' <<<"$nsc_identity")
+  ORCH_NSC_VERSION=$nsc_version
+  ORCH_NSC_ARTIFACT_DIGEST=$nsc_artifact_digest
+  ORCH_NSC_BINARY_DIGEST=$nsc_binary_digest
+  export DIENE_NSC_VERSION=$nsc_version
+  export DIENE_NSC_ARTIFACT_DIGEST=$nsc_artifact_digest
+  export DIENE_NSC_BINARY_DIGEST=$nsc_binary_digest
+  orchestrator_write_remote_archive_validator "$ORCH_STATE/archive-validator.sh"
+  validator_digest=$(diene_file_digest "$ORCH_STATE/archive-validator.sh")
+  printf '%s  archive-validator.sh\n' "${validator_digest#sha256:}" \
+    >"$ORCH_STATE/archive-validator.sha256"
+  chmod 0600 "$ORCH_STATE/archive-validator.sha256"
+  source_digest=$(diene_file_digest "$ORCH_STATE/source.tar")
+  subject_digest=$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")
+  contract_digest=$(diene_file_digest "$ORCH_STATE/egress-contract.json")
+  ORCH_STARTED=$SECONDS
+  trap orchestrator_on_exit EXIT
+  trap 'orchestrator_on_signal 143' TERM HUP
+  trap 'orchestrator_on_signal 130' INT
+
+  local -a create=("$nsc_bin" create --ephemeral --duration 2h --wait_kube_system \
+    --cidfile "$ORCH_STATE/cluster.cid" --output_json_to "$ORCH_STATE/create.json" --output json \
+    --purpose "diene-ci-k3d/v1 $DIENE_LANE" --unique_tag "$ORCH_RECEIPT_ID" \
+    --label "diene_receipt=$ORCH_RECEIPT_ID" --label "diene_run=$GITHUB_RUN_ID" \
+    --label "diene_attempt=$GITHUB_RUN_ATTEMPT")
+  [[ -z ${DIENE_NSC_MACHINE_TYPE:-} ]] || create+=(--machine_type "$DIENE_NSC_MACHINE_TYPE")
+  create_started=$SECONDS
+  create_rc=0
+  "${create[@]}" >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || create_rc=$?
+  ORCH_CREATE_SECONDS=$((SECONDS - create_started))
+  if [[ -s $ORCH_STATE/cluster.cid && -s $ORCH_STATE/create.json ]]; then
+    ORCH_CLUSTER_ID=$(diene_nsc_extract_cluster_id "$ORCH_STATE/cluster.cid" "$ORCH_STATE/create.json")
+    ORCH_CREATE_DIGEST=$(diene_file_digest "$ORCH_STATE/create.json")
+    ORCH_RECEIPT=$(diene_arm_receipt "$ORCH_RECEIPT_ID" "$ORCH_CLUSTER_ID" \
+      "$ORCH_CREATE_DIGEST" "$ORCH_CREATE_SECONDS" false "$nsc_version" \
+      "$nsc_artifact_digest" "$nsc_binary_digest")
+  fi
+  if ((create_rc != 0)); then
+    ORCH_CREATE_OUTCOME=Fail
+    ORCH_CREATE_REASON=NamespaceCreateFailed
+    orchestrator_fail "$create_rc" NamespaceCreateFailed 'nsc create did not succeed'
+    return "$create_rc"
+  fi
+  [[ -n $ORCH_CLUSTER_ID ]] || diene_die NamespaceIdentityMismatch 'create succeeded without an exact agreed cluster_id'
+  ORCH_CREATE_OUTCOME=Pass
+  ORCH_CREATE_REASON=ExactClusterIdBound
+
+  jq -n \
+    --arg repositoryId "$GITHUB_REPOSITORY_ID" --arg repositoryKey "$GITHUB_REPOSITORY" \
+    --arg sourceSha "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+    --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" --arg lane "$DIENE_LANE" \
+    --arg garden "$DIENE_GARDEN_LOCK_DIGEST" --arg artifact "$DIENE_ARTIFACT_DIGEST" \
+    --arg provenance "${DIENE_ARTIFACT_PROVENANCE_REF:-}" --arg attestation "${DIENE_ARTIFACT_ATTESTATION_DIGEST:-}" \
+    --arg journey "${DIENE_JOURNEY_MANIFEST:-}" --arg vendor "${DIENE_VENDOR_MANIFEST:-}" \
+    --arg action "${DIENE_ACTION_ID:-}" --arg fixture "${DIENE_FIXTURE_ID:-}" \
+    --arg closure "${DIENE_CLOSURE_DIGEST:-}" --arg closureRef "${DIENE_CLOSURE_BUNDLE_REF:-}" \
+    --arg closureSignature "${DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST:-}" \
+    --arg closureRoot "${DIENE_CLOSURE_TRUST_ROOT_DIGEST:-}" --arg clusterId "$ORCH_CLUSTER_ID" \
+    --arg nscVersion "$nsc_version" --arg nscArtifactDigest "$nsc_artifact_digest" \
+    --arg nscBinaryDigest "$nsc_binary_digest" --arg sourceDigest "$source_digest" \
+    --arg subjectDigest "$subject_digest" --arg archiveValidatorDigest "$validator_digest" \
+    --arg contractDigest "$contract_digest" --arg canaryImage "$DIENE_EGRESS_CANARY_IMAGE" \
+    --arg l7 "${DIENE_EGRESS_L7_ENFORCER_BIN:-}" --arg probe "${DIENE_EGRESS_PROBE_BIN:-}" \
+    --arg vendorBroker "${DIENE_VENDOR_CREDENTIAL_BROKER_BIN:-}" \
+    --arg k3s "${DIENE_ADMITTED_K3S_VERSION:-v1.33.1+k3s1}" \
+    --arg serviceCidr "${DIENE_K3S_SERVICE_CIDR:-10.143.0.0/16}" \
+    --arg venue "${DIENE_ORCHESTRATOR_VENUE:-namespace}" \
+    --arg label "${DIENE_ORCHESTRATOR_LABEL:-nscloud-ubuntu-26.04-amd64-16x32}" \
+    --arg fallback "${DIENE_ORCHESTRATOR_FALLBACK_REASON:-}" '
+    {apiVersion:"diene.atomi.cloud/ci-driver-inputs/v1",trustedRuntimeContext:"protected-base",
+     duration:"2h",platformPolicyStatus:"platform per-instance policy pending (support ask #4)",
+     owner:{repositoryId:$repositoryId,repositoryKey:$repositoryKey,sourceSha:$sourceSha,
+       runId:$runId,runAttempt:$runAttempt,workflowRef:$workflowRef},lane:$lane,
+     gardenLockDigest:$garden,artifact:{digest:$artifact,provenanceRef:$provenance,
+       attestationDigest:$attestation},
+     selectors:{journeyManifest:$journey,vendorManifest:$vendor,actionId:$action,fixtureId:$fixture},
+     closure:{digest:$closure,bundleRef:$closureRef,signatureBundleDigest:$closureSignature,
+       trustRootDigest:$closureRoot},clusterId:$clusterId,nscVersion:$nscVersion,
+     nscArtifactDigest:$nscArtifactDigest,nscBinaryDigest:$nscBinaryDigest,
+     archiveValidatorDigest:$archiveValidatorDigest,
+     sourceArchiveDigest:$sourceDigest,artifactSubjectDigest:$subjectDigest,
+     admittedK3sVersion:$k3s,admittedServiceCidr:$serviceCidr,cacheAttached:false,
+     egress:{contractDigest:$contractDigest,canaryImage:$canaryImage,l7Enforcer:$l7,probeBin:$probe},
+     vendorCredentialBroker:$vendorBroker,
+     orchestrator:{venue:$venue,label:$label,fallbackReason:(if $fallback == "" then null else $fallback end)}}' |
+    diene_write_json "$ORCH_STATE/inputs.json"
+
+  local transfer_started=$SECONDS transfer_rc=0
+  "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/source.tar" /run/diene-ci/source.tar --mkdir \
+    >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/inputs.json" \
+    /run/diene-ci/inputs.json --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$DIENE_ARTIFACT_SUBJECT" \
+    /run/diene-ci/artifact-subject.json --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/egress-contract.json" \
+    /run/diene-ci/egress-contract.json --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_RECEIPT" \
+    /run/diene-ci/receipt.json --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/archive-validator.sh" \
+    /run/diene-ci/archive-validator.sh --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/archive-validator.sha256" \
+    /run/diene-ci/archive-validator.sha256 --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ORCH_TRANSFER_SECONDS=$((SECONDS - transfer_started))
+  ORCH_TRANSFER_DIGEST=$(phase_digest transfer "$source_digest" "$contract_digest|$validator_digest")
+  if ((transfer_rc != 0)); then
+    ORCH_TRANSFER_OUTCOME=Fail
+    ORCH_TRANSFER_REASON=NamespaceTransferFailed
+    orchestrator_fail "$transfer_rc" NamespaceTransferFailed 'fixed immutable upload failed'
+    return "$transfer_rc"
+  fi
+  ORCH_TRANSFER_OUTCOME=Pass
+  ORCH_TRANSFER_REASON=ImmutableInputsUploaded
+
+  local remote_command ssh_started ssh_rc=0
+  # The command is intentionally expanded only by the remote shell.
+  # shellcheck disable=SC2016
+  remote_command='set -eu; umask 077; test "$(id -u)" = 0; install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out; cd /run/diene-ci; sha256sum -c archive-validator.sha256; chmod 0500 archive-validator.sh; ./archive-validator.sh source.tar source; install -m 0600 receipt.json receipts/exact.json; cd source; command -v nix >/dev/null; exec nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci'
+  ssh_started=$SECONDS
+  "$nsc_bin" ssh "$ORCH_CLUSTER_ID" -T "$remote_command" \
+    >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || ssh_rc=$?
+  ORCH_SSH_SECONDS=$((SECONDS - ssh_started))
+  ORCH_SSH_DIGEST=$(phase_digest ssh "$ORCH_CLUSTER_ID" "$ssh_rc")
+  if ((ssh_rc == 0)); then
+    ORCH_SSH_OUTCOME=Pass
+    ORCH_SSH_REASON=NonInteractiveDriverCompleted
+  else
+    ORCH_SSH_OUTCOME=Fail
+    ORCH_SSH_REASON=NamespaceSshDriverFailed
+    orchestrator_fail "$ssh_rc" NamespaceSshDriverFailed 'nsc ssh -T driver leg failed'
+  fi
+
+  local collection_started=$SECONDS collection_rc=0
+  "$nsc_bin" instance download "$ORCH_CLUSTER_ID" /run/diene-ci/out/proof.tar \
+    "$ORCH_STATE/collected/proof.tar" --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || collection_rc=$?
+  ((collection_rc != 0)) || "$nsc_bin" instance download "$ORCH_CLUSTER_ID" /run/diene-ci/out/proof.sha256 \
+    "$ORCH_STATE/collected/proof.sha256" --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || collection_rc=$?
+  if ((collection_rc == 0)); then
+    (cd "$ORCH_STATE/collected" && sha256sum -c proof.sha256 >/dev/null) || collection_rc=$?
+  fi
+  if ((collection_rc == 0)); then
+    orchestrator_safe_extract "$ORCH_STATE/collected/proof.tar" "$ORCH_STATE/collected" || collection_rc=$?
+  fi
+  ORCH_COLLECTION_SECONDS=$((SECONDS - collection_started))
+  if ((collection_rc == 0)); then
+    ORCH_COLLECTION_OUTCOME=Pass
+    ORCH_COLLECTION_REASON=FixedProofBundleCollected
+    ORCH_COLLECTION_DIGEST=$(diene_file_digest "$ORCH_STATE/collected/proof.tar")
+    if [[ -f $ORCH_STATE/collected/evidence/ci-receipt.json ]]; then
+      local collected_receipt=$ORCH_STATE/collected/evidence/ci-receipt.json
+      diene_validate_receipt_owner "$collected_receipt" "$ORCH_CLUSTER_ID"
+      install -m 0600 "$collected_receipt" "$ORCH_RECEIPT"
+    else
+      orchestrator_fail "$DIENE_REASON_EXIT" EvidenceCollectionFailed \
+        'collected driver proof omitted the exact Namespace receipt'
+    fi
+    if [[ -f $ORCH_STATE/collected/evidence/driver-status.json ]] &&
+      ! jq -e '.outcome == "Pass" and .exitCode == 0' \
+        "$ORCH_STATE/collected/evidence/driver-status.json" >/dev/null; then
+      orchestrator_fail "$DIENE_REASON_EXIT" DriverFailed 'driver status is red'
+    fi
+  else
+    ORCH_COLLECTION_OUTCOME=Fail
+    ORCH_COLLECTION_REASON=EvidenceCollectionFailed
+    ORCH_COLLECTION_DIGEST=$DIENE_ZERO_DIGEST
+    orchestrator_fail "$collection_rc" EvidenceCollectionFailed 'fixed proof download, digest, or extraction failed'
+  fi
+  return "$ORCH_FIRST_RC"
 }
-trap on_exit EXIT
-trap 'on_signal 143' TERM
-trap 'on_signal 130' INT
+
+# A separate workflow `if: always()` step invokes this mode. The normal
+# orchestrator EXIT trap has already destroyed and proved absence; this mode
+# re-proves that terminal state. If the runner step died before its trap ran,
+# it may recover only the exact cidfile/metadata/receipt-bound cluster_id. A
+# recovery is deliberately returned red: late cleanup closes debt but cannot
+# rewrite the failed run green.
+orchestrator_cleanup_command() {
+  diene_validate_inputs
+  diene_require_command jq
+  diene_require_command tar
+  local nsc_identity
+  nsc_identity=$(diene_nsc_identity)
+  export DIENE_NSC_VERSION DIENE_NSC_ARTIFACT_DIGEST DIENE_NSC_BINARY_DIGEST
+  DIENE_NSC_VERSION=$(jq -r '.version' <<<"$nsc_identity")
+  DIENE_NSC_ARTIFACT_DIGEST=$(jq -r '.artifactDigest' <<<"$nsc_identity")
+  DIENE_NSC_BINARY_DIGEST=$(jq -r '.binaryDigest' <<<"$nsc_identity")
+  ORCH_RECEIPT_ID=$(diene_receipt_id)
+  ORCH_STATE="${RUNNER_TEMP:?}/diene-namespace/$ORCH_RECEIPT_ID"
+  ORCH_RECEIPT=$(diene_receipt_path "$ORCH_RECEIPT_ID")
+  local lifecycle="$ORCH_STATE/namespace-lifecycle.json"
+  local cluster_id=''
+
+  if [[ -f $ORCH_RECEIPT ]]; then
+    cluster_id=$(jq -er '.namespace.clusterId | select(type == "string" and length > 0)' "$ORCH_RECEIPT") ||
+      diene_die NamespaceIdentityMismatch 'receipt carries no exact Namespace cluster_id'
+    diene_validate_receipt_owner "$ORCH_RECEIPT" "$cluster_id"
+  elif [[ -s $ORCH_STATE/cluster.cid && -s $ORCH_STATE/create.json ]]; then
+    cluster_id=$(diene_nsc_extract_cluster_id "$ORCH_STATE/cluster.cid" "$ORCH_STATE/create.json")
+  fi
+
+  if [[ -f $lifecycle ]]; then
+    local recorded
+    recorded=$(jq -er '.clusterId | select(type == "string" and length > 0)' "$lifecycle") ||
+      diene_die NamespaceIdentityMismatch 'lifecycle evidence carries no exact cluster_id'
+    [[ -z $cluster_id || $cluster_id == "$recorded" ]] ||
+      diene_die NamespaceIdentityMismatch 'receipt and lifecycle cluster_id disagree'
+    cluster_id=$recorded
+    diene_require_safe_id cluster_id "$cluster_id"
+    if jq -e '
+      .duration == "2h" and .ephemeral == true and .lateCleanupCanRewrite == false and
+      .destroy.outcome == "Pass" and .absence.outcome == "Pass"
+    ' "$lifecycle" >/dev/null && diene_nsc_absent "$cluster_id"; then
+      [[ -s ${DIENE_PROOF_BUNDLE:-$RUNNER_TEMP/diene-proof-bundle.tar} ]] ||
+        diene_die EvidenceCollectionFailed 'terminal proof bundle is absent after successful lifecycle convergence'
+      printf 'NamespaceLifecycleConverged: %s\n' "$cluster_id"
+      return 0
+    fi
+  fi
+
+  [[ -n $cluster_id ]] ||
+    diene_die NamespaceIdentityMismatch 'no exact agreed cluster_id exists; refusing broad cleanup'
+  local nsc_bin rc=0 absent=false
+  nsc_bin=$(diene_nsc_bin)
+  "$nsc_bin" destroy --force "$cluster_id" || rc=$?
+  if diene_nsc_wait_absent "$cluster_id"; then absent=true; fi
+  install -d -m 0700 "$ORCH_STATE/final-proof"
+  jq -n --arg clusterId "$cluster_id" --argjson destroyExit "$rc" --argjson absent "$absent" '
+    {outcome:"Fail",reasonCode:"LateExactCleanupCannotRewriteRun",clusterId:$clusterId,
+     destroyExit:$destroyExit,absenceProven:$absent,lateCleanupCanRewrite:false}' |
+    diene_write_json "$ORCH_STATE/final-proof/late-cleanup.json"
+  diene_die LateCleanupCannotRewriteRun \
+    "exact cluster_id $cluster_id was handled after the primary lifecycle; a fresh run is required"
+}
+
+orchestrator_verify_lifecycle() (
+  local bundle=${1:?proof bundle required}
+  diene_validate_inputs
+  diene_require_command jq
+  diene_require_command tar
+  [[ -f $bundle && ! -L $bundle ]] ||
+    diene_die EvidenceCollectionFailed 'workflow-owned lifecycle proof bundle is absent or unsafe'
+  diene_archive_is_safe "$bundle" ||
+    diene_die EvidenceCollectionFailed \
+      'lifecycle proof contains an unsafe name, link, device, FIFO, socket, or other special member'
+  local schema=diene-environment-report-v1.schema.json
+  local report_member=diene-environment-report.v1.json
+  if [[ $DIENE_LANE == ditto-vendor ]]; then
+    schema=diene-vendor-report-v1.schema.json
+    report_member=diene-vendor-report.v1.json
+  fi
+  local listing extract
+  listing=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-lifecycle-list.XXXXXX")
+  extract=$(mktemp -d "${RUNNER_TEMP:-/tmp}/diene-lifecycle-proof.XXXXXX")
+  trap 'rm -f -- "$listing"; chmod -R u+rwX "$extract" 2>/dev/null || true; rm -r -- "$extract" 2>/dev/null || true' EXIT
+  LC_ALL=C tar --list --quoting-style=escape --file "$bundle" >"$listing" ||
+    diene_die EvidenceCollectionFailed 'lifecycle proof tar is unreadable'
+  awk -v report="$report_member" '
+    $0 == report {reports++; next}
+    $0 == "namespace-lifecycle.json" {lifecycles++; next}
+    $0 == "checkpoint-chain.json" {checkpoints++; next}
+    $0 == "ci-receipt.json" {receipts++; next}
+    {bad=1}
+    END {
+      exit (bad || NR != 4 || reports != 1 || lifecycles != 1 || checkpoints != 1 || receipts != 1) ? 1 : 0
+    }
+  ' "$listing" ||
+    diene_die EvidenceCollectionFailed \
+      'lifecycle proof must contain exactly the terminal report, lifecycle, checkpoint, and receipt'
+  tar --extract --no-same-owner --no-same-permissions --keep-old-files \
+    -f "$bundle" -C "$extract" ||
+    diene_die EvidenceCollectionFailed 'lifecycle proof could not be extracted safely'
+  diene_tree_is_safe "$extract" ||
+    diene_die EvidenceCollectionFailed 'lifecycle proof contains an unreadable or special object'
+
+  local report="$extract/$report_member"
+  diene_schema_validate "$schema" "$report" \
+    'workflow-owned terminal report'
+  local lifecycle="$extract/namespace-lifecycle.json" checkpoint="$extract/checkpoint-chain.json"
+  local receipt="$extract/ci-receipt.json" nsc_identity
+  local lifecycle_nsc_version lifecycle_nsc_artifact_digest lifecycle_nsc_binary_digest
+  nsc_identity=$(diene_nsc_identity_record)
+  lifecycle_nsc_version=$(jq -r '.version' <<<"$nsc_identity")
+  lifecycle_nsc_artifact_digest=$(jq -r '.artifactDigest' <<<"$nsc_identity")
+  lifecycle_nsc_binary_digest=$(jq -r '.binaryDigest' <<<"$nsc_identity")
+  local cluster_id receipt_id
+  cluster_id=$(jq -er '.clusterId | select(type == "string" and length > 0)' "$lifecycle") ||
+    diene_die NamespaceIdentityMismatch 'terminal lifecycle has no exact cluster_id'
+  receipt_id=$(diene_receipt_id)
+  diene_require_safe_id cluster_id "$cluster_id"
+  jq -e \
+    --arg sha "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+    --arg lane "$DIENE_LANE" --arg receipt "$receipt_id" --arg cluster "$cluster_id" \
+    --arg nscVersion "$lifecycle_nsc_version" \
+    --arg nscArtifactDigest "$lifecycle_nsc_artifact_digest" \
+    --arg nscBinaryDigest "$lifecycle_nsc_binary_digest" '
+    .repositoryRevision == $sha and .workflow.runId == $runId and
+    .workflow.runAttempt == $runAttempt and .lane == $lane and .receiptId == $receipt and
+    .instance.clusterId == $cluster and .namespaceLifecycle.clusterId == $cluster and
+    .tooling.nscVersion == $nscVersion and .tooling.nscArtifactDigest == $nscArtifactDigest and
+    .tooling.nscBinaryDigest == $nscBinaryDigest and
+    .namespaceLifecycle.duration == "2h" and .namespaceLifecycle.ephemeral == true and
+    .namespaceLifecycle.endpointUsed == false and .namespaceLifecycle.cacheAttached == false and
+    .namespaceLifecycle.lateCleanupCanRewrite == false and
+    ([.namespaceLifecycle.create,.namespaceLifecycle.transfer,.namespaceLifecycle.ssh,
+      .namespaceLifecycle.collection,.namespaceLifecycle.destroy,.namespaceLifecycle.absence] |
+      all(.outcome == "Pass")) and
+    .namespaceLifecycle.outcome == "Pass" and
+    (.outcome == "Pass" or
+      (.outcome == "Unavailable" and .vendorOutcome.outcome == "Unavailable" and
+       .vendorOutcome.required == false)) and
+    .evidence.proofBundle.outcome == "Pass" and
+    .evidence.egressCanary.platformStatus ==
+      "platform per-instance policy pending (support ask #4)" and
+    .checkpointChain.validated == true and .checkpointChain.finalCleanPass == true and
+    .checkpointChain.resumedLegs == 0 and
+    all(.checkpointChain.checkpoints[]; .outcome == "Pass" and .resumed == false) and
+    .checkpointChain.checkpoints[-1].id == "final-clean-pass"
+  ' "$report" >/dev/null ||
+    diene_die NamespaceLifecycleFailed 'terminal report is not a green exact-id lifecycle proof'
+  diene_checkpoint_validate "$checkpoint"
+  jq -e '
+    .validated == true and .finalCleanPass == true and .resumedLegs == 0 and
+    all(.checkpoints[]; .outcome == "Pass" and .resumed == false) and
+    .checkpoints[-1].id == "final-clean-pass" and .checkpoints[-1].outcome == "Pass"
+  ' "$checkpoint" >/dev/null ||
+    diene_die FinalCleanPassRequired 'terminal checkpoint chain is not a clean full pass'
+  DIENE_NSC_VERSION=$lifecycle_nsc_version \
+    DIENE_NSC_ARTIFACT_DIGEST=$lifecycle_nsc_artifact_digest \
+    DIENE_NSC_BINARY_DIGEST=$lifecycle_nsc_binary_digest \
+    diene_validate_terminal_receipt "$receipt" "$lifecycle" "$checkpoint" "$report"
+  printf 'NamespaceLifecycleVerified: %s\n' "$cluster_id"
+)
 
 # ---------------------------------------------------------------------------
-# Posture, then substrate.
+# On-instance core driver mode.
 # ---------------------------------------------------------------------------
 
-# Mandatory lane proofs are demanded before anything at all is touched, so a
-# lane that cannot prove its required results never reaches the broker, let
-# alone the substrate.
-if [[ $DIENE_LANE == ditto-target-pull ]]; then
-  pull_proof=$(diene_require_pull_proof)
-fi
-if [[ $DIENE_LANE == absol ]]; then
-  closure_verifier=$(diene_require_closure_verifier)
-fi
-diene_require_host_broker
-# The lease must authorize exactly the posture this lane requires, and the
-# runner must attest that the enforcement is actually a boundary, before any
-# document is generated or any mutation is attempted.
-diene_authorized_policy_mode "$policy_mode" >/dev/null
-diene_require_enforcement_attestations
-# Evidence has to be publishable before the lane is worth running: under a
-# hermetic posture an in-job upload cannot open the connections it needs.
-evidence_ingress_dir=$(diene_require_evidence_publication)
+DRIVER_STATE=
+DRIVER_RUNTIME_DIR=
+DRIVER_RECEIPT=
+DRIVER_CHECKPOINT=
+DRIVER_RESULTS=
+DRIVER_COVERAGE=
+DRIVER_READINESS=
+DRIVER_POLICY_APPLIED=0
+DRIVER_CLEANUP_DONE=0
+DRIVER_CLEANUP_RC=0
+DRIVER_FINALIZED=0
+DRIVER_SETUP_SECONDS=0
+DRIVER_SUBSTRATE_SECONDS=0
+DRIVER_READINESS_SECONDS=0
+DRIVER_JOURNEY_SECONDS=0
+DRIVER_TEARDOWN_SECONDS=0
+DRIVER_RUNTIME_FILE=
+DRIVER_SUBSTRATE_NAME=
+DRIVER_STARTED=0
 
-case $DIENE_LANE in
-  absol)
-    # Goal order: verify and import the closure, THEN activate denial, THEN
-    # re-render and prove exact-set equality under denial, and only then let
-    # any volume or cluster exist.
-    "$closure_verifier" verify \
-      --digest "$DIENE_CLOSURE_DIGEST" \
-      --bundle "$DIENE_CLOSURE_BUNDLE_REF" \
+driver_cleanup() {
+  ((DRIVER_CLEANUP_DONE == 0)) || return "$DRIVER_CLEANUP_RC"
+  DRIVER_CLEANUP_DONE=1
+  local started=$SECONDS failed=0
+  if [[ -n $DRIVER_RUNTIME_FILE ]]; then
+    "$script_dir/environment-receipt-sweep.sh" --repository-id "$GITHUB_REPOSITORY_ID" \
+      --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+      --receipt-id "$(diene_receipt_id)" || failed=1
+  elif [[ -f $DRIVER_RECEIPT ]]; then
+    diene_receipt_patch "$DRIVER_RECEIPT" \
+      '.cleanup = {outcome:"Pass",reasonCode:"NoGardenRuntimeCreated",debt:[]}'
+  fi
+  if ((DRIVER_POLICY_APPLIED)); then
+    diene_remove_interim_policy || failed=1
+  fi
+  DRIVER_TEARDOWN_SECONDS=$((SECONDS - started))
+  DRIVER_CLEANUP_RC=$failed
+  return "$failed"
+}
+
+driver_emit_report() {
+  local verdict=${1:?verdict required} reason=${2:-}
+  local preflight="$DRIVER_RUNTIME_DIR/preflight.json" probes="$DRIVER_RUNTIME_DIR/hostile-probes.json"
+  local endpoint="$DRIVER_RUNTIME_DIR/endpoint-law.json" transitions debt teardown_outcome absence
+  transitions='["GardenExactDown:Pass","InterimPolicyRemoved:Pass"]'
+  debt='[]'
+  teardown_outcome=Pass
+  absence=ReceiptDestroyed
+  if ((DRIVER_CLEANUP_RC != 0)); then
+    transitions='["GardenOrPolicyCleanup:Fail"]'
+    debt='["on-instance exact cleanup did not converge"]'
+    teardown_outcome=Fail
+    absence=ReceiptRetainedAsDebt
+  fi
+  [[ -s $DRIVER_READINESS ]] || printf 'null\n' >"$DRIVER_READINESS"
+  local journeys coverage
+  journeys=$(jq -sc . "$DRIVER_RESULTS")
+  coverage=$(jq -sc . "$DRIVER_COVERAGE")
+  local journey_digest environment_digest=''
+  journey_digest=$(diene_file_digest "$DIENE_JOURNEY_MANIFEST")
+  [[ ! -f ${DIENE_ENVIRONMENT_LOCK:-.diene/ci/environment-lock.v1.json} ]] ||
+    environment_digest=$(diene_file_digest "${DIENE_ENVIRONMENT_LOCK:-.diene/ci/environment-lock.v1.json}")
+  jq -n \
+    --arg revision "$GITHUB_SHA" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+    --arg workflowRef "$DIENE_BASE_WORKFLOW_REF" --arg lane "$DIENE_LANE" \
+    --arg profile "$(diene_runtime_profile "$DIENE_LANE")" --arg buildMode "$(diene_build_mode "$DIENE_LANE")" \
+    --arg artifact "$DIENE_ARTIFACT_DIGEST" --arg imageRef "$DIENE_SUBJECT_IMAGE_REF" \
+    --arg producer "$DIENE_SUBJECT_PRODUCER_WORKFLOW_REF" --arg attestation "${DIENE_ARTIFACT_ATTESTATION_DIGEST:-}" \
+    --arg closure "${DIENE_CLOSURE_DIGEST:-}" --arg closureSignature "${DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST:-}" \
+    --arg closureRoot "${DIENE_CLOSURE_TRUST_ROOT_DIGEST:-}" --arg allocationKey "$(diene_allocation_key)" \
+    --arg generationKey "$(diene_generation_key)" --arg substrateName "$DRIVER_SUBSTRATE_NAME" \
+    --arg receiptId "$(diene_receipt_id)" --arg clusterId "$DIENE_NSC_CLUSTER_ID" \
+    --arg garden "$DIENE_GARDEN_LOCK_DIGEST" --arg journeyDigest "$journey_digest" \
+    --arg environmentDigest "$environment_digest" --arg nscVersion "$DIENE_NSC_VERSION" \
+    --arg nscArtifactDigest "$DIENE_NSC_ARTIFACT_DIGEST" \
+    --arg nscBinaryDigest "$DIENE_NSC_BINARY_DIGEST" \
+    --arg sourceDigest "$DIENE_SOURCE_ARCHIVE_DIGEST" \
+    --arg subjectDigest "$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")" \
+    --arg verdict "$verdict" --arg reason "$reason" --arg teardownOutcome "$teardown_outcome" \
+    --arg absence "$absence" --argjson journeys "$journeys" --argjson coverage "$coverage" \
+    --argjson transitions "$transitions" --argjson debt "$debt" \
+    --argjson setup "$DRIVER_SETUP_SECONDS" --argjson substrate "$DRIVER_SUBSTRATE_SECONDS" \
+    --argjson readinessSeconds "$DRIVER_READINESS_SECONDS" --argjson journeysSeconds "$DRIVER_JOURNEY_SECONDS" \
+    --argjson teardown "$DRIVER_TEARDOWN_SECONDS" --slurpfile readiness "$DRIVER_READINESS" \
+    --slurpfile preflight "$preflight" --slurpfile probes "$probes" --slurpfile checkpoint "$DRIVER_CHECKPOINT" '
+    {apiVersion:"diene.atomi.cloud/ci-environment-report/v1",repositoryRevision:$revision,
+     workflow:{runId:$runId,runAttempt:$runAttempt,workflowRef:$workflowRef},lane:$lane,profile:$profile,
+     buildMode:$buildMode,
+     subject:({artifactDigest:$artifact,imageRef:$imageRef,producerWorkflowRef:$producer}
+       + (if $attestation == "" then {} else {provenanceAttestationDigest:$attestation} end)
+       + (if $closure == "" then {} else {closureDigest:$closure} end)
+       + (if $closureSignature == "" then {} else {closureSignatureBundleDigest:$closureSignature} end)
+       + (if $closureRoot == "" then {} else {closureTrustRootDigest:$closureRoot} end)),
+     instance:{allocationKey:$allocationKey,generationKey:$generationKey,substrateName:$substrateName,
+       clusterId:$clusterId,osId:$preflight[0].os.id,osVersion:$preflight[0].os.version,
+       k3sVersion:$preflight[0].k3s.version,kubernetesVersion:$preflight[0].k3s.kubernetesVersion,
+       nodeCount:$preflight[0].k3s.nodeCount,capacity:$preflight[0].k3s.capacity},receiptId:$receiptId,
+     tooling:({gardenLockDigest:$garden,journeyManifestDigest:$journeyDigest,nscVersion:$nscVersion,
+       nscArtifactDigest:$nscArtifactDigest,nscBinaryDigest:$nscBinaryDigest,
+       sourceArchiveDigest:$sourceDigest,artifactSubjectDigest:$subjectDigest}
+       + (if $environmentDigest == "" then {} else {environmentLockDigest:$environmentDigest} end)),
+     readiness:($readiness[0] // null),journeys:$journeys,coverage:$coverage,
+     evidence:{leakageScan:{outcome:"Pass",reasonCode:"ScanPendingFinalisation",encodings:[],scannedPaths:[]},
+       egressCanary:{outcome:(if ($probes[0] | length) >= 6 then "Pass" else "Fail" end),
+         reasonCode:(if ($probes[0] | length) >= 6 then "HostAndPodNegativeProbesPassed" else "ProbeEvidenceIncomplete" end),
+         mode:(if $lane == "absol" or $lane == "fleet-independence" then "closure-denied-network" else "allowlist" end),
+         profileId:(if $lane == "absol" then "absol-hermetic-v1" elif $lane == "fleet-independence" then "fleet-independence-v1"
+           elif $lane == "ditto-target-pull" then "ditto-target-pull-v1" else "ditto-build-local-v1" end),
+         enforcement:"interim-in-guest-iptables-nft",
+         platformStatus:"platform per-instance policy pending (support ask #4)",hostileProbes:($probes[0] // [])},
+       shipment:{outcome:"Unavailable",reasonCode:"CollectedByOuterOrchestrator"}},
+     teardown:{outcome:$teardownOutcome,reasonCode:(if $teardownOutcome == "Pass" then "ExactReceiptDestroyed" else "CleanupDebt" end),
+       transitions:$transitions,finalizerWaitSeconds:0,debt:$debt,absenceProof:$absence},
+     checkpointChain:$checkpoint[0],
+     timings:{setupSeconds:$setup,substrateSeconds:$substrate,readinessSeconds:$readinessSeconds,
+       journeysSeconds:$journeysSeconds,teardownSeconds:$teardown},outcome:$verdict}
+     + (if $reason == "" then {} else {reasonCode:$reason} end)' |
+    diene_write_json "$DRIVER_RUNTIME_DIR/core-report.driver.json"
+  [[ -f $endpoint ]] || true
+}
+
+driver_package() {
+  local exit_code=${1:?exit code required} outcome reason
+  outcome=Pass
+  reason=DriverCompleted
+  if ((exit_code != 0)); then
+    outcome=Fail
+    reason=${2:-DriverFailed}
+  fi
+  jq -n --arg outcome "$outcome" --arg reason "$reason" --argjson exitCode "$exit_code" \
+    '{outcome:$outcome,reasonCode:$reason,exitCode:$exitCode}' |
+    diene_write_json "$DRIVER_RUNTIME_DIR/driver-status.json"
+  install -m 0600 "$DRIVER_RECEIPT" "$DRIVER_RUNTIME_DIR/ci-receipt.json"
+  install -d -m 0700 "$DRIVER_STATE/out"
+  tar -cf "$DRIVER_STATE/out/proof.tar" -C "$DRIVER_RUNTIME_DIR/.." evidence
+  chmod 0600 "$DRIVER_STATE/out/proof.tar"
+  (cd "$DRIVER_STATE/out" && sha256sum proof.tar >proof.sha256)
+  chmod 0600 "$DRIVER_STATE/out/proof.sha256"
+}
+
+driver_finalize() {
+  local prior=${1:-0}
+  ((DRIVER_FINALIZED == 0)) || return "$prior"
+  DRIVER_FINALIZED=1
+  local reason='' result=$prior
+  if [[ -s $DIENE_REASON_FILE ]]; then
+    IFS=$'\t' read -r reason _ <"$DIENE_REASON_FILE" || true
+  fi
+  driver_cleanup || {
+    ((result != 0)) || result=$DIENE_REASON_EXIT
+    [[ -n $reason ]] || reason=CleanupDebt
+  }
+  local evidence_digest
+  evidence_digest=$(phase_digest driver "$DIENE_NSC_CLUSTER_ID" "${reason:-Pass}")
+  if ((result == 0)); then
+    diene_checkpoint_append "$DRIVER_CHECKPOINT" final-clean-pass Pass "$evidence_digest" false
+    diene_checkpoint_seal "$DRIVER_CHECKPOINT" true
+    driver_emit_report Pass ''
+  else
+    diene_checkpoint_append "$DRIVER_CHECKPOINT" driver-failure Fail "$evidence_digest" false
+    diene_checkpoint_seal "$DRIVER_CHECKPOINT" false
+    driver_emit_report Fail "${reason:-DriverFailed}"
+  fi
+  driver_package "$result" "${reason:-DriverFailed}"
+  return "$result"
+}
+
+driver_on_exit() {
+  local prior=$?
+  trap - EXIT TERM INT HUP
+  local rc=0
+  driver_finalize "$prior" || rc=$?
+  exit "$rc"
+}
+
+driver_on_signal() {
+  local rc=${1:?signal status required}
+  diene_warn DriverCancelled 'signal received by on-instance driver'
+  printf 'DriverCancelled\tsignal received\n' >"$DIENE_REASON_FILE"
+  exit "$rc"
+}
+
+diene_core_driver_preflight() {
+  "$script_dir/environment-runner-preflight.sh" "$@"
+}
+
+driver_core() {
+  DRIVER_STATE=${1:?fixed driver state directory required}
+  diene_load_remote_inputs "$DRIVER_STATE"
+  if [[ $DIENE_LANE == ditto-vendor ]]; then
+    exec "$script_dir/environment-vendor-run.sh" driver "$DRIVER_STATE"
+  fi
+  diene_validate_inputs
+  for command in jq sha256sum timeout tar; do diene_require_command "$command"; done
+  diene_require_command "${DIENE_PLS_BIN:-pls}"
+  diene_require_command "${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}"
+  DRIVER_RUNTIME_DIR="$DRIVER_STATE/evidence"
+  install -d -m 0700 "$DRIVER_RUNTIME_DIR"
+  export DIENE_EVIDENCE_STAGING="$DRIVER_RUNTIME_DIR/staging"
+  install -d -m 0700 "$DIENE_EVIDENCE_STAGING"
+  for surface in stdout stderr argv environ; do
+    : >"$DIENE_EVIDENCE_STAGING/$surface"
+    chmod 0600 "$DIENE_EVIDENCE_STAGING/$surface"
+  done
+  printf '%q ' "$0" "$@" >"$DIENE_EVIDENCE_STAGING/argv"
+  printf '\n' >>"$DIENE_EVIDENCE_STAGING/argv"
+  env | grep -v '^DIENE_LEAK_CANARY=' | LC_ALL=C sort >"$DIENE_EVIDENCE_STAGING/environ"
+  export DIENE_REASON_FILE="$DRIVER_RUNTIME_DIR/reason"
+  : >"$DIENE_REASON_FILE"
+  DRIVER_RESULTS="$DRIVER_RUNTIME_DIR/journeys.jsonl"
+  DRIVER_COVERAGE="$DRIVER_RUNTIME_DIR/coverage.jsonl"
+  DRIVER_READINESS="$DRIVER_RUNTIME_DIR/readiness.json"
+  : >"$DRIVER_RESULTS"
+  : >"$DRIVER_COVERAGE"
+  : >"$DRIVER_READINESS"
+  if [[ $DIENE_LANE == fleet-independence ]]; then
+    jq -cn '{id:"fleet-endpoint-resource-negative-probe",outcome:"Unavailable",
+      reasonCode:"FleetEndpointResourceNegativeProbeContractUnavailable",required:false}' \
+      >>"$DRIVER_COVERAGE"
+  fi
+  DRIVER_RECEIPT="$DRIVER_STATE/receipts/exact.json"
+  export DIENE_RECEIPT_DIR="$DRIVER_STATE/receipts"
+  diene_validate_receipt_owner "$DRIVER_RECEIPT" "$DIENE_NSC_CLUSTER_ID"
+  DRIVER_CHECKPOINT="$DRIVER_RUNTIME_DIR/checkpoint-chain.json"
+  local input_digest
+  input_digest=$(diene_sha256_text \
+    "$GITHUB_SHA|$DIENE_SOURCE_ARCHIVE_DIGEST|$DIENE_GARDEN_LOCK_DIGEST|$DIENE_ARTIFACT_DIGEST|$(diene_file_digest "$DIENE_EGRESS_CONTRACT")")
+  diene_checkpoint_init "$DRIVER_CHECKPOINT" "$input_digest"
+  jq -n --arg clusterId "$DIENE_NSC_CLUSTER_ID" '
+    {outcome:"Fail",reasonCode:"PreflightNotCompleted",clusterId:$clusterId,
+     os:{id:null,version:null,uid:0},
+     k3s:{version:null,kubernetesVersion:null,nodeCount:null,capacity:null},
+     network:{podCidrs:[],serviceCidrs:[],ipv6Disabled:false,namespaceIngress:false,publicBinding:false},
+     storage:{defaultClass:null},policyBackend:{mechanism:"iptables",backend:"nf_tables",version:null},
+     cacheAttached:false,platformStatus:"platform per-instance policy pending (support ask #4)"}' |
+    diene_write_json "$DRIVER_RUNTIME_DIR/preflight.json"
+  printf '[]\n' | diene_write_json "$DRIVER_RUNTIME_DIR/hostile-probes.json"
+  DRIVER_STARTED=$SECONDS
+  trap driver_on_exit EXIT
+  trap 'driver_on_signal 143' TERM HUP
+  trap 'driver_on_signal 130' INT
+
+  local preflight="$DRIVER_RUNTIME_DIR/preflight.json"
+  export DIENE_PREFLIGHT_EVIDENCE=$preflight
+  diene_core_driver_preflight --output "$preflight"
+  diene_checkpoint_append "$DRIVER_CHECKPOINT" instance-preflight Pass "$(diene_file_digest "$preflight")" false
+
+  local manifest=$DIENE_JOURNEY_MANIFEST
+
+  local closure_verifier='' pull_proof=''
+  if [[ $DIENE_LANE == absol ]]; then
+    closure_verifier=$(diene_require_closure_verifier)
+    "$closure_verifier" verify --digest "$DIENE_CLOSURE_DIGEST" --bundle "$DIENE_CLOSURE_BUNDLE_REF" \
       --signature-digest "$DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST" \
       --trust-root-digest "$DIENE_CLOSURE_TRUST_ROOT_DIGEST" ||
-      diene_die ClosureAttestationInterfaceUnavailable 'signed closure verification did not pass'
-    "$pls_bin" closure import "$DIENE_CLOSURE_BUNDLE_REF"
+      diene_die ClosureAttestationInterfaceUnavailable 'signed closure verification failed'
+    "${DIENE_PLS_BIN:-pls}" closure import "$DIENE_CLOSURE_BUNDLE_REF"
+  elif [[ $DIENE_LANE == ditto-target-pull ]]; then
+    pull_proof=$(diene_require_pull_proof)
+  fi
 
-    allow_file="$runtime_dir/host-policy.json"
-    diene_write_allow_file "$allow_file" closure-denied-network
-    diene_host_policy_apply "$receipt_id" "$allow_file"
-    policy_applied=1
-    "$pls_bin" closure preflight --denied-network
+  local resolved="$DRIVER_RUNTIME_DIR/egress-resolved.json"
+  local policy="$DRIVER_RUNTIME_DIR/policy.json" l7="$DRIVER_RUNTIME_DIR/l7-egress.json"
+  diene_resolve_egress_contract "$DIENE_EGRESS_CONTRACT" "$resolved"
+  diene_preflow_start
+  diene_apply_interim_policy "$resolved" "$policy" "$l7"
+  DRIVER_POLICY_APPLIED=1
+  diene_verify_hostile_egress "$DRIVER_RUNTIME_DIR/hostile-probes.json"
+  diene_receipt_patch "$DRIVER_RECEIPT" \
+    '.namespace.policy.applied = true | .namespace.policy.hostileProbes = "Pass"'
+  diene_checkpoint_append "$DRIVER_CHECKPOINT" egress-policy Pass "$(diene_file_digest "$policy")" false
 
+  if [[ $DIENE_LANE == absol ]]; then
+    "${DIENE_PLS_BIN:-pls}" closure preflight --denied-network
     "$closure_verifier" exact-set --digest "$DIENE_CLOSURE_DIGEST" --network-denied ||
-      diene_die ClosureAttestationInterfaceUnavailable 'exact-set equality did not hold under denial'
-    ;;
-  fleet-independence)
-    # Hermetic, but not closure-backed: the fixture reaches nothing beyond the
-    # runner-assigned lane CIDRs.
-    allow_file="$runtime_dir/host-policy.json"
-    diene_write_allow_file "$allow_file" closure-denied-network
-    diene_host_policy_apply "$receipt_id" "$allow_file"
-    policy_applied=1
-    ;;
-  ditto-build-local | ditto-target-pull)
-    # Connected Ditto is not hermetic: it must reach its scoped seed and, for
-    # target-pull, the registry. Those endpoints must be literal and
-    # runner-published — the enforcement layer refuses bare hostnames and
-    # denies DNS — so the lane refuses rather than claiming a posture through
-    # which the required operations could not have succeeded.
-    allow_file="$runtime_dir/host-policy.json"
-    # Through a file, not a process substitution: a refusal inside a
-    # substituted subshell cannot exit this script, so an unenforceable
-    # connected posture would slip through as an empty endpoint set.
-    connected_file="$runtime_dir/connected-endpoints"
-    diene_connected_endpoints >"$connected_file"
-    mapfile -t connected_endpoints <"$connected_file"
-    diene_write_allow_file "$allow_file" allowlist "${connected_endpoints[@]}"
-    diene_host_policy_apply "$receipt_id" "$allow_file"
-    policy_applied=1
-    ;;
-esac
-if ((policy_applied)); then
-  # shellcheck disable=SC2016 # $mode and $file are jq variables, bound below
-  diene_receipt_patch "$receipt" '.hostPolicy = {applied: true, mode: $mode, allowFile: $file}' \
-    --arg mode "$policy_mode" --arg file "${allow_file:-}"
-fi
+      diene_die ClosureAttestationInterfaceUnavailable 'closure exact-set equality failed under denial'
+  fi
+  DRIVER_SETUP_SECONDS=$((SECONDS - DRIVER_STARTED))
 
-if [[ $DIENE_LANE == ditto-target-pull ]]; then
-  # Mandatory, not optional coverage: refuse when no interface can prove them.
-  pull_proof=$(diene_require_pull_proof)
-fi
+  local substrate_started=$SECONDS profile build_mode
+  profile=$(diene_runtime_profile "$DIENE_LANE")
+  build_mode=$(diene_build_mode "$DIENE_LANE")
+  "${DIENE_PLS_BIN:-pls}" env up --profile "$profile" --build-mode "$build_mode" \
+    --artifact "$DIENE_ARTIFACT_DIGEST"
+  DRIVER_SUBSTRATE_SECONDS=$((SECONDS - substrate_started))
+  DRIVER_RUNTIME_FILE=$(diene_discover_runtime "$profile" "$(diene_allocation_key)" "$(diene_generation_key)")
+  jq -e --arg digest "$DIENE_ARTIFACT_DIGEST" '.artifact.digest == $digest' "$DRIVER_RUNTIME_FILE" >/dev/null ||
+    diene_die UntrustedSubject 'Garden runtime record carries another artifact digest'
+  DRIVER_SUBSTRATE_NAME=$(jq -r '.substrate.name' "$DRIVER_RUNTIME_FILE")
+  # shellcheck disable=SC2016
+  diene_receipt_patch "$DRIVER_RECEIPT" '.runtimeFile = $path | .cleanup.reasonCode = "RuntimeBound"' \
+    --arg path "$DRIVER_RUNTIME_FILE"
+  export DIENE_GARDEN_RUNTIME_FILE=$DRIVER_RUNTIME_FILE
+  diene_checkpoint_append "$DRIVER_CHECKPOINT" render-apply Pass \
+    "$(phase_digest render "$DRIVER_SUBSTRATE_NAME" "$DRIVER_SUBSTRATE_SECONDS")" false
 
-setup_seconds=$((SECONDS - lane_started))
-substrate_started=$SECONDS
-# --artifact is mandatory for build-local and target-pull.
-"$pls_bin" env up --profile "$profile" --build-mode "$build_mode" --artifact "$DIENE_ARTIFACT_DIGEST"
-substrate_seconds=$((SECONDS - substrate_started))
+  local readiness_started=$SECONDS
+  "${DIENE_PLS_BIN:-pls}" env doctor --profile "$profile" --json >"$DRIVER_READINESS" ||
+    diene_die ReadinessEvidenceUnavailable 'pls env doctor emitted no readiness evidence'
+  diene_schema_validate diene-readiness-v1.schema.json "$DRIVER_READINESS" 'readiness evidence'
+  jq -e --arg profile "$profile" '
+    .profile == $profile and .outcome == "Pass" and
+    ([.readiness[] | select(.required == true) | .outcome] | length > 0 and all(. == "Pass")) and
+    any(.readiness[]; .id == "EnvironmentReady" and .outcome == "Pass") and
+    ([.readiness[] | select(.id == "AllocationReady" or .id == "CastformProdSafetyReady" or .id == "CallbackReady") | .outcome]
+      | all(. == "NotRequired"))
+  ' "$DRIVER_READINESS" >/dev/null || diene_die EnvironmentNotReady '17-leaf readiness DAG did not converge'
+  DRIVER_READINESS_SECONDS=$((SECONDS - readiness_started))
+  diene_checkpoint_append "$DRIVER_CHECKPOINT" environment-ready Pass \
+    "$(diene_file_digest "$DRIVER_READINESS")" false
 
-runtime_file=$(diene_discover_runtime "$profile" "$allocation_key" "$generation_key") ||
-  diene_die RuntimeEvidenceUnavailable "Garden emitted no diene-runtime/v1 record for $allocation_key"
-jq -e --arg digest "$DIENE_ARTIFACT_DIGEST" '.artifact.digest == $digest' "$runtime_file" >/dev/null ||
-  diene_die UntrustedSubject 'Garden runtime record does not carry the declared artifact digest'
-substrate_name=$(jq -r '.substrate.name' "$runtime_file")
-# shellcheck disable=SC2016 # $path is a jq variable, bound below
-diene_receipt_patch "$receipt" '.runtimeFile = $path | .cleanup.reasonCode = "RuntimeBound"' --arg path "$runtime_file"
-export DIENE_GARDEN_RUNTIME_FILE=$runtime_file
-
-# ---------------------------------------------------------------------------
-# Readiness, consumed from the ratified read-only doctor command and asserted
-# leaf by leaf: an empty or truncated emission refuses instead of passing.
-# ---------------------------------------------------------------------------
-
-readiness_started=$SECONDS
-"$pls_bin" env doctor --profile "$profile" --json >"$readiness_file" ||
-  diene_die ReadinessEvidenceUnavailable 'pls env doctor produced no readiness evidence'
-diene_schema_validate diene-readiness-v1.schema.json "$readiness_file" 'readiness evidence'
-jq -e --arg profile "$profile" '
-  .profile == $profile and .outcome == "Pass" and
-  ([.readiness[] | select(.required == true) | .outcome] | length > 0 and all(. == "Pass")) and
-  (any(.readiness[]; .id == "EnvironmentReady" and .outcome == "Pass")) and
-  ([.readiness[] | select(.id == "AllocationReady" or .id == "CastformProdSafetyReady" or .id == "CallbackReady") | .outcome]
-     | all(. == "NotRequired"))
-' "$readiness_file" >/dev/null || diene_die EnvironmentNotReady 'resource-native readiness DAG did not converge'
-
-case $DIENE_LANE in
-  ditto-target-pull)
-    jq -e 'any(.readiness[]; .id == "ArtifactPullReady" and .required == true and .outcome == "Pass")' \
-      "$readiness_file" >/dev/null ||
-      diene_die EnvironmentNotReady 'target-pull did not prove ArtifactPullReady'
-    # Each of these is a required result in the lane table, so each is proven
-    # or the lane fails. None of them may become optional green coverage.
+  if [[ $DIENE_LANE == ditto-target-pull ]]; then
     for proof in real-pull evict-repull sibling-denial pull-secret-ownership credential-removal; do
-      "$pull_proof" "$proof" --digest "$DIENE_ARTIFACT_DIGEST" --receipt "$receipt_id" ||
+      "$pull_proof" "$proof" --digest "$DIENE_ARTIFACT_DIGEST" --receipt "$(diene_receipt_id)" ||
         diene_die RequiredCoverageUnavailable "target-pull did not prove $proof"
     done
-    ;;
-  absol)
-    jq -e 'any(.readiness[]; .id == "SeedReady" and .outcome == "NotRequired")' "$readiness_file" >/dev/null ||
-      diene_die EnvironmentNotReady 'Absol reported a required seed'
-    ;;
-  fleet-independence)
-    jq -e 'any(.readiness[]; .id == "SeedReady" and .outcome == "NotRequired")' "$readiness_file" >/dev/null ||
-      diene_die EnvironmentNotReady 'the independence fixture reported a required seed'
-    ;;
-esac
-readiness_seconds=$((SECONDS - readiness_started))
+  fi
 
-# ---------------------------------------------------------------------------
-# Declared journeys. Every selected journey runs and is reported; the lane does
-# not stop at the first failure, so the report carries complete coverage.
-# ---------------------------------------------------------------------------
-
-journeys_started=$SECONDS
-selection="$runtime_dir/selection.json"
-fixture=${DIENE_FIXTURE_ID:-}
-jq -c \
-  --arg lane "$DIENE_LANE" --arg profile "$profile" --arg mode "$build_mode" --arg fixture "$fixture" '
-  .journeys[] |
-  select(any(.appliesTo[];
-    .lane == $lane and .profile == $profile and .buildMode == $mode and
-    ((.fixtureId // "") == $fixture)))
-' "$manifest" >"$selection"
-
-required_failure=0
-entry_file="$runtime_dir/journey.json"
-while IFS= read -r entry; do
-  printf '%s\n' "$entry" >"$entry_file"
-  journey_id=$(jq -er '.id' "$entry_file")
-  pack_id=$(jq -er '.fixturePack.id' "$entry_file")
-  pack_digest=$(jq -er '.fixturePack.digest' "$entry_file")
-  journey_required=$(jq -r '.required' "$entry_file")
-  diene_require_safe_id fixture_pack_id "$pack_id"
-  pack_path=".diene/ci/fixtures/$pack_id/manifest.yaml"
-  journey_started=$SECONDS
-
-  if [[ ! -f $pack_path ]]; then
-    # A required missing pack is blocking Fail; an optional one is
-    # non-blocking Unavailable and never counts as passed.
-    if [[ $journey_required == true ]]; then
-      outcome=Fail
-      required_failure=1
-    else
+  local journeys_started=$SECONDS selection="$DRIVER_RUNTIME_DIR/selection.jsonl"
+  diene_select_journeys "$manifest" "$selection"
+  local required_failure=0 entry_file="$DRIVER_RUNTIME_DIR/journey.json"
+  while IFS= read -r entry; do
+    printf '%s\n' "$entry" >"$entry_file"
+    local journey_id pack_id pack_digest journey_required pack_path actual outcome reason started
+    journey_id=$(jq -er '.id' "$entry_file")
+    pack_id=$(jq -er '.fixturePack.id' "$entry_file")
+    pack_digest=$(jq -er '.fixturePack.digest' "$entry_file")
+    journey_required=$(jq -r '.required' "$entry_file")
+    pack_path=".diene/ci/fixtures/$pack_id/manifest.yaml"
+    started=$SECONDS
+    if [[ ! -f $pack_path ]]; then
       outcome=Unavailable
+      [[ $journey_required != true ]] || { outcome=Fail; required_failure=1; }
+      jq -nc --arg id "$journey_id" --arg outcome "$outcome" --argjson required "$journey_required" \
+        --argjson duration "$((SECONDS - started))" \
+        '{id:$id,outcome:$outcome,reasonCode:"FixtureUnavailable",required:$required,durationSeconds:$duration}' \
+        >>"$DRIVER_RESULTS"
+      continue
     fi
-    jq -nc --arg id "$journey_id" --arg outcome "$outcome" \
-      --argjson required "$journey_required" --argjson duration "$((SECONDS - journey_started))" \
-      '{id: $id, outcome: $outcome, reasonCode: "FixtureUnavailable", required: $required, durationSeconds: $duration}' \
-      >>"$results_file"
-    continue
-  fi
+    actual=$(diene_file_digest "$pack_path")
+    if [[ $actual != "$pack_digest" ]]; then
+      required_failure=1
+      jq -nc --arg id "$journey_id" --argjson required "$journey_required" --arg digest "$actual" \
+        --argjson duration "$((SECONDS - started))" \
+        '{id:$id,outcome:"Fail",reasonCode:"FixturePackDigestMismatch",required:$required,
+          durationSeconds:$duration,fixturePackDigest:$digest}' >>"$DRIVER_RESULTS"
+      continue
+    fi
+    outcome=Pass
+    reason=AssertionsSatisfied
+    if ! diene_run_argv "$entry_file" . setup; then outcome=Fail; reason=SetupFailed; fi
+    if [[ $outcome == Pass ]] && ! diene_run_argv "$entry_file" . probe; then outcome=Fail; reason=ProbeFailed; fi
+    if ! diene_run_argv "$entry_file" . cleanup; then outcome=Fail; reason=CleanupFailed; required_failure=1; fi
+    [[ $outcome == Pass || $journey_required != true ]] || required_failure=1
+    jq -nc --arg id "$journey_id" --arg outcome "$outcome" --arg reason "$reason" \
+      --argjson required "$journey_required" --argjson duration "$((SECONDS - started))" \
+      --arg digest "$pack_digest" \
+      '{id:$id,outcome:$outcome,reasonCode:$reason,required:$required,durationSeconds:$duration,
+        fixturePackDigest:$digest}' >>"$DRIVER_RESULTS"
+  done <"$selection"
+  [[ -s $DRIVER_RESULTS ]] ||
+    diene_die JourneySelectorUnsatisfied 'selected core journey set produced no executed result'
+  DRIVER_JOURNEY_SECONDS=$((SECONDS - journeys_started))
+  ((required_failure == 0)) || diene_die JourneyFailed 'a required journey did not pass'
+  diene_checkpoint_append "$DRIVER_CHECKPOINT" journeys Pass \
+    "$(phase_digest journeys "$DIENE_LANE" "$DRIVER_JOURNEY_SECONDS")" false
 
-  # The declared pack digest is immutable: bytes that drift from the
-  # declaration are refused rather than silently exercised.
-  actual_pack_digest=$(diene_file_digest "$pack_path")
-  if [[ $actual_pack_digest != "$pack_digest" ]]; then
-    required_failure=1
-    jq -nc --arg id "$journey_id" --argjson required "$journey_required" \
-      --argjson duration "$((SECONDS - journey_started))" --arg digest "$actual_pack_digest" \
-      '{id: $id, outcome: "Fail", reasonCode: "FixturePackDigestMismatch", required: $required, durationSeconds: $duration, fixturePackDigest: $digest}' \
-      >>"$results_file"
-    continue
-  fi
+  diene_verify_endpoint_law "$DRIVER_RUNTIME_DIR/endpoint-law.json"
+}
 
-  outcome=Pass
-  reason=AssertionsSatisfied
-  if ! diene_run_argv "$entry_file" '.' setup; then
-    outcome=Fail
-    reason=SetupFailed
-  elif ! diene_run_argv "$entry_file" '.' probe; then
-    outcome=Fail
-    reason=ProbeFailed
-  fi
-  # Cleanup failure is always Fail or visible receipt-scoped debt, regardless
-  # of whether the journey itself was required.
-  if ! diene_run_argv "$entry_file" '.' cleanup; then
-    outcome=Fail
-    reason=CleanupFailed
-    required_failure=1
-  fi
-  [[ $outcome == Pass || $journey_required != true ]] || required_failure=1
+environment_k3d_main() {
+  case ${1:-orchestrate} in
+    --validate-inputs)
+      diene_validate_inputs
+      ;;
+    orchestrate)
+      shift || true
+      orchestrate "$@"
+      ;;
+    cleanup)
+      shift
+      orchestrator_cleanup_command "$@"
+      ;;
+    lifecycle)
+      shift
+      orchestrator_verify_lifecycle "$@"
+      ;;
+    driver)
+      shift
+      driver_core "$@"
+      ;;
+    *) diene_die InputContractInvalid "unknown environment-k3d mode ${1:-}" ;;
+  esac
+}
 
-  jq -nc --arg id "$journey_id" --arg outcome "$outcome" --arg reason "$reason" \
-    --argjson required "$journey_required" --argjson duration "$((SECONDS - journey_started))" \
-    --arg digest "$pack_digest" \
-    '{id: $id, outcome: $outcome, reasonCode: $reason, required: $required, durationSeconds: $duration, fixturePackDigest: $digest}' \
-    >>"$results_file"
-done <"$selection"
-journeys_seconds=$((SECONDS - journeys_started))
-
-if [[ ! -s $results_file ]]; then
-  jq -nc '{id: "NoDeclaration", outcome: "NotApplicable", reasonCode: "NoDeclaration", required: false, durationSeconds: 0}' \
-    >"$results_file"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  environment_k3d_main "$@"
 fi
-
-((required_failure == 0)) || diene_die JourneyFailed 'a required declared journey did not pass'
-
-printf 'subject_digest=%s\nreceipt_id=%s\nallocation_key=%s\n' \
-  "$DIENE_ARTIFACT_DIGEST" "$receipt_id" "$allocation_key" >>"${GITHUB_OUTPUT:-/dev/null}"

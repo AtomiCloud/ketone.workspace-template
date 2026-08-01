@@ -1,27 +1,190 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.atomi.cloud/diene/diene-ci-receipt-v1.schema.json",
-  "title": "Diene CI cleanup receipt v1",
-  "description": "CI-owned cleanup selector, written before any substrate mutation so a cancelled run is still swept. It carries the full immutable owner tuple plus the lane-scoped allocation and generation keys, and it binds the Garden-emitted runtime file only once that file has actually been discovered. A receipt whose runtimeFile is null authorises no deletion; it can only become visible cleanup debt.",
+  "title": "Diene CI Namespace and Garden cleanup receipt v1",
+  "description": "Exact-run receipt for one anonymous Namespace instance and the Garden runtime inside it. The Namespace clusterId is the sole outer destructive selector; names, labels, endpoints, prefixes, profiles, and repository-wide selectors never authorize destroy. The receipt remains red until exact destroy and a separate positive absence observation both pass.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["apiVersion", "owner", "lane", "profile", "buildMode", "runtimeFile", "cleanup"],
+  "required": [
+    "apiVersion",
+    "owner",
+    "lane",
+    "profile",
+    "buildMode",
+    "tooling",
+    "namespace",
+    "runtimeFile",
+    "cleanup"
+  ],
   "properties": {
     "apiVersion": { "const": "diene.atomi.cloud/ci-receipt/v1" },
     "owner": { "$ref": "#/$defs/owner" },
-    "lane": { "enum": ["ditto-build-local", "ditto-target-pull", "ditto-vendor", "absol", "fleet-independence"] },
+    "lane": { "$ref": "#/$defs/lane" },
     "profile": { "enum": ["ditto", "absol"] },
     "buildMode": { "enum": ["build-local", "target-pull"] },
-    "actionId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,127}$" },
-    "runtimeFile": { "type": ["string", "null"], "pattern": "^/" },
-    "hostPolicy": {
+    "tooling": { "$ref": "#/$defs/tooling" },
+    "actionId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,127}$"
+    },
+    "namespace": { "$ref": "#/$defs/namespace" },
+    "runtimeFile": {
+      "type": ["string", "null"],
+      "pattern": "^/"
+    },
+    "checkpointChainDigest": { "$ref": "#/$defs/digest" },
+    "lifecycleDigest": { "$ref": "#/$defs/digest" },
+    "terminalReportDigest": { "$ref": "#/$defs/digest" },
+    "cleanup": { "$ref": "#/$defs/cleanup" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "lane": { "const": "absol" } }, "required": ["lane"] },
+      "then": {
+        "properties": {
+          "profile": { "const": "absol" },
+          "buildMode": { "const": "build-local" },
+          "namespace": {
+            "properties": {
+              "cacheAttached": { "const": false },
+              "egressProfile": { "const": "absol-hermetic-v1" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "lane": { "const": "fleet-independence" } }, "required": ["lane"] },
+      "then": {
+        "properties": {
+          "profile": { "const": "ditto" },
+          "buildMode": { "const": "build-local" },
+          "namespace": {
+            "properties": {
+              "cacheAttached": { "const": false },
+              "egressProfile": { "const": "fleet-independence-v1" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "lane": { "const": "ditto-vendor" } }, "required": ["lane"] },
+      "then": { "required": ["actionId"] },
+      "else": { "not": { "required": ["actionId"] } }
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "lane": {
+      "enum": [
+        "ditto-build-local",
+        "ditto-target-pull",
+        "ditto-vendor",
+        "absol",
+        "fleet-independence"
+      ]
+    },
+    "owner": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["applied", "mode"],
+      "required": [
+        "repositoryId",
+        "repositoryKey",
+        "sourceSha",
+        "runId",
+        "runAttempt",
+        "receiptId",
+        "allocationKey",
+        "generationKey",
+        "workflowRef"
+      ],
       "properties": {
-        "applied": { "type": "boolean" },
-        "mode": { "enum": ["allowlist", "closure-denied-network"] },
-        "allowFile": { "type": ["string", "null"], "pattern": "^/" }
+        "repositoryId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "repositoryKey": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+$" },
+        "sourceSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "runId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "runAttempt": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "receiptId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "allocationKey": {
+          "type": "string",
+          "pattern": "^r[1-9][0-9]*-w[1-9][0-9]*-a[1-9][0-9]*-l[a-z-]+(-v[a-z0-9][a-z0-9-]*)?$"
+        },
+        "generationKey": { "type": "string", "pattern": "^g[0-9a-f]{12}$" },
+        "workflowRef": {
+          "type": "string",
+          "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$"
+        }
+      }
+    },
+    "tooling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nscVersion", "nscArtifactDigest", "nscBinaryDigest"],
+      "properties": {
+        "nscVersion": { "const": "v0.0.532" },
+        "nscArtifactDigest": { "$ref": "#/$defs/digest" },
+        "nscBinaryDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "reasonCode"],
+      "properties": {
+        "outcome": { "enum": ["Pending", "Pass", "Fail", "NotAttempted"] },
+        "reasonCode": { "type": "string", "minLength": 1 },
+        "observedAt": { "type": "string", "format": "date-time" },
+        "durationSeconds": { "type": "integer", "minimum": 0 },
+        "receiptDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clusterId",
+        "duration",
+        "ephemeral",
+        "egressProfile",
+        "cacheAttached",
+        "policy",
+        "create",
+        "destroy",
+        "absence"
+      ],
+      "properties": {
+        "clusterId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$" },
+        "duration": { "const": "2h" },
+        "ephemeral": { "const": true },
+        "egressProfile": {
+          "enum": [
+            "ditto-build-local-v1",
+            "ditto-target-pull-v1",
+            "ditto-vendor-v1",
+            "absol-hermetic-v1",
+            "fleet-independence-v1"
+          ]
+        },
+        "cacheAttached": { "type": "boolean" },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mechanism", "trustBoundary", "platformPerInstancePolicy", "applied", "hostileProbes"],
+          "properties": {
+            "mechanism": { "const": "interim-in-guest-iptables-nft" },
+            "trustBoundary": { "const": "trusted-generated-content" },
+            "platformPerInstancePolicy": { "const": "pending-support-ask-4" },
+            "applied": { "type": "boolean" },
+            "hostileProbes": { "enum": ["Pending", "Pass", "Fail"] }
+          }
+        },
+        "create": { "$ref": "#/$defs/phase" },
+        "destroy": { "$ref": "#/$defs/phase" },
+        "absence": { "$ref": "#/$defs/phase" }
       }
     },
     "cleanup": {
@@ -32,25 +195,10 @@
         "outcome": { "enum": ["Pending", "Pass", "Fail"] },
         "reasonCode": { "type": "string", "minLength": 1 },
         "finalizerWaitSeconds": { "type": "integer", "minimum": 0, "maximum": 900 },
-        "debt": { "type": "array", "items": { "type": "string", "minLength": 1 } }
-      }
-    }
-  },
-  "$defs": {
-    "owner": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["repositoryId", "repositoryKey", "sourceSha", "runId", "runAttempt", "receiptId", "allocationKey", "generationKey", "workflowRef"],
-      "properties": {
-        "repositoryId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
-        "repositoryKey": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+$" },
-        "sourceSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "runId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
-        "runAttempt": { "type": "string", "pattern": "^[1-9][0-9]*$" },
-        "receiptId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
-        "allocationKey": { "type": "string", "pattern": "^r[1-9][0-9]*-w[1-9][0-9]*-a[1-9][0-9]*-l[a-z-]+(-v[a-z0-9][a-z0-9-]*)?$" },
-        "generationKey": { "type": "string", "pattern": "^g[0-9a-f]{12}$" },
-        "workflowRef": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$" }
+        "debt": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
       }
     }
   }

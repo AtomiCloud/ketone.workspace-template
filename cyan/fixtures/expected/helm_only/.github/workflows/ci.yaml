@@ -1,7 +1,8 @@
 name: CI
 on:
-  push:
-  pull_request:
+  push: null
+  pull_request: null
+permissions: {}
 jobs:
   precommit:
     name: Pre-Commit
@@ -9,16 +10,10 @@ jobs:
       contents: read
     uses: ./.github/workflows/⚡reusable-precommit.yaml
     secrets: inherit
-  helm:
-    name: Helm Chart
-    uses: ./.github/workflows/⚡reusable-helm.yaml
-    secrets: inherit
-    with:
-      chart_path: ./infra/root_chart
   artifact-build:
     name: Artifact Build
     needs: precommit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -29,17 +24,25 @@ jobs:
       - name: Produce the immutable application artifact
         env:
           DIENE_BASE_WORKFLOW_REF: ${{ github.repository }}/.github/workflows/ci.yaml@${{ github.sha }}
-        run: |
+        run: >
           # The subject is produced by the repository's own publisher. This job
+
           # never derives a digest from a source tree and never fabricates
+
           # provenance, and a missing publisher is a stable refusal rather than
+
           # a quiet pass: an absent artifact must not read as a green build.
+
           producer=.diene/ci/artifact-producer.sh
+
           if [[ ! -x $producer ]]; then
             printf 'ArtifactProducerUnavailable: %s is absent or not executable\n' "$producer" >&2
             exit 1
           fi
-          "$producer" --source-sha "$GITHUB_SHA" --output "$RUNNER_TEMP/artifact.v1.json"
+
+          "$producer" --source-sha "$GITHUB_SHA" --output
+          "$RUNNER_TEMP/artifact.v1.json"
+
           nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh \
             --validate-subject "$RUNNER_TEMP/artifact.v1.json"
       - name: Publish the immutable same-run subject
@@ -52,7 +55,7 @@ jobs:
   environment-contract-tests:
     name: Environment Contract Tests
     needs: precommit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -63,8 +66,10 @@ jobs:
   environment-profile-contract:
     name: Environment Profile Contract
     if: github.event_name == 'pull_request' || github.ref_protected == true
-    needs: [precommit, artifact-build]
-    runs-on: ubuntu-24.04
+    needs:
+      - precommit
+      - artifact-build
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     concurrency:
       group: profile-${{ fromJSON(github.repository_id) }}-${{ github.sha }}
@@ -96,4 +101,9 @@ jobs:
           path: ${{ runner.temp }}/diene-profile-contract.json
           if-no-files-found: error
           retention-days: 7
-permissions: {}
+  helm:
+    name: Helm Chart
+    uses: ./.github/workflows/⚡reusable-helm.yaml
+    secrets: inherit
+    with:
+      chart_path: ./infra/root_chart

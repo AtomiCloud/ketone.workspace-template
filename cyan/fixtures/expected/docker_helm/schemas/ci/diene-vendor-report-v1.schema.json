@@ -2,28 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.atomi.cloud/diene/diene-vendor-report-v1.schema.json",
   "title": "Diene declared-vendor action report v1",
-  "description": "Evidence for one separately invoked vendor action. It is emitted for failing runs as well as passing ones. It may not carry core readiness or journey fields, so a vendor action can never satisfy, replace or weaken a core assertion.",
+  "description": "Evidence for one separately invoked vendor action. Existing report vocabulary remains valid; Namespace lifecycle and predecessor-chain evidence are additive for the active venue. Core readiness and journey fields remain forbidden.",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "apiVersion",
-    "repositoryRevision",
-    "workflow",
-    "lane",
-    "profile",
-    "buildMode",
-    "actionId",
-    "componentClass",
-    "permissionRule",
-    "receiptId",
-    "instance",
-    "tooling",
-    "vendorOutcome",
-    "providerCleanup",
-    "evidence",
-    "teardown",
-    "timings",
-    "outcome"
+    "apiVersion", "repositoryRevision", "workflow", "lane", "profile", "buildMode",
+    "actionId", "componentClass", "permissionRule", "receiptId", "instance", "tooling",
+    "vendorOutcome", "providerCleanup", "evidence", "teardown", "timings", "outcome"
   ],
   "properties": {
     "apiVersion": { "const": "diene.atomi.cloud/ci-vendor-report/v1" },
@@ -43,19 +28,128 @@
     "credential": { "$ref": "#/$defs/credential" },
     "evidence": { "$ref": "diene-environment-report-v1.schema.json#/$defs/evidence" },
     "teardown": { "$ref": "diene-environment-report-v1.schema.json#/$defs/teardown" },
+    "namespaceLifecycle": { "$ref": "diene-environment-report-v1.schema.json#/$defs/namespaceLifecycle" },
+    "checkpointChain": { "$ref": "diene-environment-report-v1.schema.json#/$defs/checkpointChain" },
     "timings": { "$ref": "diene-environment-report-v1.schema.json#/$defs/timings" },
     "outcome": { "enum": ["Pass", "Fail", "NotApplicable", "Unavailable"] },
     "reasonCode": { "type": "string", "minLength": 1 }
   },
   "allOf": [
     {
-      "description": "A vendor report may never open the core namespace.",
-      "not": { "anyOf": [{ "required": ["readiness"] }, { "required": ["journeys"] }, { "required": ["coverage"] }, { "required": ["subject"] }] }
+      "not": {
+        "anyOf": [
+          { "required": ["readiness"] },
+          { "required": ["journeys"] },
+          { "required": ["coverage"] },
+          { "required": ["subject"] }
+        ]
+      }
     },
     {
-      "description": "Anything other than a plain pass must name its stable reason.",
-      "if": { "properties": { "outcome": { "enum": ["Fail", "NotApplicable", "Unavailable"] } }, "required": ["outcome"] },
+      "if": {
+        "properties": { "outcome": { "enum": ["Fail", "NotApplicable", "Unavailable"] } },
+        "required": ["outcome"]
+      },
       "then": { "required": ["reasonCode"] }
+    },
+    {
+      "if": { "required": ["namespaceLifecycle"] },
+      "then": {
+        "required": ["checkpointChain"],
+        "properties": {
+          "instance": {
+            "required": ["clusterId", "osId", "k3sVersion", "kubernetesVersion", "nodeCount", "capacity"]
+          },
+          "tooling": {
+            "required": [
+              "nscVersion", "nscArtifactDigest", "nscBinaryDigest",
+              "sourceArchiveDigest", "artifactSubjectDigest"
+            ]
+          },
+          "evidence": {
+            "required": ["proofBundle"],
+            "properties": {
+              "egressCanary": {
+                "required": ["profileId", "enforcement", "platformStatus", "hostileProbes"]
+              }
+            }
+          },
+          "timings": {
+            "required": [
+              "createToKubernetesReadySeconds", "driverTransferSetupSeconds", "renderApplySeconds",
+              "collectionSeconds", "destroySeconds", "totalColdSeconds"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "enum": ["Pass", "Unavailable"] } },
+        "required": ["outcome", "namespaceLifecycle"]
+      },
+      "then": {
+        "properties": {
+          "providerCleanup": {
+            "properties": { "outcome": { "const": "Pass" }, "absenceProven": { "const": true } }
+          },
+          "instance": {
+            "properties": {
+              "clusterId": { "type": "string" }, "osId": { "const": "wolfi" },
+              "k3sVersion": { "type": "string" }, "kubernetesVersion": { "type": "string" },
+              "nodeCount": { "const": 1 }, "capacity": { "type": "object" }
+            }
+          },
+          "namespaceLifecycle": {
+            "properties": {
+              "outcome": { "const": "Pass" },
+              "create": { "properties": { "outcome": { "const": "Pass" } } },
+              "transfer": { "properties": { "outcome": { "const": "Pass" } } },
+              "ssh": { "properties": { "outcome": { "const": "Pass" } } },
+              "collection": { "properties": { "outcome": { "const": "Pass" } } },
+              "destroy": { "properties": { "outcome": { "const": "Pass" } } },
+              "absence": { "properties": { "outcome": { "const": "Pass" } } }
+            }
+          },
+          "checkpointChain": {
+            "properties": {
+              "validated": { "const": true }, "resumedLegs": { "const": 0 }, "finalCleanPass": { "const": true },
+              "checkpoints": {
+                "items": {
+                  "properties": {
+                    "outcome": { "const": "Pass" },
+                    "resumed": { "const": false }
+                  }
+                }
+              }
+            }
+          },
+          "evidence": {
+            "properties": {
+              "proofBundle": {
+                "properties": { "outcome": { "const": "Pass" }, "collectedBeforeDestroy": { "const": true } }
+              },
+              "egressCanary": { "properties": { "outcome": { "const": "Pass" } } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "Unavailable" } },
+        "required": ["outcome", "namespaceLifecycle"]
+      },
+      "then": {
+        "properties": {
+          "vendorOutcome": {
+            "properties": {
+              "outcome": { "const": "Unavailable" },
+              "required": { "const": false }
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -66,29 +160,26 @@
       "properties": {
         "outcome": { "enum": ["Pass", "Fail", "Unavailable"] },
         "reasonCode": { "type": "string", "minLength": 1 },
-        "objectIds": {
-          "description": "Provider object IDs recorded in the run receipt. Empty only when the adapter created none.",
-          "type": "array",
-          "items": { "type": "string", "minLength": 1 }
-        },
+        "objectIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "absenceProven": { "type": "boolean" },
         "durableDebtRecord": { "type": ["string", "null"], "minLength": 1 }
       },
       "allOf": [
         {
-          "description": "Unproven provider absence must leave a durable debt record; it can never be silently dropped.",
           "if": { "properties": { "absenceProven": { "const": false } }, "required": ["absenceProven"] },
-          "then": { "properties": { "durableDebtRecord": { "type": "string" } }, "required": ["durableDebtRecord"] }
+          "then": {
+            "properties": { "durableDebtRecord": { "type": "string" } },
+            "required": ["durableDebtRecord"]
+          }
         }
       ]
     },
     "credential": {
-      "description": "Observed credential lifecycle, never asserted. `removed` may only be true when the broker confirmed revocation after provider absence was proved.",
       "type": "object",
       "additionalProperties": false,
       "required": ["issuer", "masked", "issuedAfterReadiness", "removed", "removalObserved"],
       "properties": {
-        "issuer": { "const": "host-owned-broker" },
+        "issuer": { "enum": ["host-owned-broker", "approved-environment-phase-broker"] },
         "masked": { "type": "boolean" },
         "issuedAfterReadiness": { "type": "boolean" },
         "removed": { "type": "boolean" },

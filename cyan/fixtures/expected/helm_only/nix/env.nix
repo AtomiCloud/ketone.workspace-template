@@ -2,17 +2,17 @@
 with packages;
 {
   dev = [
-    git
-    pls
   ];
 
   lint = [
     actionlint
+    check-jsonschema
     gitlint
     go-task
     infralint
     kubeconform
     kyverno
+    pkgs.ripgrep
     pre-commit
     sg
     shellcheck
@@ -20,6 +20,13 @@ with packages;
   ];
 
   main = [
+    git
+    kubectl
+  ];
+
+  mainLinux = [
+    iproute2
+    pkgs.getent
   ];
 
   releaser = [
@@ -29,5 +36,7 @@ with packages;
   system = [
     atomiutils
     infrautils
+    nsc
+    pls
   ];
 }

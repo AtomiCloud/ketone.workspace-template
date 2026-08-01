@@ -17,40 +17,92 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 source "$script_dir/environment-lib.sh"
 
+profile_renderer() {
+  local renderer=${DIENE_PROFILE_RENDER_BIN:-}
+  [[ -n $renderer ]] ||
+    diene_die ProfileRenderInterfaceUnavailable 'Garden ratifies no runtime-free executable render command'
+  command -v -- "$renderer" >/dev/null 2>&1 ||
+    diene_die ProfileRenderInterfaceUnavailable 'configured profile renderer is absent or not executable'
+  printf '%s\n' "$renderer"
+}
+
 if [[ ${1:-} == --validate-inputs ]]; then
   diene_validate_inputs
   exit 0
 fi
 
-# Release-boundary prerequisites. This runs on the GitHub-hosted authorization
-# path, before any lane job can select a disposable self-hosted runner: a
-# missing controller/image pin, an unaccepted RunnerProvisionerReady proof, or
-# an absent repository-owned artifact subject refuses here rather than after a
-# VM has already been allocated.
+# Pre-SIT prerequisites. This is deliberately runtime-free and is invoked both
+# by the workflow contract job and again by the lifecycle orchestrator before
+# `nsc create`. A missing producer, invalid selected declaration, malformed
+# production fixture, bad Promotion/Freight object, or non-canonical duration
+# refuses before Namespace authority mutates anything.
 if [[ ${1:-} == --validate-prerequisites ]]; then
   diene_require_command jq
   diene_require_command "${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}"
-
-  pin=${DIENE_RUNNER_PIN:-.diene/ci/runner-pin.v1.json}
-  [[ -f $pin ]] ||
-    diene_die RunnerIsolationUnavailable 'no accepted diene-ci-runner/v1 controller and image pin; refusing before runner selection'
-  diene_schema_validate diene-runner-pin-v1.schema.json "$pin" 'runner pin'
-
   producer=${DIENE_ARTIFACT_PRODUCER:-.diene/ci/artifact-producer.sh}
   [[ -x $producer ]] ||
-    diene_die ArtifactProducerUnavailable 'no repository-owned artifact producer; refusing before runner selection'
+    diene_die ArtifactProducerUnavailable 'no repository-owned artifact producer; refusing before nsc create'
+  [[ ${DIENE_NSC_DURATION:-2h} == 2h ]] ||
+    diene_die ProductionFixtureInvalid 'production SIT duration is exactly 2h'
+  [[ ${DIENE_PRE_SIT_NEGATIVE_CANARY:-0} == 0 ]] ||
+    diene_die ProductionFixtureInvalid 'the pre-SIT negative canary was intentionally activated'
 
-  # A vendor dispatch additionally proves its declaration and the exact
-  # requested action before a runner can be selected.
-  if [[ -n ${DIENE_VENDOR_MANIFEST:-} ]]; then
+  if [[ ${DIENE_LANE:-} == ditto-vendor ]]; then
     [[ -f ${DIENE_VENDOR_MANIFEST} ]] || diene_die InputContractInvalid 'vendor manifest missing'
     diene_schema_validate diene-vendors-v1.schema.json "$DIENE_VENDOR_MANIFEST" 'vendor manifest'
     jq -e --arg id "${DIENE_ACTION_ID:?}" '[.actions[] | select(.actionId == $id)] | length == 1' \
       "$DIENE_VENDOR_MANIFEST" >/dev/null ||
       diene_die InputContractInvalid 'vendor action is not declared exactly once'
+  else
+    journeys=${DIENE_JOURNEY_MANIFEST:-}
+    [[ $journeys == .diene/ci/journeys.v1.yaml && -f $journeys ]] ||
+      diene_die InputContractInvalid 'selected journey manifest is absent or non-canonical'
+    diene_select_journeys "$journeys"
   fi
 
-  printf 'PrerequisitesAccepted\n'
+  fixture_root=${DIENE_PRE_SIT_FIXTURE_ROOT:-.diene/ci/fixtures}
+  if [[ -d $fixture_root ]]; then
+    while IFS= read -r -d '' fixture; do
+      fixture_json=$fixture
+      converted=
+      if ! jq empty "$fixture" >/dev/null 2>&1; then
+        diene_require_command yq
+        converted=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-fixture.XXXXXX")
+        yq -o=json '.' "$fixture" >"$converted" || {
+          rm -f -- "$converted"
+          diene_die ProductionFixtureInvalid "$fixture is not valid YAML/JSON"
+        }
+        fixture_json=$converted
+      fi
+      jq -e '
+        ([.. | objects | .duration? // empty] |
+          all(type == "string" and test("^[1-9][0-9]*(s|m|h|d)$"))) and
+        ([.. | objects | select(.kind? == "Promotion" or .kind? == "Freight")] |
+          all((.apiVersion | type == "string" and length > 0) and
+              (.metadata.name | type == "string" and length > 0)))
+      ' "$fixture_json" >/dev/null || {
+        [[ -z $converted ]] || rm -f -- "$converted"
+        diene_die ProductionFixtureInvalid \
+          "$fixture carries an invalid Promotion/Freight object or duration spelling"
+      }
+      [[ -z $converted ]] || rm -f -- "$converted"
+    done < <(find "$fixture_root" -type f \( -name 'manifest.yaml' -o -name 'manifest.yml' -o -name 'manifest.json' \) -print0)
+  fi
+
+  selected_manifest=${DIENE_VENDOR_MANIFEST:-${DIENE_JOURNEY_MANIFEST:-}}
+  if [[ -f $selected_manifest ]]; then
+    while IFS=$'\t' read -r pack_id pack_digest; do
+      [[ -n $pack_id ]] || continue
+      pack_path="$fixture_root/$pack_id/manifest.yaml"
+      [[ ! -f $pack_path ]] || [[ $(diene_file_digest "$pack_path") == "$pack_digest" ]] ||
+        diene_die ProductionFixtureInvalid "present fixture $pack_id does not match its immutable digest"
+    done < <(jq -r '
+      if has("journeys") then .journeys[].fixturePack
+      else .actions[].fixturePack end | [.id,.digest] | @tsv
+    ' "$selected_manifest")
+  fi
+
+  printf 'PreSitContractAccepted\n'
   exit 0
 fi
 
@@ -110,9 +162,10 @@ if [[ ${1:-} == --render-profile ]]; then
     lapras | ditto | rotom | absol) ;;
     *) diene_die InputContractInvalid "unknown profile $profile" ;;
   esac
-  [[ -n ${DIENE_PROFILE_RENDER_BIN:-} ]] ||
-    diene_die ProfileRenderInterfaceUnavailable 'Garden ratifies no runtime-free executable render command'
-  exec "$DIENE_PROFILE_RENDER_BIN" --profile "$profile"
+  renderer=$(profile_renderer)
+  "$renderer" --profile "$profile" ||
+    diene_die ProfileRenderInterfaceUnavailable "$profile executable renderer failed"
+  exit 0
 fi
 
 diene_require_command jq
@@ -121,6 +174,15 @@ diene_require_command "${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}"
 lock=${DIENE_ENVIRONMENT_LOCK:-.diene/ci/environment-lock.v1.json}
 report=${DIENE_PROFILE_REPORT:-${RUNNER_TEMP:-/tmp}/diene-profile-contract.json}
 raw=$(mktemp "${RUNNER_TEMP:-/tmp}/diene-profile-raw.XXXXXX")
+render_dir=
+cleanup_profile_temps() {
+  rm -f -- "$raw"
+  if [[ -n $render_dir ]]; then
+    chmod -R u+rwX "$render_dir" 2>/dev/null || true
+    rm -r -- "$render_dir"
+  fi
+}
+trap cleanup_profile_temps EXIT
 
 emit() {
   "$script_dir/environment-report.sh" --kind profile --input "$raw" --output "$report"
@@ -129,7 +191,7 @@ emit() {
 
 # A repository that declares no environment lock has not opted in. That is
 # explicit NotApplicable/NoDeclaration, never an implied pass.
-if [[ ! -f $lock ]]; then
+if [[ ! -e $lock && ! -L $lock ]]; then
   jq -n '{
     apiVersion: "diene.atomi.cloud/ci-profile-report/v1",
     outcome: "NotApplicable", reasonCode: "NoDeclaration",
@@ -147,9 +209,17 @@ if [[ ! -f $lock ]]; then
   exit 0
 fi
 
+[[ -f $lock && ! -L $lock ]] ||
+  diene_die InputContractInvalid 'environment lock must be a regular file'
+jq empty "$lock" >/dev/null 2>&1 ||
+  diene_die PreviewManifestSchemaMismatch 'environment lock is not valid JSON'
+
 lock_digest=$(diene_file_digest "$lock")
 
 # --- static corpus gates over the repository-owned lock ---------------------
+
+jq -e '[.profiles | keys[]] | all(. != "porygon")' "$lock" >/dev/null ||
+  diene_die PreviewManifestSchemaMismatch 'retired profile identity porygon found'
 
 jq -e '
   . as $root |
@@ -162,9 +232,6 @@ jq -e '
   (["lapras","ditto","rotom","absol"] | all(. as $p | $root.profiles[$p].substrate == "k3d")) and
   (["eevee","castform"] | all(. as $p | $root.profiles[$p].substrate == "entei-vcluster"))
 ' "$lock" >/dev/null || diene_die PreviewManifestSchemaMismatch 'substrate parity mismatch'
-
-jq -e '[.profiles | keys[]] | all(. != "porygon")' "$lock" >/dev/null ||
-  diene_die PreviewManifestSchemaMismatch 'retired profile identity found'
 
 jq -e '
   ([.. | objects | keys[]] | all(. != "ref" and . != "operatorId" and . != "versionPin" and . != "commitPin")) and
@@ -189,9 +256,12 @@ pls_bin=${DIENE_PLS_BIN:-pls}
 diene_require_command "$pls_bin"
 # Ditto permits only build-local|target-pull; Absol only closure-backed
 # build-local. Switching validates the pair and never mutates.
-"$pls_bin" env switch --profile ditto --build-mode build-local
-"$pls_bin" env switch --profile ditto --build-mode target-pull
-"$pls_bin" env switch --profile absol --build-mode build-local
+"$pls_bin" env switch --profile ditto --build-mode build-local ||
+  diene_die PreviewManifestSchemaMismatch 'Ditto build-local profile/mode pair was refused'
+"$pls_bin" env switch --profile ditto --build-mode target-pull ||
+  diene_die PreviewManifestSchemaMismatch 'Ditto target-pull profile/mode pair was refused'
+"$pls_bin" env switch --profile absol --build-mode build-local ||
+  diene_die PreviewManifestSchemaMismatch 'Absol build-local profile/mode pair was refused'
 if "$pls_bin" env switch --profile absol --build-mode target-pull 2>/dev/null; then
   diene_die PreviewManifestSchemaMismatch 'Absol accepted a non closure-backed build mode'
 fi
@@ -202,10 +272,11 @@ rendered='[]'
 render_outcome=Unavailable
 render_reason=ProfileRenderInterfaceUnavailable
 if [[ -n ${DIENE_PROFILE_RENDER_BIN:-} ]]; then
+  renderer=$(profile_renderer)
   render_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/diene-profile.XXXXXX")
-  trap 'rm -rf -- "$render_dir"' EXIT
   for profile in lapras ditto rotom absol; do
-    "$DIENE_PROFILE_RENDER_BIN" --profile "$profile" >"$render_dir/$profile.json"
+    "$renderer" --profile "$profile" >"$render_dir/$profile.json" ||
+      diene_die ProfileRenderInterfaceUnavailable "$profile executable renderer failed"
     jq -e --arg profile "$profile" '.profile == $profile and .substrate == "k3d"' "$render_dir/$profile.json" >/dev/null ||
       diene_die ProfileRenderMismatch "$profile did not render the local k3d contract"
   done

@@ -2,9 +2,12 @@ name: CI
 on:
   push:
   pull_request:
+permissions: {}
 jobs:
   precommit:
     name: Pre-Commit
+    # The workflow default is the empty set, so every caller job states the
+    # least privilege it actually needs.
     permissions:
       contents: read
     uses: ./.github/workflows/⚡reusable-precommit.yaml
@@ -12,7 +15,7 @@ jobs:
   artifact-build:
     name: Artifact Build
     needs: precommit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -46,7 +49,7 @@ jobs:
   environment-contract-tests:
     name: Environment Contract Tests
     needs: precommit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -58,7 +61,7 @@ jobs:
     name: Environment Profile Contract
     if: github.event_name == 'pull_request' || github.ref_protected == true
     needs: [precommit, artifact-build]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     concurrency:
       group: profile-${{ fromJSON(github.repository_id) }}-${{ github.sha }}
@@ -90,4 +93,3 @@ jobs:
           path: ${{ runner.temp }}/diene-profile-contract.json
           if-no-files-found: error
           retention-days: 7
-permissions: {}
