@@ -263,5 +263,5 @@ scripts/
 | **Workflow types**        | CI (every commit), Release (main merge), CD (tag push) |
 | **Execution**             | Nix -> Caches -> shell script                          |
 | **Reusable workflows**    | Named with `⚡`, reusable workflow handles execution   |
-| **Cache tag (shared)**    | `atomi-nix-store-cache` (one shared store, not per-service) |
+| **Cache tag (shared)**    | `nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64` (one shared store, not per-service) |
 | **Local reproducibility** | `nix develop .#ci -c ./scripts/ci/script.sh`           |
