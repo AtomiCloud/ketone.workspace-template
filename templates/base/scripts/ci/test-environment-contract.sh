@@ -6114,6 +6114,16 @@ install -m 0600 "$guest_rail_expected_stdout_file" "$guest_rail_stdout_probe/bla
 printf '\n' >>"$guest_rail_stdout_probe/blank-line"
 install -m 0600 "$guest_rail_expected_stdout_file" "$guest_rail_stdout_probe/nul"
 printf '\000' >>"$guest_rail_stdout_probe/nul"
+# A link whose target holds the exact expected bytes. The helper must refuse it
+# for being a link, never for its content, so the link is first proved to be a
+# symlink that dereferences to a byte-identical file. Without this the `! -L`
+# branch could be deleted, inverted, or bypassed and every probe below would
+# still pass.
+ln -s -- "$guest_rail_expected_stdout_file" "$guest_rail_stdout_probe/symlink"
+[[ -L $guest_rail_stdout_probe/symlink ]] ||
+  fail 'the guest rail symlink probe is not a symbolic link'
+cmp -s "$guest_rail_expected_stdout_file" "$guest_rail_stdout_probe/symlink" ||
+  fail 'the guest rail symlink probe does not dereference to the exact expected bytes'
 guest_rail_expected_stdout_bytes=$(wc -c <"$guest_rail_expected_stdout_file")
 guest_rail_probe_bytes=$((guest_rail_expected_stdout_bytes + 1))
 for guest_rail_stdout_variant in blank-line nul; do
@@ -6128,7 +6138,9 @@ guest_rail_stdout_is_exact "$guest_rail_stdout_probe/exact" ||
   fail 'the guest rail stdout comparison accepts an appended NUL byte'
 ! guest_rail_stdout_is_exact "$guest_rail_stdout_probe/absent" ||
   fail 'the guest rail stdout comparison accepts a missing capture'
-ok 'the guest rail stdout comparison is byte exact and rejects appended blank and NUL bytes'
+! guest_rail_stdout_is_exact "$guest_rail_stdout_probe/symlink" ||
+  fail 'the guest rail stdout comparison accepts a symlinked capture'
+ok 'the guest rail stdout comparison is byte exact and rejects appended blank, NUL, absent, and symlinked captures'
 
 guest_rail_assert_post_profile_refusal() {
   local scenario=${1:?profile injection scenario required}
