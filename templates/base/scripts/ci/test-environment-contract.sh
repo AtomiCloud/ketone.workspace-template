@@ -155,6 +155,29 @@ chmod 0600 /etc/nix/nix.conf
 install -m 0500 /run/diene-ci/guest-nix-installer /nix/nix-installer
 
 case $rail_scenario in
+  s12g-path-shadow | s12h-all-vectors)
+    rail_pinned_config_digest=$(sha256sum /etc/nix/nix.conf | cut -d' ' -f1)
+    install -d -m 0700 /nix/hostile-bin
+    {
+      printf '%s\n' '#!/bin/sh'
+      printf "printf '%%s  /etc/nix/nix.conf\\n' '%s'\n" "$rail_pinned_config_digest"
+    } >/nix/hostile-bin/sha256sum
+    chmod 0500 /nix/hostile-bin/sha256sum
+    if [ "$rail_scenario" = s12h-all-vectors ]; then
+      printf '%s\n' '#!/bin/sh' 'printf "%s\n" forged' >/nix/hostile-bin/cut
+      printf '%s\n' '#!/bin/sh' 'printf "%s\n" forged' >/nix/hostile-bin/env
+      chmod 0500 /nix/hostile-bin/cut /nix/hostile-bin/env
+    fi
+    ;;
+  s12l-cdpath)
+    install -d -m 0700 /nix/decoy/source/scripts/ci
+    printf '%s\n' '#!/bin/sh' 'exit 99' \
+      >/nix/decoy/source/scripts/ci/environment-k3d-run.sh
+    chmod 0500 /nix/decoy/source/scripts/ci/environment-k3d-run.sh
+    ;;
+esac
+
+case $rail_scenario in
   profile-missing) ;;
   profile-dangling)
     ln -s /nix/store/diene-guest-rail-missing/etc/profile.d/nix-daemon.sh \
@@ -176,16 +199,118 @@ chmod 0600 "$rail_harness/events"
 if [ "$rail_scenario" = profile-source-fail ]; then
   return 23
 fi
-if [ "$rail_scenario" = config-mutated ]; then
-  printf '%s\n' 'post-profile-mutation = true' >>/etc/nix/nix.conf
-fi
 PATH=/nix/var/nix/profiles/default/bin:$PATH
 NIX_PROFILES=/nix/var/nix/profiles/default
 NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 export PATH NIX_PROFILES NIX_SSL_CERT_FILE
 printf '%s\n' profile-sourced >>"$rail_harness/events"
 chmod 0600 "$rail_harness/events"
-return 0
+case $rail_scenario in
+  config-mutated)
+    printf '%s\n' 'post-profile-mutation = true' >>/etc/nix/nix.conf
+    return 0
+    ;;
+  s12c-digest-rebind)
+    printf '%s\n' 's12c-digest-rebind = true' >>/etc/nix/nix.conf
+    guest_nix_etc_config_digest=$(sha256sum /etc/nix/nix.conf | cut -d' ' -f1)
+    printf '%s\n' "$rail_scenario" >"$rail_harness/injection-ran"
+    chmod 0600 "$rail_harness/injection-ran"
+    return 0
+    ;;
+  s12d-fail-noop)
+    printf '%s\n' 's12d-fail-noop = true' >>/etc/nix/nix.conf
+    printf '%s\n' "$rail_scenario" >"$rail_harness/injection-ran"
+    chmod 0600 "$rail_harness/injection-ran"
+    guest_nix_fail() { :; }
+    return 0
+    ;;
+  s12e-hash-rebind)
+    rail_original_config_digest=$(sha256sum /etc/nix/nix.conf | cut -d' ' -f1)
+    printf '%s\n' 's12e-hash-rebind = true' >>/etc/nix/nix.conf
+    printf '%s\n' "$rail_scenario" >"$rail_harness/injection-ran"
+    chmod 0600 "$rail_harness/injection-ran"
+    guest_nix_hash_etc_config() { printf '%s\n' "$rail_original_config_digest"; }
+    return 0
+    ;;
+  s12g-path-shadow)
+    printf '%s\n' 's12g-path-shadow = true' >>/etc/nix/nix.conf
+    printf '%s\n' "$rail_scenario" >"$rail_harness/injection-ran"
+    chmod 0600 "$rail_harness/injection-ran"
+    PATH=/nix/hostile-bin:$PATH
+    export PATH
+    return 0
+    ;;
+  s12h-all-vectors)
+    rail_original_config_digest=$(sha256sum /etc/nix/nix.conf | cut -d' ' -f1)
+    printf '%s\n' 's12h-all-vectors = true' >>/etc/nix/nix.conf
+    printf '%s\n' "$rail_scenario" >"$rail_harness/injection-ran"
+    chmod 0600 "$rail_harness/injection-ran"
+    guest_nix_etc_config_digest=deadbeef
+    guest_nix_bound_config_digest=$rail_original_config_digest
+    guest_nix_etc_config_digest_after_profile=$rail_original_config_digest
+    guest_nix_profile_rc=0
+    guest_nix_stage1='printf skipped'
+    guest_nix_stage2='printf skipped'
+    guest_nix_fail() { :; }
+    guest_nix_hash_etc_config() { printf '%s\n' "$rail_original_config_digest"; }
+    guest_nix_source_profile() { :; }
+    sha256sum() { printf '%s  /etc/nix/nix.conf\n' "$rail_original_config_digest"; }
+    cut() { :; }
+    env() { :; }
+    printf() { :; }
+    exec() { :; }
+    exit() { :; }
+    command() { :; }
+    set -- junk junk junk
+    PATH=/nix/hostile-bin:$PATH
+    export PATH
+    return 0
+    ;;
+  s12i-readonly)
+    printf '%s\n' 's12i-readonly = true' >>/etc/nix/nix.conf
+    printf '%s\n' "$rail_scenario" >"$rail_harness/injection-ran"
+    chmod 0600 "$rail_harness/injection-ran"
+    readonly guest_nix_profile_rc=0
+    return 0
+    ;;
+  s12l-cdpath)
+    printf '%s\n' "$rail_scenario" >"$rail_harness/injection-ran"
+    chmod 0600 "$rail_harness/injection-ran"
+    CDPATH=/nix/decoy
+    export CDPATH
+    return 0
+    ;;
+  s12n-export-names)
+    printf '%s\n' 's12n-export-names = true' >>/etc/nix/nix.conf
+    printf '%s\n' "$rail_scenario" >"$rail_harness/injection-ran"
+    chmod 0600 "$rail_harness/injection-ran"
+    guest_nix_bound_config_digest=forged
+    guest_nix_etc_config_digest=forged
+    guest_nix_etc_config_digest_after_profile=forged
+    guest_nix_profile_rc=0
+    guest_nix_develop_path=/nix/hostile-bin
+    guest_nix_profile_names=forged
+    guest_nix_profile_names_unsorted=forged
+    guest_nix_profile_environment=forged
+    guest_nix_stage1='printf skipped'
+    guest_nix_stage2='printf skipped'
+    export guest_nix_bound_config_digest guest_nix_etc_config_digest \
+      guest_nix_etc_config_digest_after_profile guest_nix_profile_rc \
+      guest_nix_develop_path guest_nix_profile_names \
+      guest_nix_profile_names_unsorted guest_nix_profile_environment \
+      guest_nix_stage1 guest_nix_stage2
+    return 0
+    ;;
+  s12p-return-shadow)
+    printf '%s\n' 's12p-return-shadow = true' >>/etc/nix/nix.conf
+    printf '%s\n' "$rail_scenario" >"$rail_harness/injection-ran"
+    chmod 0600 "$rail_harness/injection-ran"
+    return() { :; }
+    set() { :; }
+    false
+    ;;
+  *) return 0 ;;
+esac
 GUEST_NIX_PROFILE
     chmod 0600 /nix/store/diene-guest-rail/etc/profile.d/nix-daemon.sh
     ln -s /nix/store/diene-guest-rail/etc/profile.d/nix-daemon.sh \
@@ -921,7 +1046,7 @@ case $command in
       $remote_command == *'env -i PATH="$GUEST_NIX_PATH" HOME="$GUEST_NIX_HOME"'* &&
       $remote_command == *'NIX_INSTALLER_DIAGNOSTIC_ENDPOINT='* &&
       $remote_command == *'./guest-nix-installer install linux --no-confirm --init none'* &&
-      $remote_command == *'guest_nix_source_profile "$guest_nix_profile"'* &&
+      $remote_command == *'. "$guest_nix_profile"'* &&
       $remote_command == *'NIX_USER_CONF_FILES=/run/diene-ci/nix-user.conf'* &&
       $remote_command == *'guest_nix_hash_etc_config'* &&
       $remote_command == *'exec /nix/var/nix/profiles/default/bin/nix '* ]] || exit 69
@@ -4230,53 +4355,13 @@ guest_nix_remote_output_case multiline multiline refuse
 guest_nix_remote_output_case extra-newline extra-newline refuse
 guest_nix_remote_output_case stderr stderr refuse
 
-remote_profile_helper=$scratch/guest-nix-source-profile-helper.sh
-sed -n '/^guest_nix_source_profile() {$/,/^}$/p' \
-  "$production_remote_command" >"$remote_profile_helper"
-[[ $(grep -c '^guest_nix_source_profile() {$' "$remote_profile_helper") == 1 ]] ||
-  fail 'the profile source helper could not be isolated from the fixed remote command'
-# shellcheck source=/dev/null
-source "$remote_profile_helper"
+[[ $(grep -c '^guest_nix_source_profile() {$' "$production_remote_command") == 0 ]] ||
+  fail 'the fixed remote command retained a post-dot profile helper that can erase source failure'
 hostile_guest_nix_profile=$scratch/hostile-guest-nix-profile.sh
 # The hostile profile must expand its inherited PATH only when it is sourced.
 # shellcheck disable=SC2016
 printf '%s\n' 'PATH=/hostile-profile/bin:$PATH' 'export PATH' 'return 23' \
   >"$hostile_guest_nix_profile"
-remote_profile_original_path=$PATH
-remote_profile_rc=0
-if guest_nix_source_profile "$hostile_guest_nix_profile"; then
-  fail 'the fixed remote profile helper accepted a nonzero source result'
-else
-  remote_profile_rc=$?
-fi
-remote_profile_flags=$-
-[[ $remote_profile_rc == 23 && $PATH == /hostile-profile/bin:* &&
-  $remote_profile_flags == *e* && $remote_profile_flags == *u* ]] ||
-  fail 'the fixed remote profile helper lost source status, profile state, or strict flags'
-PATH=$remote_profile_original_path
-
-curated_guest_nix_profile=$scratch/curated-guest-nix-profile.sh
-# shellcheck disable=SC2016
-printf '%s\n' 'PATH=/nix/var/nix/profiles/default/bin:$PATH' \
-  'NIX_PROFILES=/nix/var/nix/profiles/default' 'export PATH NIX_PROFILES' 'return 0' \
-  >"$curated_guest_nix_profile"
-remote_profile_original_nix_profiles=${NIX_PROFILES-}
-PATH=/usr/sbin:/usr/bin:/sbin:/bin
-unset NIX_PROFILES
-guest_nix_source_profile "$curated_guest_nix_profile" ||
-  fail 'the fixed remote profile helper refused the curated Wolfi profile'
-remote_profile_flags=$-
-[[ $PATH == /nix/var/nix/profiles/default/bin:/usr/sbin:/usr/bin:/sbin:/bin &&
-  $NIX_PROFILES == /nix/var/nix/profiles/default &&
-  $remote_profile_flags == *e* && $remote_profile_flags == *u* ]] ||
-  fail 'the curated Wolfi profile did not preserve its trusted PATH, Nix variables, or strict flags'
-PATH=$remote_profile_original_path
-if [[ -n $remote_profile_original_nix_profiles ]]; then
-  NIX_PROFILES=$remote_profile_original_nix_profiles
-  export NIX_PROFILES
-else
-  unset NIX_PROFILES
-fi
 
 remote_profile_resolution_line=$(rg -n '^guest_nix_profile_resolved=\$\(readlink -f ' \
   "$production_remote_command" | cut -d: -f1)
@@ -4287,10 +4372,23 @@ remote_profile_validation_line=$(rg -n '^\[ -f "\$guest_nix_profile" \] && \[ -r
 remote_profile_unsafe_refusal_line=$(rg -n \
   "^    'the exact guest Nix profile is absent, unreadable, or not a regular file'$" \
   "$production_remote_command" | cut -d: -f1)
-remote_profile_line=$(rg -n '^guest_nix_source_profile "\$guest_nix_profile" ' \
+remote_stage2_open_line=$(rg -n -F "guest_nix_stage2=\$(cat <<'GUEST_NIX_STAGE2'" \
+  "$production_remote_command" | cut -d: -f1)
+remote_stage2_close_line=$(rg -n '^GUEST_NIX_STAGE2$' \
+  "$production_remote_command" | cut -d: -f1)
+remote_stage1_open_line=$(rg -n -F "guest_nix_stage1_head=\$(cat <<'GUEST_NIX_STAGE1'" \
+  "$production_remote_command" | cut -d: -f1)
+remote_profile_line=$(rg -n '^\. "\$guest_nix_profile"$' \
+  "$production_remote_command" | cut -d: -f1)
+remote_profile_status_line=$(rg -n '^guest_nix_profile_rc=\$\?$' \
+  "$production_remote_command" | cut -d: -f1)
+remote_stage1_close_line=$(rg -n '^GUEST_NIX_STAGE1$' \
+  "$production_remote_command" | cut -d: -f1)
+remote_outer_exec_line=$(rg -n \
+  '^exec /bin/sh -c "\$guest_nix_stage1" guest-nix-stage1 "\$guest_nix_profile"$' \
   "$production_remote_command" | cut -d: -f1)
 remote_profile_refusal_line=$(rg -n \
-  "^  guest_nix_fail GuestNixProfileSourceFailed 'the exact guest Nix profile returned nonzero while being sourced'$" \
+  '^  guest_nix_fail GuestNixProfileSourceFailed "the exact guest Nix profile returned nonzero while being sourced"$' \
   "$production_remote_command" | cut -d: -f1)
 remote_develop_line=$(rg -n '^exec /nix/var/nix/profiles/default/bin/nix .* develop ' \
   "$production_remote_command" | cut -d: -f1)
@@ -4298,7 +4396,9 @@ remote_user_conf_line=$(rg -n '^NIX_USER_CONF_FILES=/run/diene-ci/nix-user\.conf
   "$production_remote_command" | cut -d: -f1)
 for remote_boundary in "$remote_profile_resolution_line" "$remote_profile_suffix_line" \
   "$remote_profile_validation_line" "$remote_profile_unsafe_refusal_line" \
-  "$remote_profile_line" "$remote_profile_refusal_line" "$remote_user_conf_line" \
+  "$remote_stage2_open_line" "$remote_stage2_close_line" "$remote_stage1_open_line" \
+  "$remote_profile_line" "$remote_profile_status_line" "$remote_stage1_close_line" \
+  "$remote_outer_exec_line" "$remote_profile_refusal_line" "$remote_user_conf_line" \
   "$remote_develop_line"; do
   [[ $remote_boundary =~ ^[1-9][0-9]*$ ]] ||
     fail 'a fixed remote profile/develop boundary is absent or ambiguous'
@@ -4306,11 +4406,49 @@ done
 [[ $remote_profile_resolution_line -lt $remote_profile_suffix_line &&
   $remote_profile_suffix_line -lt $remote_profile_validation_line &&
   $remote_profile_validation_line -lt $remote_profile_unsafe_refusal_line &&
-  $remote_profile_unsafe_refusal_line -lt $remote_profile_line &&
-  $remote_profile_line -lt $remote_profile_refusal_line &&
+  $remote_profile_unsafe_refusal_line -lt $remote_stage2_open_line &&
+  $remote_stage2_open_line -lt $remote_profile_refusal_line &&
   $remote_profile_refusal_line -lt $remote_user_conf_line &&
-  $remote_user_conf_line -lt $remote_develop_line ]] ||
-  fail 'the fixed remote command does not validate and source the mandatory profile before nix develop'
+  $remote_user_conf_line -lt $remote_develop_line &&
+  $remote_develop_line -lt $remote_stage2_close_line &&
+  $remote_stage2_close_line -lt $remote_stage1_open_line &&
+  $remote_stage1_open_line -lt $remote_profile_line &&
+  $remote_profile_line -lt $remote_profile_status_line &&
+  $remote_profile_status_line -lt $remote_stage1_close_line &&
+  $remote_stage1_close_line -lt $remote_outer_exec_line ]] ||
+  fail 'the fixed remote command does not isolate profile sourcing from the pristine develop stage'
+[[ $remote_profile_status_line -eq $((remote_profile_line + 1)) &&
+  $remote_stage1_close_line -eq $((remote_profile_status_line + 1)) ]] ||
+  fail 'stage 1 runs a bare command after sourcing instead of only capturing the profile status'
+
+remote_stage2_body=$scratch/guest-nix-stage2-body.sh
+sed -n "$((remote_stage2_open_line + 1)),$((remote_stage2_close_line - 1))p" \
+  "$production_remote_command" >"$remote_stage2_body"
+if grep -Fq "'" "$remote_stage2_body"; then
+  fail 'the stage-2 program contains a single quote and cannot remain one fixed stage-1 word'
+fi
+
+mapfile -t remote_hash_helper_lines < <(
+  rg -n '^guest_nix_hash_etc_config\(\) \{$' "$production_remote_command" |
+    cut -d: -f1
+)
+[[ ${#remote_hash_helper_lines[@]} == 2 ]] ||
+  fail 'the fixed remote command does not contain exactly two Nix configuration hash helpers'
+remote_hash_helper_one_end=$(awk -v start="${remote_hash_helper_lines[0]}" \
+  'NR > start && $0 == "}" { print NR; exit }' "$production_remote_command")
+remote_hash_helper_two_end=$(awk -v start="${remote_hash_helper_lines[1]}" \
+  'NR > start && $0 == "}" { print NR; exit }' "$production_remote_command")
+[[ $remote_hash_helper_one_end =~ ^[1-9][0-9]*$ &&
+  $remote_hash_helper_two_end =~ ^[1-9][0-9]*$ ]] ||
+  fail 'a Nix configuration hash helper has no exact closing boundary'
+sed -n "${remote_hash_helper_lines[0]},${remote_hash_helper_one_end}p" \
+  "$production_remote_command" >"$scratch/guest-nix-hash-helper-one.sh"
+sed -n "${remote_hash_helper_lines[1]},${remote_hash_helper_two_end}p" \
+  "$production_remote_command" >"$scratch/guest-nix-hash-helper-two.sh"
+cmp -s "$scratch/guest-nix-hash-helper-one.sh" \
+  "$scratch/guest-nix-hash-helper-two.sh" ||
+  fail 'the pristine-stage Nix configuration hash helper diverged from its pre-profile definition'
+ok 'the stage handoff has no post-dot command seam, quote seam, or divergent hash helper'
 
 profile_refusal_marker=$scratch/guest-nix-host-profile-protected-mutation
 profile_refusal_rc=0
@@ -4531,7 +4669,12 @@ guest_rail_run_case() {
   else
     rail_rc=$?
   fi
-  if [[ $rail_rc != "$expected_rc" ]]; then
+  if [[ $expected_rc == nonzero ]]; then
+    if [[ $rail_rc == 0 ]]; then
+      sed -n '1,160p' "$docker_error" >&2
+      fail "$label disposable guest unexpectedly returned zero"
+    fi
+  elif [[ $rail_rc != "$expected_rc" ]]; then
     sed -n '1,160p' "$docker_error" >&2
     fail "$label disposable guest returned $rail_rc instead of $expected_rc"
   fi
@@ -4557,19 +4700,28 @@ guest_rail_run_case() {
       fail "$label successful exact rail emitted an unexpected refusal"
     return
   fi
-  [[ $expected_rc == 64 && -n $expected_reason ]] ||
-    fail "$label hostile rail expectation is not a stable exit-64 refusal"
-  grep -Fq -- "$expected_reason:" "$result/harness/remote.stderr" || {
-    sed -n '1,160p' "$result/harness/remote.stderr" >&2
-    fail "$label exact rail emitted no stable $expected_reason refusal"
-  }
-  [[ $(grep -Ec '^GuestNix[A-Za-z]+:' "$result/harness/remote.stderr") == 1 ]] ||
-    fail "$label exact rail did not emit exactly one stable GuestNix refusal class"
+  if [[ $expected_rc == nonzero ]]; then
+    [[ -z $expected_reason ]] ||
+      fail "$label nonzero rail expectation unexpectedly names a stable refusal class"
+  else
+    [[ $expected_rc == 64 && -n $expected_reason ]] ||
+      fail "$label hostile rail expectation is not a stable exit-64 refusal"
+    grep -Fq -- "$expected_reason:" "$result/harness/remote.stderr" || {
+      sed -n '1,160p' "$result/harness/remote.stderr" >&2
+      fail "$label exact rail emitted no stable $expected_reason refusal"
+    }
+    [[ $(grep -Ec '^GuestNix[A-Za-z]+:' "$result/harness/remote.stderr") == 1 ]] ||
+      fail "$label exact rail did not emit exactly one stable GuestNix refusal class"
+  fi
   for forbidden_green in \
     "$result/evidence/guest-nix/version.txt" \
     "$result/evidence/guest-nix/version.stderr" \
+    "$result/evidence/guest-nix/identity.json" \
+    "$result/evidence/guest-nix/live-version.txt" \
     "$result/harness/nix-version.argv" \
     "$result/harness/nix-develop.argv" \
+    "$result/harness/nix-develop.cwd" \
+    "$result/harness/nix-develop.env" \
     "$result/harness/installed-copy.sha256" \
     "$result/out/proof.tar" \
     "$result/out/proof.sha256"; do
@@ -4581,7 +4733,61 @@ guest_rail_run_case() {
       \( -iname '*identity*' -o -iname '*preflight*' \) -print 2>/dev/null | grep -q . ||
       fail "$label hostile rail created a green identity/preflight record"
   fi
-  ok "$label executes the exact rail and refuses $expected_reason before direct Nix"
+  if [[ $expected_rc == nonzero ]]; then
+    ok "$label executes the exact rail and fails closed before direct Nix (observed rc $rail_rc)"
+  else
+    ok "$label executes the exact rail and refuses $expected_reason before direct Nix"
+  fi
+}
+
+guest_rail_assert_post_profile_refusal() {
+  local scenario=${1:?profile injection scenario required}
+  local environment_mode=${2:?profile environment expectation required}
+  local result=$GUEST_RAIL_RESULT forbidden_stub
+  grep -Fxq -- "$scenario" "$result/harness/injection-ran" ||
+    fail "$scenario did not leave its unconditional injection marker"
+  grep -Fxq -- "$scenario = true" "$result/harness/final-nix.conf" ||
+    fail "$scenario did not really mutate /etc/nix/nix.conf"
+  if [[ $environment_mode == present ]]; then
+    [[ -f $result/evidence/guest-nix/environment.txt ]] ||
+      fail "$scenario did not reach the pristine post-profile evidence stage"
+  elif [[ $environment_mode == absent ]]; then
+    [[ ! -e $result/evidence/guest-nix/environment.txt &&
+      ! -L $result/evidence/guest-nix/environment.txt ]] ||
+      fail "$scenario wrote post-profile environment evidence before refusal"
+  else
+    fail "$scenario has an unknown profile environment expectation"
+  fi
+  if [[ -f $result/evidence/guest-nix/environment.txt ]]; then
+    ! grep -q '^etcNixConf=' "$result/evidence/guest-nix/environment.txt" ||
+      fail "$scenario published a green Nix configuration binding after refusal"
+  fi
+  [[ -d $result/out && -z $(find "$result/out" -mindepth 1 -print -quit) ]] ||
+    fail "$scenario left a publication artifact after refusal"
+  for forbidden_stub in \
+    "$result/harness/nix-version.argv" \
+    "$result/harness/nix-develop.argv" \
+    "$result/harness/nix-develop.cwd" \
+    "$result/harness/nix-develop.env"; do
+    [[ ! -e $forbidden_stub && ! -L $forbidden_stub ]] ||
+      fail "$scenario reached the direct Nix stub"
+  done
+  [[ $(cat "$result/harness/remote.stdout") == 'archive-validator.sh: OK' ]] ||
+    fail "$scenario emitted output after the archive-validator receipt"
+}
+
+guest_rail_profile_refusal_case() {
+  local label=${1:?profile refusal label required}
+  local scenario=${2:?profile refusal scenario required}
+  local reason=${3:?profile refusal class required}
+  local message=${4:?profile refusal message required}
+  local environment_mode=${5:?profile environment expectation required}
+  guest_rail_run_case "$label" "$scenario" 64 "$reason"
+  [[ $(cat "$GUEST_RAIL_RESULT/harness/remote.stderr") == "$reason: $message" ]] || {
+    sed -n '1,160p' "$GUEST_RAIL_RESULT/harness/remote.stderr" >&2
+    fail "$label did not emit the one exact measured profile-isolation refusal"
+  }
+  guest_rail_assert_post_profile_refusal "$scenario" "$environment_mode"
 }
 
 guest_rail_run_case S0 happy 0 ''
@@ -4736,6 +4942,42 @@ assert_not_contains "$GUEST_RAIL_RESULT/harness/events" profile-sourced
 guest_rail_run_case S12 config-mutated 64 GuestNixIdentityUnexpected
 grep -Fxq -- 'post-profile-mutation = true' "$GUEST_RAIL_RESULT/harness/final-nix.conf" ||
   fail 'S12 did not mutate /etc/nix/nix.conf between binding and recheck'
+
+guest_rail_profile_identity_message='the installed /etc/nix/nix.conf changed before develop'
+guest_rail_profile_source_message='the exact guest Nix profile returned nonzero while being sourced'
+guest_rail_profile_refusal_case S12c s12c-digest-rebind GuestNixIdentityUnexpected \
+  "$guest_rail_profile_identity_message" present
+guest_rail_profile_refusal_case S12d s12d-fail-noop GuestNixIdentityUnexpected \
+  "$guest_rail_profile_identity_message" present
+guest_rail_profile_refusal_case S12e s12e-hash-rebind GuestNixIdentityUnexpected \
+  "$guest_rail_profile_identity_message" present
+guest_rail_profile_refusal_case S12g s12g-path-shadow GuestNixIdentityUnexpected \
+  "$guest_rail_profile_identity_message" present
+guest_rail_profile_refusal_case S12h s12h-all-vectors GuestNixIdentityUnexpected \
+  "$guest_rail_profile_identity_message" present
+
+guest_rail_run_case S12i s12i-readonly nonzero ''
+guest_rail_assert_post_profile_refusal s12i-readonly absent
+assert_contains "$GUEST_RAIL_RESULT/harness/remote.stderr" \
+  'guest_nix_profile_rc: is read only'
+
+guest_rail_run_case S12l s12l-cdpath 0 ''
+grep -Fxq -- s12l-cdpath "$GUEST_RAIL_RESULT/harness/injection-ran" ||
+  fail 'S12l did not run the CDPATH profile injection'
+diff -u "$scratch/guest-rail-develop.argv" \
+  "$GUEST_RAIL_RESULT/harness/nix-develop.argv" >/dev/null ||
+  fail 'S12l did not preserve the exact terminal nix develop argv'
+grep -Fxq -- /run/diene-ci/source "$GUEST_RAIL_RESULT/harness/nix-develop.cwd" ||
+  fail 'S12l let CDPATH redirect nix develop to the decoy source'
+[[ $(cat "$GUEST_RAIL_RESULT/harness/remote.stdout") == 'archive-validator.sh: OK' ]] ||
+  fail 'S12l emitted output from a CDPATH-selected decoy'
+ok 'S12l ignores profile CDPATH and develops from the exact absolute source CWD'
+
+guest_rail_profile_refusal_case S12n s12n-export-names GuestNixIdentityUnexpected \
+  "$guest_rail_profile_identity_message" present
+guest_rail_profile_refusal_case S12p s12p-return-shadow GuestNixProfileSourceFailed \
+  "$guest_rail_profile_source_message" absent
+
 guest_rail_run_case S13 nix-absent 64 GuestNixToolchainAbsent
 grep -Fxq -- '/nix/store/diene-guest-rail/etc/profile.d/nix-daemon.sh' \
   "$GUEST_RAIL_RESULT/harness/profile.resolved" ||
