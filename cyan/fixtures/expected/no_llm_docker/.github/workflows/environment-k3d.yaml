@@ -1,0 +1,262 @@
+name: Environment k3d
+
+on:
+  push:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      source_sha: { description: 'Full protected-main commit', required: true, type: string }
+      release_candidate: { description: 'Run release-candidate Absol gate', required: false, default: false, type: boolean }
+
+permissions: {}
+
+jobs:
+  # Everything decidable without a cluster happens on GitHub-hosted runners.
+  # A repository that has not declared journeys, an immutable artifact subject,
+  # and valid production fixtures never enables the runtime callers at all,
+  # so no Namespace instance is created for an incomplete repository.
+  authorize-runtime:
+    name: Authorize protected runtime
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.guard.outputs.enabled }}
+      source_sha: ${{ steps.guard.outputs.source_sha }}
+      base_workflow_ref: ${{ steps.guard.outputs.base_workflow_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
+      - id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_SHA: ${{ inputs.source_sha || github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          # A full lowercase 40-hex commit, not merely a 40-character string: a
+          # 40-character ref name must never pass as a commit SHA.
+          [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "$REQUESTED_SHA^{commit}"
+          test "$(git rev-parse --verify "$REQUESTED_SHA^{commit}")" = "$REQUESTED_SHA"
+          test "$GITHUB_REPOSITORY_OWNER" = AtomiCloud
+          # The commit must be reachable from the protected default branch.
+          git merge-base --is-ancestor "$REQUESTED_SHA" "origin/$DEFAULT_BRANCH"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$REF_PROTECTED" != true ]]; then exit 1; fi
+          if [[ "$GITHUB_ACTOR" == dependabot[bot] ]]; then exit 1; fi
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" --jq .permission)
+            [[ "$permission" == write || "$permission" == admin ]]
+          fi
+
+          # The base workflow identity is part of the trust tuple, so it must be
+          # this repository's own file at the exact revision under test.
+          [[ "$WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/"* ]]
+          test "$WORKFLOW_SHA" = "$REQUESTED_SHA"
+          base_workflow_ref="${WORKFLOW_REF%@*}@$REQUESTED_SHA"
+
+          # Only an absent journey declaration disables the runtime callers,
+          # and that claims no coverage. Every OTHER prerequisite — the Garden
+          # lock, the artifact producer, production fixtures, and the closure —
+          # is a refusal in the runtime-free jobs below, never a silent skip:
+          # a repository that opted in must not go green with the blocking
+          # checks quietly absent.
+          enabled=true
+          if [[ ! -f .diene/ci/journeys.v1.yaml ]]; then
+            printf 'runtime lanes disabled: no journey declaration, so no coverage is claimed\n' >&2
+            enabled=false
+          fi
+          printf 'enabled=%s\nsource_sha=%s\nbase_workflow_ref=%s\n' \
+            "$enabled" "$REQUESTED_SHA" "$base_workflow_ref" >>"$GITHUB_OUTPUT"
+
+  # The subject comes from the repository's own producer, run in this very
+  # workflow run. CI never derives, computes or fabricates a digest, provenance
+  # ref or attestation: a source-tree hash is not an artifact and a string
+  # built from run metadata is not provenance. Because the subject must bind
+  # this run and attempt, a checked-in declaration cannot satisfy the handoff
+  # and would go stale on the next commit.
+  artifact-build:
+    name: Artifact Build
+    if: needs.authorize-runtime.outputs.enabled == 'true'
+    needs: authorize-runtime
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      artifact_digest: ${{ steps.subject.outputs.artifact_digest }}
+      artifact_provenance_ref: ${{ steps.subject.outputs.artifact_provenance_ref }}
+      artifact_attestation_digest: ${{ steps.subject.outputs.artifact_attestation_digest }}
+      garden_lock_digest: ${{ steps.subject.outputs.garden_lock_digest }}
+      closure_digest: ${{ steps.subject.outputs.closure_digest }}
+      closure_bundle_ref: ${{ steps.subject.outputs.closure_bundle_ref }}
+      closure_signature_bundle_digest: ${{ steps.subject.outputs.closure_signature_bundle_digest }}
+      closure_trust_root_digest: ${{ steps.subject.outputs.closure_trust_root_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ needs.authorize-runtime.outputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - id: subject
+        env:
+          GITHUB_SHA: ${{ needs.authorize-runtime.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.authorize-runtime.outputs.source_sha }}
+          DIENE_BASE_WORKFLOW_REF: ${{ needs.authorize-runtime.outputs.base_workflow_ref }}
+        run: |
+          producer=.diene/ci/artifact-producer.sh
+          if [[ ! -x $producer ]]; then
+            printf 'ArtifactProducerUnavailable: %s is absent or not executable\n' "$producer" >&2
+            exit 1
+          fi
+          subject="$RUNNER_TEMP/artifact.v1.json"
+          # The repository's own producer builds and publishes the immutable
+          # subject and writes the declaration for THIS run.
+          "$producer" --source-sha "$SOURCE_SHA" --output "$subject"
+          nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-subject "$subject"
+          lock=$(sha256sum .diene/ci/environment-lock.v1.json | cut -d' ' -f1)
+          {
+            printf 'garden_lock_digest=sha256:%s\n' "$lock"
+            nix develop .#ci -c jq -r '
+              "artifact_digest=" + .artifact.digest,
+              "artifact_provenance_ref=" + (.provenance.provenanceRef // ""),
+              "artifact_attestation_digest=" + (.provenance.attestationDigest // ""),
+              "closure_digest=" + (.closure.digest // ""),
+              "closure_bundle_ref=" + (.closure.bundleRef // ""),
+              "closure_signature_bundle_digest=" + (.closure.signatureBundleDigest // ""),
+              "closure_trust_root_digest=" + (.closure.trustRootDigest // "")
+            ' "$subject"
+          } >>"$GITHUB_OUTPUT"
+      - name: Hand the immutable subject to the same-run gates
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/artifact.v1.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # The blocking runtime-free gate, in this run. It validates the exact subject
+  # artifact-build already produced — it never invokes the producer a second
+  # time — and mutates no cluster, so every runtime lane can depend on it
+  # before any disposable runner is selected.
+  environment-profile-contract:
+    name: Environment Profile Contract
+    if: needs.authorize-runtime.outputs.enabled == 'true'
+    needs: [authorize-runtime, artifact-build]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    concurrency:
+      group: profile-${{ fromJSON(github.repository_id) }}-${{ needs.authorize-runtime.outputs.source_sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ needs.authorize-runtime.outputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
+      - name: Validate the same-run subject handoff
+        env:
+          GITHUB_SHA: ${{ needs.authorize-runtime.outputs.source_sha }}
+          DIENE_BASE_WORKFLOW_REF: ${{ needs.authorize-runtime.outputs.base_workflow_ref }}
+        run: |
+          nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh \
+            --validate-subject "$RUNNER_TEMP/subject/artifact.v1.json"
+      - name: Validate runtime-free profile, corpus, and parity
+        run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh
+      - name: Upload safe profile contract report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-profile-contract-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-profile-contract.json
+          if-no-files-found: error
+          retention-days: 7
+
+
+  # Trigger matrix per the goal's lane table. Build-local and target-pull run
+  # on protected push or authorized dispatch only; Absol adds the
+  # release-candidate dispatch; the weekly schedule reaches fleet-independence
+  # and nothing else.
+  environment-ditto-build-local:
+    if: >-
+      needs.authorize-runtime.outputs.enabled == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [authorize-runtime, artifact-build, environment-profile-contract]
+    permissions: { contents: read, id-token: write }
+    uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
+    with:
+      lane: ditto-build-local
+      repository_id: ${{ fromJSON(github.repository_id) }}
+      repository_key: ${{ github.repository }}
+      source_sha: ${{ needs.authorize-runtime.outputs.source_sha }}
+      garden_lock_digest: ${{ needs.artifact-build.outputs.garden_lock_digest }}
+      artifact_digest: ${{ needs.artifact-build.outputs.artifact_digest }}
+      journey_manifest: .diene/ci/journeys.v1.yaml
+
+  environment-ditto-target-pull:
+    if: >-
+      needs.authorize-runtime.outputs.enabled == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [authorize-runtime, artifact-build, environment-profile-contract]
+    permissions: { contents: read, packages: read, id-token: write }
+    uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
+    with:
+      lane: ditto-target-pull
+      repository_id: ${{ fromJSON(github.repository_id) }}
+      repository_key: ${{ github.repository }}
+      source_sha: ${{ needs.authorize-runtime.outputs.source_sha }}
+      garden_lock_digest: ${{ needs.artifact-build.outputs.garden_lock_digest }}
+      artifact_digest: ${{ needs.artifact-build.outputs.artifact_digest }}
+      artifact_provenance_ref: ${{ needs.artifact-build.outputs.artifact_provenance_ref }}
+      artifact_attestation_digest: ${{ needs.artifact-build.outputs.artifact_attestation_digest }}
+      journey_manifest: .diene/ci/journeys.v1.yaml
+
+  # Absol is never silently omitted: an incomplete closure has already refused
+  # in environment-profile-contract, so this gate is the trigger matrix alone.
+  environment-absol:
+    if: >-
+      needs.authorize-runtime.outputs.enabled == 'true' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.release_candidate == true))
+    needs: [authorize-runtime, artifact-build, environment-profile-contract]
+    permissions: { contents: read, id-token: write }
+    uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
+    with:
+      lane: absol
+      repository_id: ${{ fromJSON(github.repository_id) }}
+      repository_key: ${{ github.repository }}
+      source_sha: ${{ needs.authorize-runtime.outputs.source_sha }}
+      garden_lock_digest: ${{ needs.artifact-build.outputs.garden_lock_digest }}
+      artifact_digest: ${{ needs.artifact-build.outputs.artifact_digest }}
+      journey_manifest: .diene/ci/journeys.v1.yaml
+      closure_digest: ${{ needs.artifact-build.outputs.closure_digest }}
+      closure_bundle_ref: ${{ needs.artifact-build.outputs.closure_bundle_ref }}
+      closure_signature_bundle_digest: ${{ needs.artifact-build.outputs.closure_signature_bundle_digest }}
+      closure_trust_root_digest: ${{ needs.artifact-build.outputs.closure_trust_root_digest }}
+
+  # The schedule reaches this lane and no other, and an authorized dispatch may
+  # rerun it under the same full-commit/reachable/write-or-admin predicate.
+  environment-fleet-independence:
+    if: >-
+      needs.authorize-runtime.outputs.enabled == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch')
+    needs: [authorize-runtime, artifact-build, environment-profile-contract]
+    permissions: { contents: read }
+    uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
+    with:
+      lane: fleet-independence
+      repository_id: ${{ fromJSON(github.repository_id) }}
+      repository_key: ${{ github.repository }}
+      source_sha: ${{ needs.authorize-runtime.outputs.source_sha }}
+      garden_lock_digest: ${{ needs.artifact-build.outputs.garden_lock_digest }}
+      artifact_digest: ${{ needs.artifact-build.outputs.artifact_digest }}
+      journey_manifest: .diene/ci/journeys.v1.yaml

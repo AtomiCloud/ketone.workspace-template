@@ -2,15 +2,15 @@
 with packages;
 {
   dev = [
-    git
     infisical
-    pls
   ];
 
   lint = [
     actionlint
+    check-jsonschema
     gitlint
     go-task
+    pkgs.ripgrep
     pre-commit
     sg
     shellcheck
@@ -18,6 +18,13 @@ with packages;
   ];
 
   main = [
+    git
+    kubectl
+  ];
+
+  mainLinux = [
+    iproute2
+    pkgs.getent
   ];
 
   releaser = [
@@ -26,5 +33,7 @@ with packages;
 
   system = [
     atomiutils
+    nsc
+    pls
   ];
 }

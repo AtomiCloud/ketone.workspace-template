@@ -29,9 +29,15 @@ Publishing is driven by the `⚡reusable-helm.yaml` reusable workflow, called fr
 (every commit) and `cd.yaml` (release tag):
 
 1. The reusable workflow uses `AtomiCloud/actions.setup-nix` and runs inside `nix develop .#cd`,
-   so `helm`/`yq` come from the Nix store. The store is restored from the shared
-   `nscloud-cache-tag-atomi-nix-store-cache` (one cache for all Nix jobs — no per-service keys),
-   which is why Helm needs Nix while Docker does not.
+   so `helm`/`yq` come from the Nix store. Helm is a **cache-eligible** lane, so it runs on the
+   `-with-cache` venue label (`nscloud-ubuntu-26.04-amd64-16x32-with-cache`) and the store is
+   restored from the shared `nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64` (one
+   cache for all Nix jobs — no per-service keys), which is why Helm needs Nix while Docker does
+   not. Both parts are required: the `-with-cache` suffix attaches the volume and the tag names
+   it, so a bare venue label caches nothing even with a tag present. The tag is scoped to the
+   runner OS: moving off `ubuntu-26.04` rotates it to the matching `-ubuntu-<version>-amd64` tag
+   (e.g. the `ubuntu-24.04` fallback), so the first run after an OS switch is a cold build and no
+   store is ever shared across OS versions.
 2. It runs `./scripts/ci/helm.sh <chart_path> [version]`:
    - **CI** (no version) → publishes `v0.0.0-<sha6>-<branch>`, with `appVersion` set to the
      commit version.

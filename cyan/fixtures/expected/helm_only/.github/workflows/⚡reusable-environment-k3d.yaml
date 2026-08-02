@@ -1,0 +1,334 @@
+name: ⚡ Reusable Environment k3d
+
+# `environment-k3d` and diene-ci-k3d/v1 are stable compatibility ABI. The
+# active substrate is one anonymous Namespace instance with built-in k3s.
+on:
+  workflow_call:
+    inputs:
+      lane: { required: true, type: string }
+      repository_id: { required: true, type: number }
+      repository_key: { required: true, type: string }
+      source_sha: { required: true, type: string }
+      garden_lock_digest: { required: true, type: string }
+      artifact_digest: { required: true, type: string }
+      artifact_provenance_ref: { required: false, type: string, default: '' }
+      artifact_attestation_digest: { required: false, type: string, default: '' }
+      journey_manifest: { required: false, type: string, default: '' }
+      vendor_manifest: { required: false, type: string, default: '' }
+      action_id: { required: false, type: string, default: '' }
+      closure_digest: { required: false, type: string, default: '' }
+      closure_bundle_ref: { required: false, type: string, default: '' }
+      closure_signature_bundle_digest: { required: false, type: string, default: '' }
+      closure_trust_root_digest: { required: false, type: string, default: '' }
+    outputs:
+      subject_digest:
+        value: ${{ jobs.environment-ditto-build-local.outputs.subject_digest || jobs.environment-ditto-target-pull.outputs.subject_digest || jobs.environment-ditto-vendor.outputs.subject_digest || jobs.environment-absol.outputs.subject_digest || jobs.environment-fleet-independence.outputs.subject_digest }}
+      receipt_id:
+        value: ${{ jobs.environment-ditto-build-local.outputs.receipt_id || jobs.environment-ditto-target-pull.outputs.receipt_id || jobs.environment-ditto-vendor.outputs.receipt_id || jobs.environment-absol.outputs.receipt_id || jobs.environment-fleet-independence.outputs.receipt_id }}
+      core_report_digest:
+        value: ${{ jobs.environment-ditto-build-local.outputs.core_report_digest || jobs.environment-ditto-target-pull.outputs.core_report_digest || jobs.environment-absol.outputs.core_report_digest || jobs.environment-fleet-independence.outputs.core_report_digest }}
+      vendor_report_digest:
+        value: ${{ jobs.environment-ditto-vendor.outputs.vendor_report_digest }}
+
+permissions: {}
+
+jobs:
+  # Every cheap refusal, including production-fixture/duration lint and the
+  # trusted-ref-only interim-policy gate, completes before nsc is available to
+  # a runtime step.
+  contract:
+    name: Input Contract
+    # The measured GitHub-hosted venue is Ubuntu 26.04. This contract job has
+    # no Namespace authority, so its reported orchestrator venue is hosted.
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    env: &github-hosted-env
+      DIENE_LANE: ${{ inputs.lane }}
+      GITHUB_REPOSITORY_ID: ${{ inputs.repository_id }}
+      GITHUB_REPOSITORY: ${{ inputs.repository_key }}
+      GITHUB_SHA: ${{ inputs.source_sha }}
+      DIENE_GARDEN_LOCK_DIGEST: ${{ inputs.garden_lock_digest }}
+      DIENE_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      DIENE_ARTIFACT_PROVENANCE_REF: ${{ inputs.artifact_provenance_ref }}
+      DIENE_ARTIFACT_ATTESTATION_DIGEST: ${{ inputs.artifact_attestation_digest }}
+      DIENE_JOURNEY_MANIFEST: ${{ inputs.journey_manifest }}
+      DIENE_VENDOR_MANIFEST: ${{ inputs.vendor_manifest }}
+      DIENE_ACTION_ID: ${{ inputs.action_id }}
+      DIENE_CLOSURE_DIGEST: ${{ inputs.closure_digest }}
+      DIENE_CLOSURE_BUNDLE_REF: ${{ inputs.closure_bundle_ref }}
+      DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST: ${{ inputs.closure_signature_bundle_digest }}
+      DIENE_CLOSURE_TRUST_ROOT_DIGEST: ${{ inputs.closure_trust_root_digest }}
+      DIENE_TRUSTED_RUNTIME_CONTEXT: protected-base
+      DIENE_NSC_DURATION: 2h
+      DIENE_ADMITTED_K3S_VERSION: v1.33.1+k3s1
+      DIENE_K3S_SERVICE_CIDR: 10.143.0.0/16
+      DIENE_ORCHESTRATOR_VENUE: github-hosted
+      DIENE_ORCHESTRATOR_LABEL: ubuntu-26.04
+      DIENE_CONNECTED_EGRESS_JSON: ${{ vars.DIENE_CONNECTED_EGRESS_JSON }}
+      DIENE_EGRESS_CANARY_IMAGE: ${{ vars.DIENE_EGRESS_CANARY_IMAGE }}
+      DIENE_EGRESS_L7_ENFORCER_BIN: ${{ vars.DIENE_EGRESS_L7_ENFORCER_BIN }}
+      DIENE_EGRESS_PROBE_BIN: ${{ vars.DIENE_EGRESS_PROBE_BIN }}
+      DIENE_VENDOR_CREDENTIAL_BROKER_BIN: ${{ vars.DIENE_VENDOR_CREDENTIAL_BROKER_BIN }}
+      DIENE_FIXTURE_ID: ${{ inputs.lane == 'fleet-independence' && 'bootstrap-fleet-independence-v1' || '' }}
+    steps:
+      - uses: &checkout actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+      - uses: &setup-nix AtomiCloud/actions.setup-nix@v3
+      - &derive-identity
+        name: Derive the trusted workflow identity and subject handoff
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          test "$WORKFLOW_SHA" = "$SOURCE_SHA"
+          {
+            printf 'DIENE_BASE_WORKFLOW_REF=%s@%s\n' "${WORKFLOW_REF%@*}" "$WORKFLOW_SHA"
+            printf 'DIENE_ARTIFACT_SUBJECT=%s\n' "$RUNNER_TEMP/subject/artifact.v1.json"
+          } >>"$GITHUB_ENV"
+      - name: Re-prove the protected caller context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          test "$GITHUB_REPOSITORY_OWNER" = AtomiCloud
+          test "$GITHUB_ACTOR" != 'dependabot[bot]'
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"
+          case "$EVENT_NAME" in
+            push|schedule) test "$REF_PROTECTED" = true ;;
+            workflow_dispatch)
+              permission=$(gh api \
+                "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" \
+                --jq .permission)
+              [[ "$permission" == write || "$permission" == admin ]]
+              ;;
+            *) exit 1 ;;
+          esac
+      - uses: &subject-download actions/download-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
+      - name: Refuse untrusted selectors and subjects before nsc create
+        run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-inputs
+      - name: Validate production fixtures and immutable prerequisites
+        run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-prerequisites
+
+  environment-ditto-build-local:
+    name: environment-ditto-build-local
+    if: inputs.lane == 'ditto-build-local'
+    needs: contract
+    timeout-minutes: 75
+    environment: ci-ditto
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-ditto-build-local
+      cancel-in-progress: false
+    permissions: { contents: read, id-token: write }
+    # The three cache-consuming Ditto lanes must all request the measured S31
+    # cache label triple. The anchor makes that shared venue deliberate.
+    runs-on: &cache-attached-namespace-runner
+      - nscloud-ubuntu-26.04-amd64-16x32-with-cache
+      - nscloud-cache-size-50gb
+      - nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64
+    env: &cache-attached-namespace-env
+      DIENE_LANE: ${{ inputs.lane }}
+      GITHUB_REPOSITORY_ID: ${{ inputs.repository_id }}
+      GITHUB_REPOSITORY: ${{ inputs.repository_key }}
+      GITHUB_SHA: ${{ inputs.source_sha }}
+      DIENE_GARDEN_LOCK_DIGEST: ${{ inputs.garden_lock_digest }}
+      DIENE_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      DIENE_ARTIFACT_PROVENANCE_REF: ${{ inputs.artifact_provenance_ref }}
+      DIENE_ARTIFACT_ATTESTATION_DIGEST: ${{ inputs.artifact_attestation_digest }}
+      DIENE_JOURNEY_MANIFEST: ${{ inputs.journey_manifest }}
+      DIENE_VENDOR_MANIFEST: ${{ inputs.vendor_manifest }}
+      DIENE_ACTION_ID: ${{ inputs.action_id }}
+      DIENE_CLOSURE_DIGEST: ${{ inputs.closure_digest }}
+      DIENE_CLOSURE_BUNDLE_REF: ${{ inputs.closure_bundle_ref }}
+      DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST: ${{ inputs.closure_signature_bundle_digest }}
+      DIENE_CLOSURE_TRUST_ROOT_DIGEST: ${{ inputs.closure_trust_root_digest }}
+      DIENE_TRUSTED_RUNTIME_CONTEXT: protected-base
+      DIENE_NSC_DURATION: 2h
+      DIENE_ADMITTED_K3S_VERSION: v1.33.1+k3s1
+      DIENE_K3S_SERVICE_CIDR: 10.143.0.0/16
+      DIENE_ORCHESTRATOR_VENUE: namespace
+      DIENE_ORCHESTRATOR_LABEL: nscloud-ubuntu-26.04-amd64-16x32-with-cache
+      DIENE_CONNECTED_EGRESS_JSON: ${{ vars.DIENE_CONNECTED_EGRESS_JSON }}
+      DIENE_EGRESS_CANARY_IMAGE: ${{ vars.DIENE_EGRESS_CANARY_IMAGE }}
+      DIENE_EGRESS_L7_ENFORCER_BIN: ${{ vars.DIENE_EGRESS_L7_ENFORCER_BIN }}
+      DIENE_EGRESS_PROBE_BIN: ${{ vars.DIENE_EGRESS_PROBE_BIN }}
+      DIENE_VENDOR_CREDENTIAL_BROKER_BIN: ${{ vars.DIENE_VENDOR_CREDENTIAL_BROKER_BIN }}
+      DIENE_FIXTURE_ID: ${{ inputs.lane == 'fleet-independence' && 'bootstrap-fleet-independence-v1' || '' }}
+    outputs: &core-outputs
+      subject_digest: ${{ steps.run.outputs.subject_digest }}
+      receipt_id: ${{ steps.run.outputs.receipt_id }}
+      core_report_digest: ${{ steps.run.outputs.core_report_digest }}
+    steps: &core-runtime-steps
+      - uses: *checkout
+        with: { ref: '${{ inputs.source_sha }}' }
+      - uses: *setup-nix
+      - *derive-identity
+      - uses: *subject-download
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
+      -
+        id: run
+        name: Run the exact Namespace lifecycle
+        continue-on-error: true
+        run: |
+          DIENE_LEAK_CANARY="diene-canary-$(head -c 18 /dev/urandom | base64 | tr -d '=+/')"
+          export DIENE_LEAK_CANARY
+          nix develop .#ci -c ./scripts/ci/environment-k3d-run.sh orchestrate
+      -
+        id: lifecycle
+        name: Unconditionally converge exact destroy and absence
+        if: always()
+        run: nix develop .#ci -c ./scripts/ci/environment-k3d-run.sh cleanup
+      -
+        name: Upload proof only after lifecycle convergence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-namespace-proof-${{ inputs.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-proof-bundle.tar
+          if-no-files-found: error
+          retention-days: 7
+      -
+        name: Preserve the first lifecycle or runtime failure
+        if: always() && (steps.run.outcome != 'success' || steps.lifecycle.outcome != 'success')
+        run: exit 1
+
+  environment-ditto-target-pull:
+    name: environment-ditto-target-pull
+    if: inputs.lane == 'ditto-target-pull'
+    needs: contract
+    timeout-minutes: 75
+    environment: ci-ditto-pull
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-ditto-target-pull
+      cancel-in-progress: false
+    permissions: { contents: read, packages: read, id-token: write }
+    runs-on: *cache-attached-namespace-runner
+    env: *cache-attached-namespace-env
+    outputs: *core-outputs
+    steps: *core-runtime-steps
+
+  environment-ditto-vendor:
+    name: environment-ditto-vendor
+    if: inputs.lane == 'ditto-vendor'
+    needs: contract
+    timeout-minutes: 90
+    environment: ci-ditto-vendor
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-ditto-vendor-${{ inputs.action_id }}
+      cancel-in-progress: false
+    permissions: { contents: read, id-token: write }
+    runs-on: *cache-attached-namespace-runner
+    env: *cache-attached-namespace-env
+    outputs:
+      subject_digest: ${{ steps.run.outputs.subject_digest }}
+      receipt_id: ${{ steps.run.outputs.receipt_id }}
+      vendor_report_digest: ${{ steps.run.outputs.vendor_report_digest }}
+    steps: *core-runtime-steps
+
+  environment-absol:
+    name: environment-absol
+    if: inputs.lane == 'absol'
+    needs: contract
+    timeout-minutes: 120
+    environment: ci-absol
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-absol
+      cancel-in-progress: false
+    permissions: { contents: read, id-token: write }
+    # Absol and fleet-independence are intentionally cacheless: this exact
+    # bare venue must never acquire the -with-cache or S31 cache labels.
+    runs-on: &cacheless-namespace-runner nscloud-ubuntu-26.04-amd64-16x32
+    env: &cacheless-namespace-env
+      DIENE_LANE: ${{ inputs.lane }}
+      GITHUB_REPOSITORY_ID: ${{ inputs.repository_id }}
+      GITHUB_REPOSITORY: ${{ inputs.repository_key }}
+      GITHUB_SHA: ${{ inputs.source_sha }}
+      DIENE_GARDEN_LOCK_DIGEST: ${{ inputs.garden_lock_digest }}
+      DIENE_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      DIENE_ARTIFACT_PROVENANCE_REF: ${{ inputs.artifact_provenance_ref }}
+      DIENE_ARTIFACT_ATTESTATION_DIGEST: ${{ inputs.artifact_attestation_digest }}
+      DIENE_JOURNEY_MANIFEST: ${{ inputs.journey_manifest }}
+      DIENE_VENDOR_MANIFEST: ${{ inputs.vendor_manifest }}
+      DIENE_ACTION_ID: ${{ inputs.action_id }}
+      DIENE_CLOSURE_DIGEST: ${{ inputs.closure_digest }}
+      DIENE_CLOSURE_BUNDLE_REF: ${{ inputs.closure_bundle_ref }}
+      DIENE_CLOSURE_SIGNATURE_BUNDLE_DIGEST: ${{ inputs.closure_signature_bundle_digest }}
+      DIENE_CLOSURE_TRUST_ROOT_DIGEST: ${{ inputs.closure_trust_root_digest }}
+      DIENE_TRUSTED_RUNTIME_CONTEXT: protected-base
+      DIENE_NSC_DURATION: 2h
+      DIENE_ADMITTED_K3S_VERSION: v1.33.1+k3s1
+      DIENE_K3S_SERVICE_CIDR: 10.143.0.0/16
+      DIENE_ORCHESTRATOR_VENUE: namespace
+      DIENE_ORCHESTRATOR_LABEL: nscloud-ubuntu-26.04-amd64-16x32
+      DIENE_CONNECTED_EGRESS_JSON: ${{ vars.DIENE_CONNECTED_EGRESS_JSON }}
+      DIENE_EGRESS_CANARY_IMAGE: ${{ vars.DIENE_EGRESS_CANARY_IMAGE }}
+      DIENE_EGRESS_L7_ENFORCER_BIN: ${{ vars.DIENE_EGRESS_L7_ENFORCER_BIN }}
+      DIENE_EGRESS_PROBE_BIN: ${{ vars.DIENE_EGRESS_PROBE_BIN }}
+      DIENE_VENDOR_CREDENTIAL_BROKER_BIN: ${{ vars.DIENE_VENDOR_CREDENTIAL_BROKER_BIN }}
+      DIENE_FIXTURE_ID: ${{ inputs.lane == 'fleet-independence' && 'bootstrap-fleet-independence-v1' || '' }}
+    outputs: *core-outputs
+    steps: *core-runtime-steps
+
+  environment-fleet-independence:
+    name: environment-fleet-independence
+    if: inputs.lane == 'fleet-independence'
+    needs: contract
+    timeout-minutes: 60
+    environment: ci-ditto
+    concurrency:
+      group: k3d-${{ inputs.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-fleet-independence
+      cancel-in-progress: false
+    permissions: { contents: read }
+    runs-on: *cacheless-namespace-runner
+    env: *cacheless-namespace-env
+    outputs: *core-outputs
+    steps: *core-runtime-steps
+
+  # This stable workflow-owned check consumes only the already-collected proof.
+  # It has no nsc credentials and cannot make late cleanup rewrite a failed run.
+  environment-runner-lifecycle:
+    name: environment-runner-lifecycle
+    if: always()
+    needs:
+      - contract
+      - environment-ditto-build-local
+      - environment-ditto-target-pull
+      - environment-ditto-vendor
+      - environment-absol
+      - environment-fleet-independence
+    timeout-minutes: 20
+    permissions: { contents: read }
+    # This proof-only verifier has no Namespace authority and runs on the
+    # measured GitHub-hosted Ubuntu 26.04 venue.
+    runs-on: ubuntu-26.04
+    env: *github-hosted-env
+    steps:
+      - uses: *checkout
+        with: { ref: '${{ inputs.source_sha }}' }
+      - uses: *setup-nix
+      - *derive-identity
+      - uses: *subject-download
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
+      - uses: actions/download-artifact@v4
+        with:
+          name: diene-namespace-proof-${{ inputs.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/namespace-proof
+      - name: Verify the exact terminal lifecycle evidence
+        env:
+          SELECTED_RUNTIME_RESULT: ${{ (inputs.lane == 'ditto-build-local' && needs.environment-ditto-build-local.result) || (inputs.lane == 'ditto-target-pull' && needs.environment-ditto-target-pull.result) || (inputs.lane == 'ditto-vendor' && needs.environment-ditto-vendor.result) || (inputs.lane == 'absol' && needs.environment-absol.result) || (inputs.lane == 'fleet-independence' && needs.environment-fleet-independence.result) }}
+        run: |
+          test "$SELECTED_RUNTIME_RESULT" = success
+          nix develop .#ci -c ./scripts/ci/environment-k3d-run.sh lifecycle \
+            "$RUNNER_TEMP/namespace-proof/diene-proof-bundle.tar"

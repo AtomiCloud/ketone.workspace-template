@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - 'main'
+  pull_request:
+    branches:
+      - 'main'
 
 env:
   DOCKER_DOMAIN: ghcr.io
@@ -14,19 +17,25 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - uses: docker/setup-qemu-action@v3
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - name: Validate Helm Tooling Matrix
+        run: ./scripts/validate-helm-tooling.sh
       - name: Install CyanPrint
         run: ./scripts/setup-ubuntu.sh
       - name: Run CyanPrint Tests
         run: cyanprint test template .
   publish:
     needs: test
+    # Publishing stays push-only: pull requests run the test job and stop there, so they
+    # never log into the registry, never publish, and never need the release secrets.
+    if: github.event_name == 'push'
     name: Publish
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: rlespinasse/github-slug-action@v3.x

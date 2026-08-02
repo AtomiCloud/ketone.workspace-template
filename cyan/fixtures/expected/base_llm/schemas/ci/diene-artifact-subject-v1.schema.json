@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.atomi.cloud/diene/diene-artifact-subject-v1.schema.json",
+  "title": "Diene repository-owned immutable artifact subject v1",
+  "description": "The immutable OCI subject emitted by the repository-owned producer at .diene/ci/artifact-producer.sh. It is a same-run output, never a checked-in file: the consuming job asserts that producer.runId, producer.runAttempt and producer.workflowRef bind the run that is about to consume it, so a committed declaration (which would go stale on the next commit) cannot satisfy the handoff. A repository without a producer has no runtime subject and its runtime lanes refuse ArtifactProducerUnavailable rather than substituting a source-tree hash.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "sourceSha", "artifact"],
+  "properties": {
+    "apiVersion": { "const": "diene.atomi.cloud/ci-artifact-subject/v1" },
+    "sourceSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["imageRef", "digest", "registry", "producer"],
+      "properties": {
+        "imageRef": {
+          "type": "string",
+          "description": "Immutable digest-pinned reference. Tags are forbidden.",
+          "pattern": "^[a-z0-9][a-z0-9.-]*(:[0-9]+)?/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$"
+        },
+        "digest": { "$ref": "#/$defs/digest" },
+        "registry": { "type": "string", "enum": ["ghcr.io"] },
+        "private": { "type": "boolean", "default": true },
+        "producer": { "$ref": "#/$defs/producer" }
+      }
+    },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "closure": { "$ref": "#/$defs/closure" }
+  },
+  "allOf": [
+    {
+      "description": "A declaration that carries provenance must bind it to the same source revision as the subject itself.",
+      "if": { "required": ["provenance"] },
+      "then": { "properties": { "provenance": { "required": ["predicateType", "provenanceRef", "attestationDigest", "workflowRef", "runId", "runAttempt"] } } }
+    }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflowRef", "runId", "runAttempt"],
+      "properties": {
+        "workflowRef": {
+          "type": "string",
+          "description": "Immutable full-commit workflow identity of the publishing run, in GITHUB_WORKFLOW_REF form.",
+          "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$"
+        },
+        "runId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "runAttempt": { "type": "string", "pattern": "^[1-9][0-9]*$" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["predicateType", "provenanceRef", "attestationDigest", "workflowRef", "runId", "runAttempt"],
+      "properties": {
+        "predicateType": { "const": "https://slsa.dev/provenance/v1" },
+        "provenanceRef": {
+          "description": "The real, resolvable reference to the published provenance statement. It is emitted by the producer and cross-checked against the workflow_call input of the same name; it is never assembled from run metadata.",
+          "type": "string",
+          "minLength": 1
+        },
+        "attestationDigest": { "$ref": "#/$defs/digest" },
+        "workflowRef": { "type": "string", "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$" },
+        "runId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "runAttempt": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "pullIdentity": {
+          "type": "string",
+          "description": "Selected-package read identity used by target-pull. Must differ from the publishing identity.",
+          "minLength": 1
+        }
+      }
+    },
+    "closure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundleRef", "digest", "signatureBundleDigest", "trustRootDigest"],
+      "properties": {
+        "bundleRef": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://[^\\s]+$" },
+        "digest": { "$ref": "#/$defs/digest" },
+        "signatureBundleDigest": { "$ref": "#/$defs/digest" },
+        "trustRootDigest": { "$ref": "#/$defs/digest" },
+        "rekorInclusionProofDigest": { "$ref": "#/$defs/digest" },
+        "certificateDigest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

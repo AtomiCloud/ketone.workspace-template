@@ -63,8 +63,8 @@ Key properties:
 - Setup uses the shared AtomiCloud actions — `AtomiCloud/actions.setup-docker` for Docker and
   `AtomiCloud/actions.setup-nix` for Helm (Helm runs in `nix develop .#cd`). Do **not** call
   the underlying nscloud/buildx actions directly.
-- All Nix jobs (pre-commit, Helm, release) share the same Nix store cache via
-  `nscloud-cache-tag-atomi-nix-store-cache`.
+- All Nix jobs (pre-commit, Helm, release) share the same OS-scoped Nix store cache via
+  `nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64`.
 - There is **no cap** on the number of images or charts — add a caller job per `image_name`
   / `chart_path`.
 
@@ -136,9 +136,9 @@ on:
 jobs:
   precommit:
     runs-on:
-      - nscloud-ubuntu-22.04-amd64-4x8-with-cache
+      - nscloud-ubuntu-26.04-amd64-16x32-with-cache
       - nscloud-cache-size-50gb
-      - nscloud-cache-tag-atomi-nix-store-cache
+      - nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64
     steps:
       - uses: AtomiCloud/actions.setup-nix@v3 # checks out the repo too
       - run: nix develop .#ci -c ./scripts/ci/pre-commit.sh
@@ -164,14 +164,63 @@ jobs:
 
 Runners with Nix store caching for persistent build artifacts.
 
+### Runner Venues
+
+Every job picks exactly one venue. There is one **primary** and one **fallback** per venue kind.
+Namespace venues additionally carry a **deliberate cache split** — the `-with-cache` suffix is
+what attaches the cache volume, so a bare label can never be cached:
+
+| Venue                          | Primary                                       | Fallback                                      |
+| ------------------------------ | --------------------------------------------- | --------------------------------------------- |
+| GitHub                         | `ubuntu-26.04`                                | `ubuntu-24.04`                                |
+| Namespace, cache-eligible      | `nscloud-ubuntu-26.04-amd64-16x32-with-cache` | `nscloud-ubuntu-24.04-amd64-16x32-with-cache` |
+| Namespace, must-not-share-cache | `nscloud-ubuntu-26.04-amd64-16x32`            | `nscloud-ubuntu-24.04-amd64-16x32`            |
+
+Rules:
+
+- **Cache-eligible jobs** — every Nix-store user, which is every Namespace reusable workflow in
+  this template — use the `-with-cache` venue label **plus** the matching OS-scoped cache tag and
+  `nscloud-cache-size-50gb`.
+- **Must-not-share-cache jobs** use the **bare** venue label and carry **no cache-tag label at
+  all**. Cache absence on those lanes is the point, so never "fix" one by adding a tag: a bare
+  label cannot attach a cache volume, and a bare label paired with a cache tag silently caches
+  nothing.
+- **Never mix primary and fallback labels** in the same `runs-on`. A Namespace job carries
+  exactly one venue label and at most one cache tag; `nscloud-cache-size-50gb` is metadata and
+  is not a venue label.
+- The fallback exists for venue outages only. A job that runs on a fallback venue MUST record a
+  non-empty `S31_RUNNER_FALLBACK_REASON` at job-level `env` saying why:
+
+  ```yaml
+  jobs:
+    precommit:
+      runs-on:
+        - nscloud-ubuntu-24.04-amd64-16x32-with-cache
+        - nscloud-cache-size-50gb
+        - nscloud-cache-tag-atomi-nix-store-cache-ubuntu-24.04-amd64
+      env:
+        S31_RUNNER_FALLBACK_REASON: '26.04 image unavailable in region (INC-1234)'
+  ```
+
+- Primary jobs MUST NOT carry a stale `S31_RUNNER_FALLBACK_REASON`. Remove it in the same commit
+  that moves a job back to the primary venue.
+
 ### Shared Nix Store Cache
 
-All Nix jobs use a single shared cache tag — **not** per-service — so the whole org reuses one
-warm store and saves cache space:
+All cache-eligible Nix jobs use a single shared, **OS-scoped** cache tag — **not** per-service —
+so the whole org reuses one warm store and saves cache space:
 
 ```yaml
-nscloud-cache-tag-atomi-nix-store-cache
+nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64
 ```
+
+The tag only takes effect on a `-with-cache` venue label; that suffix is what attaches the cache
+volume. The two travel together: a cache-eligible job has both, and a **must-not-share-cache job
+has neither** — bare venue label, no cache tag.
+
+The `-ubuntu-<version>-<arch>` suffix binds the store to the OS that produced it. Switching OS
+versions rotates the tag (26.04 ↔ 24.04 use different tags), so the first run on the new OS is a
+**cold build** by design — no alias, no carry-over, and no cross-OS store reuse.
 
 ## Local Reproducibility
 
@@ -214,5 +263,5 @@ scripts/
 | **Workflow types**        | CI (every commit), Release (main merge), CD (tag push) |
 | **Execution**             | Nix -> Caches -> shell script                          |
 | **Reusable workflows**    | Named with `⚡`, reusable workflow handles execution   |
-| **Cache tag (shared)**    | `atomi-nix-store-cache` (one shared store, not per-service) |
+| **Cache tag (shared)**    | `nscloud-cache-tag-atomi-nix-store-cache-ubuntu-26.04-amd64` (one shared store, not per-service) |
 | **Local reproducibility** | `nix develop .#ci -c ./scripts/ci/script.sh`           |

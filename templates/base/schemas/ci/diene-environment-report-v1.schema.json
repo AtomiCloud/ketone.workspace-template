@@ -1,0 +1,455 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.atomi.cloud/diene/diene-environment-report-v1.schema.json",
+  "title": "Diene core environment report v1",
+  "description": "Evidence for one core runtime lane. Existing lane/readiness/journey/evidence vocabulary remains valid; Namespace lifecycle, exact identity, proof-bundle, checkpoint, and cold-timing evidence are additive and mandatory for the active Namespace execution path.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "repositoryRevision",
+    "workflow",
+    "lane",
+    "profile",
+    "buildMode",
+    "subject",
+    "instance",
+    "receiptId",
+    "tooling",
+    "readiness",
+    "journeys",
+    "coverage",
+    "evidence",
+    "teardown",
+    "timings",
+    "outcome"
+  ],
+  "properties": {
+    "apiVersion": { "const": "diene.atomi.cloud/ci-environment-report/v1" },
+    "repositoryRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "workflow": { "$ref": "#/$defs/workflow" },
+    "lane": { "enum": ["ditto-build-local", "ditto-target-pull", "absol", "fleet-independence"] },
+    "profile": { "enum": ["ditto", "absol"] },
+    "buildMode": { "enum": ["build-local", "target-pull"] },
+    "subject": { "$ref": "#/$defs/subject" },
+    "instance": { "$ref": "#/$defs/instance" },
+    "receiptId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "tooling": { "$ref": "#/$defs/tooling" },
+    "readiness": {
+      "anyOf": [
+        { "$ref": "diene-readiness-v1.schema.json" },
+        { "type": "null" }
+      ]
+    },
+    "journeys": { "type": "array", "items": { "$ref": "#/$defs/outcome" } },
+    "coverage": { "type": "array", "items": { "$ref": "#/$defs/outcome" } },
+    "evidence": { "$ref": "#/$defs/evidence" },
+    "teardown": { "$ref": "#/$defs/teardown" },
+    "namespaceLifecycle": { "$ref": "#/$defs/namespaceLifecycle" },
+    "checkpointChain": { "$ref": "#/$defs/checkpointChain" },
+    "timings": { "$ref": "#/$defs/timings" },
+    "outcome": { "enum": ["Pass", "Fail"] },
+    "reasonCode": { "type": "string", "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "Fail" } }, "required": ["outcome"] },
+      "then": { "required": ["reasonCode"] }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "Pass" } }, "required": ["outcome"] },
+      "then": {
+        "properties": {
+          "readiness": { "type": "object" },
+          "teardown": {
+            "properties": {
+              "outcome": { "const": "Pass" },
+              "absenceProof": { "const": "ReceiptDestroyed" }
+            }
+          },
+          "coverage": {
+            "items": {
+              "properties": {
+                "required": { "const": false },
+                "id": {
+                  "not": {
+                    "enum": [
+                      "artifact-real-pull",
+                      "artifact-evict-repull",
+                      "artifact-sibling-denial",
+                      "artifact-pull-secret-ownership",
+                      "artifact-credential-removal",
+                      "closure-signature-verification",
+                      "closure-exact-set-equality"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "The vendor namespace may never be opened by a core report.",
+      "not": {
+        "anyOf": [
+          { "required": ["vendorOutcome"] },
+          { "required": ["vendorOutcomes"] },
+          { "required": ["actionId"] },
+          { "required": ["providerCleanup"] }
+        ]
+      }
+    },
+    {
+      "description": "When the additive Namespace surface is present it is complete; old venue-agnostic reports remain schema-compatible.",
+      "if": { "required": ["namespaceLifecycle"] },
+      "then": {
+        "required": ["checkpointChain"],
+        "properties": {
+          "instance": {
+            "required": ["clusterId", "osId", "k3sVersion", "kubernetesVersion", "nodeCount", "capacity"]
+          },
+          "tooling": {
+            "required": [
+              "nscVersion",
+              "nscArtifactDigest",
+              "nscBinaryDigest",
+              "sourceArchiveDigest",
+              "artifactSubjectDigest"
+            ]
+          },
+          "evidence": {
+            "required": ["proofBundle"],
+            "properties": {
+              "egressCanary": {
+                "required": ["profileId", "enforcement", "platformStatus", "hostileProbes"]
+              }
+            }
+          },
+          "timings": {
+            "required": [
+              "createToKubernetesReadySeconds",
+              "driverTransferSetupSeconds",
+              "renderApplySeconds",
+              "collectionSeconds",
+              "destroySeconds",
+              "totalColdSeconds"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "description": "A green Namespace report requires every outer phase, a collected proof, and a final clean non-resumed chain.",
+      "if": {
+        "properties": { "outcome": { "const": "Pass" } },
+        "required": ["outcome", "namespaceLifecycle"]
+      },
+      "then": {
+        "properties": {
+          "namespaceLifecycle": {
+            "properties": {
+              "outcome": { "const": "Pass" },
+              "create": { "properties": { "outcome": { "const": "Pass" } } },
+              "transfer": { "properties": { "outcome": { "const": "Pass" } } },
+              "ssh": { "properties": { "outcome": { "const": "Pass" } } },
+              "collection": { "properties": { "outcome": { "const": "Pass" } } },
+              "destroy": { "properties": { "outcome": { "const": "Pass" } } },
+              "absence": { "properties": { "outcome": { "const": "Pass" } } }
+            }
+          },
+          "instance": {
+            "properties": {
+              "clusterId": { "type": "string" },
+              "osId": { "const": "wolfi" },
+              "k3sVersion": { "type": "string" },
+              "kubernetesVersion": { "type": "string" },
+              "nodeCount": { "const": 1 },
+              "capacity": { "type": "object" }
+            }
+          },
+          "checkpointChain": {
+            "properties": {
+              "validated": { "const": true },
+              "resumedLegs": { "const": 0 },
+              "finalCleanPass": { "const": true },
+              "checkpoints": {
+                "items": {
+                  "properties": {
+                    "outcome": { "const": "Pass" },
+                    "resumed": { "const": false }
+                  }
+                }
+              }
+            }
+          },
+          "evidence": {
+            "properties": {
+              "proofBundle": {
+                "properties": {
+                  "outcome": { "const": "Pass" },
+                  "collectedBeforeDestroy": { "const": true }
+                }
+              },
+              "egressCanary": { "properties": { "outcome": { "const": "Pass" } } }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "runAttempt", "workflowRef"],
+      "properties": {
+        "runId": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "runAttempt": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "workflowRef": {
+          "type": "string",
+          "pattern": "^AtomiCloud/[A-Za-z0-9_.-]+/\\.github/workflows/[^@]+@[0-9a-f]{40}$"
+        }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactDigest", "imageRef", "producerWorkflowRef"],
+      "properties": {
+        "artifactDigest": { "$ref": "#/$defs/digest" },
+        "imageRef": { "type": "string", "minLength": 1 },
+        "producerWorkflowRef": { "type": "string", "minLength": 1 },
+        "provenanceAttestationDigest": { "$ref": "#/$defs/digest" },
+        "closureDigest": { "$ref": "#/$defs/digest" },
+        "closureSignatureBundleDigest": { "$ref": "#/$defs/digest" },
+        "closureTrustRootDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allocationKey", "generationKey"],
+      "properties": {
+        "allocationKey": { "type": "string", "minLength": 1 },
+        "generationKey": { "type": "string", "minLength": 1 },
+        "substrateName": { "type": "string", "minLength": 1 },
+        "substrateReceipt": { "type": "string", "minLength": 1 },
+        "clusterId": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$" },
+        "osId": { "enum": ["wolfi", null] },
+        "osVersion": { "type": ["string", "null"], "minLength": 1 },
+        "k3sVersion": { "type": ["string", "null"], "pattern": "k3s" },
+        "kubernetesVersion": { "type": ["string", "null"], "minLength": 1 },
+        "nodeCount": { "enum": [1, null] },
+        "capacity": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["cpu", "memory"],
+              "properties": {
+                "cpu": { "type": "string", "minLength": 1 },
+                "memory": { "type": "string", "minLength": 1 }
+              }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "tooling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gardenLockDigest", "journeyManifestDigest"],
+      "properties": {
+        "gardenLockDigest": { "$ref": "#/$defs/digest" },
+        "journeyManifestDigest": { "$ref": "#/$defs/digest" },
+        "environmentLockDigest": { "$ref": "#/$defs/digest" },
+        "artifactSubjectDigest": { "$ref": "#/$defs/digest" },
+        "sourceArchiveDigest": { "$ref": "#/$defs/digest" },
+        "nscVersion": { "const": "v0.0.532" },
+        "nscArtifactDigest": { "$ref": "#/$defs/digest" },
+        "nscBinaryDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "outcome", "reasonCode", "required"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "outcome": { "enum": ["Pass", "Fail", "NotApplicable", "Unavailable"] },
+        "reasonCode": { "type": "string", "minLength": 1 },
+        "required": { "type": "boolean" },
+        "durationSeconds": { "type": "integer", "minimum": 0 },
+        "fixturePackDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leakageScan", "egressCanary", "shipment"],
+      "properties": {
+        "leakageScan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outcome", "reasonCode", "encodings", "scannedPaths"],
+          "properties": {
+            "outcome": { "enum": ["Pass", "Fail"] },
+            "reasonCode": { "type": "string", "minLength": 1 },
+            "encodings": { "type": "array", "minItems": 6, "items": { "type": "string", "minLength": 1 } },
+            "scannedPaths": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "egressCanary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outcome", "reasonCode"],
+          "properties": {
+            "outcome": { "enum": ["Pass", "Fail", "NotRequired", "Unavailable"] },
+            "reasonCode": { "type": "string", "minLength": 1 },
+            "mode": { "enum": ["allowlist", "closure-denied-network"] },
+            "profileId": {
+              "enum": [
+                "ditto-build-local-v1",
+                "ditto-target-pull-v1",
+                "ditto-vendor-v1",
+                "absol-hermetic-v1",
+                "fleet-independence-v1"
+              ]
+            },
+            "enforcement": { "const": "interim-in-guest-iptables-nft" },
+            "platformStatus": { "const": "platform per-instance policy pending (support ask #4)" },
+            "hostileProbes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/outcome" } }
+          }
+        },
+        "shipment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outcome", "reasonCode"],
+          "properties": {
+            "outcome": { "enum": ["Pass", "Unavailable"] },
+            "reasonCode": { "type": "string", "minLength": 1 }
+          }
+        },
+        "proofBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outcome", "reasonCode", "digest", "collectedBeforeDestroy"],
+          "properties": {
+            "outcome": { "enum": ["Pass", "Fail"] },
+            "reasonCode": { "type": "string", "minLength": 1 },
+            "digest": { "$ref": "#/$defs/digest" },
+            "collectedBeforeDestroy": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "teardown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "reasonCode", "transitions", "finalizerWaitSeconds", "debt", "absenceProof"],
+      "properties": {
+        "outcome": { "enum": ["Pass", "Fail"] },
+        "reasonCode": { "type": "string", "minLength": 1 },
+        "transitions": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "finalizerWaitSeconds": { "type": "integer", "minimum": 0, "maximum": 900 },
+        "debt": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "absenceProof": { "enum": ["ReceiptDestroyed", "ReceiptRetainedAsDebt", "NotAttempted"] }
+      }
+    },
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "reasonCode", "durationSeconds"],
+      "properties": {
+        "outcome": { "enum": ["Pass", "Fail", "NotAttempted"] },
+        "reasonCode": { "type": "string", "minLength": 1 },
+        "durationSeconds": { "type": "integer", "minimum": 0 },
+        "receiptDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "namespaceLifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clusterId", "duration", "ephemeral", "endpointUsed", "cacheAttached",
+        "orchestratorVenue", "orchestratorLabel", "fallbackReason",
+        "create", "transfer", "ssh", "collection", "destroy", "absence",
+        "lateCleanupCanRewrite", "outcome"
+      ],
+      "properties": {
+        "clusterId": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$" },
+        "duration": { "const": "2h" },
+        "ephemeral": { "const": true },
+        "endpointUsed": { "const": false },
+        "cacheAttached": { "type": "boolean" },
+        "orchestratorVenue": { "enum": ["github", "namespace", "local"] },
+        "orchestratorLabel": {
+          "enum": [
+            "ubuntu-26.04", "ubuntu-24.04",
+            "nscloud-ubuntu-26.04-amd64-16x32", "nscloud-ubuntu-26.04-amd64-16x32-with-cache",
+            "nscloud-ubuntu-24.04-amd64-16x32",
+            "local-contract-test"
+          ]
+        },
+        "fallbackReason": { "type": ["string", "null"], "minLength": 1 },
+        "create": { "$ref": "#/$defs/phase" },
+        "transfer": { "$ref": "#/$defs/phase" },
+        "ssh": { "$ref": "#/$defs/phase" },
+        "collection": { "$ref": "#/$defs/phase" },
+        "destroy": { "$ref": "#/$defs/phase" },
+        "absence": { "$ref": "#/$defs/phase" },
+        "lateCleanupCanRewrite": { "const": false },
+        "outcome": { "enum": ["Pass", "Fail"] }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "inputDigest", "predecessorDigest", "evidenceDigest", "receiptDigest", "outcome", "resumed"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+        "inputDigest": { "$ref": "#/$defs/digest" },
+        "predecessorDigest": { "$ref": "#/$defs/digest" },
+        "evidenceDigest": { "$ref": "#/$defs/digest" },
+        "receiptDigest": { "$ref": "#/$defs/digest" },
+        "outcome": { "enum": ["Pass", "Fail"] },
+        "resumed": { "type": "boolean" }
+      }
+    },
+    "checkpointChain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputDigest", "checkpoints", "validated", "resumedLegs", "finalCleanPass"],
+      "properties": {
+        "apiVersion": { "const": "diene.atomi.cloud/ci-checkpoint-chain/v1" },
+        "inputDigest": { "$ref": "#/$defs/digest" },
+        "checkpoints": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/checkpoint" } },
+        "validated": { "type": "boolean" },
+        "resumedLegs": { "type": "integer", "minimum": 0 },
+        "finalCleanPass": { "type": "boolean" }
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["setupSeconds", "substrateSeconds", "readinessSeconds", "journeysSeconds", "teardownSeconds"],
+      "properties": {
+        "setupSeconds": { "type": "integer", "minimum": 0 },
+        "substrateSeconds": { "type": "integer", "minimum": 0 },
+        "readinessSeconds": { "type": "integer", "minimum": 0 },
+        "journeysSeconds": { "type": "integer", "minimum": 0 },
+        "teardownSeconds": { "type": "integer", "minimum": 0 },
+        "createToKubernetesReadySeconds": { "type": "integer", "minimum": 0 },
+        "driverTransferSetupSeconds": { "type": "integer", "minimum": 0 },
+        "renderApplySeconds": { "type": "integer", "minimum": 0 },
+        "collectionSeconds": { "type": "integer", "minimum": 0 },
+        "destroySeconds": { "type": "integer", "minimum": 0 },
+        "totalColdSeconds": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

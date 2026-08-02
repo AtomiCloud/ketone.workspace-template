@@ -1,0 +1,148 @@
+name: Environment vendor action
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha: { description: 'Full protected-main commit', required: true, type: string }
+      action_id: { description: 'Exact declared vendor action ID', required: true, type: string }
+
+permissions: {}
+
+jobs:
+  authorize-vendor:
+    name: Authorize vendor action
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      source_sha: ${{ steps.guard.outputs.source_sha }}
+      base_workflow_ref: ${{ steps.guard.outputs.base_workflow_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, ref: '${{ inputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ACTION_ID: ${{ inputs.action_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          # A full lowercase 40-hex commit, not merely a 40-character string: a
+          # 40-character ref name must never pass as a commit SHA.
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "$SOURCE_SHA^{commit}"
+          test "$(git rev-parse --verify "$SOURCE_SHA^{commit}")" = "$SOURCE_SHA"
+          test "$GITHUB_REPOSITORY_OWNER" = AtomiCloud
+          git merge-base --is-ancestor "$SOURCE_SHA" "origin/$DEFAULT_BRANCH"
+          permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" --jq .permission)
+          [[ "$permission" == write || "$permission" == admin ]]
+
+          [[ "$WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/"* ]]
+          test "$WORKFLOW_SHA" = "$SOURCE_SHA"
+          base_workflow_ref="${WORKFLOW_REF%@*}@$SOURCE_SHA"
+
+          # The exact declaration and production fixtures are proven before
+          # the reusable workflow can invoke nsc create.
+          DIENE_LANE=ditto-vendor DIENE_NSC_DURATION=2h \
+            DIENE_VENDOR_MANIFEST=.diene/ci/vendors.v1.yaml DIENE_ACTION_ID="$ACTION_ID" \
+            nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-prerequisites
+
+          printf 'source_sha=%s\nbase_workflow_ref=%s\n' "$SOURCE_SHA" "$base_workflow_ref" >>"$GITHUB_OUTPUT"
+
+  # The same stable prerequisite IDs the core caller uses. The vendor lane gets
+  # no shortcut rail of its own.
+  artifact-build:
+    name: Artifact Build
+    needs: authorize-vendor
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      artifact_digest: ${{ steps.subject.outputs.artifact_digest }}
+      garden_lock_digest: ${{ steps.subject.outputs.garden_lock_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ needs.authorize-vendor.outputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - id: subject
+        env:
+          GITHUB_SHA: ${{ needs.authorize-vendor.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.authorize-vendor.outputs.source_sha }}
+          DIENE_BASE_WORKFLOW_REF: ${{ needs.authorize-vendor.outputs.base_workflow_ref }}
+        run: |
+          producer=.diene/ci/artifact-producer.sh
+          if [[ ! -x $producer ]]; then
+            printf 'ArtifactProducerUnavailable: %s is absent or not executable\n' "$producer" >&2
+            exit 1
+          fi
+          subject="$RUNNER_TEMP/artifact.v1.json"
+          "$producer" --source-sha "$SOURCE_SHA" --output "$subject"
+          nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh --validate-subject "$subject"
+          lock=$(sha256sum .diene/ci/environment-lock.v1.json | cut -d' ' -f1)
+          {
+            printf 'garden_lock_digest=sha256:%s\n' "$lock"
+            nix develop .#ci -c jq -r '"artifact_digest=" + .artifact.digest' "$subject"
+          } >>"$GITHUB_OUTPUT"
+      - name: Publish the immutable same-run subject
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/artifact.v1.json
+          if-no-files-found: error
+          retention-days: 1
+
+  environment-profile-contract:
+    name: Environment Profile Contract
+    needs: [authorize-vendor, artifact-build]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    concurrency:
+      group: profile-${{ fromJSON(github.repository_id) }}-${{ needs.authorize-vendor.outputs.source_sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ needs.authorize-vendor.outputs.source_sha }}' }
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: diene-artifact-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/subject
+      - name: Validate the exact same-run subject artifact-build published
+        env:
+          GITHUB_SHA: ${{ needs.authorize-vendor.outputs.source_sha }}
+          DIENE_BASE_WORKFLOW_REF: ${{ needs.authorize-vendor.outputs.base_workflow_ref }}
+        run: |
+          nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh \
+            --validate-subject "$RUNNER_TEMP/subject/artifact.v1.json"
+      - name: Validate runtime-free profile, corpus, and parity
+        run: nix develop .#ci -c ./scripts/ci/environment-profile-contract.sh
+      - name: Upload safe profile contract report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diene-profile-contract-vendor-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diene-profile-contract.json
+          if-no-files-found: error
+          retention-days: 7
+
+  environment-ditto-vendor:
+    needs: [authorize-vendor, artifact-build, environment-profile-contract]
+    permissions: { contents: read, id-token: write }
+    uses: ./.github/workflows/⚡reusable-environment-k3d.yaml
+    secrets: inherit
+    with:
+      lane: ditto-vendor
+      repository_id: ${{ fromJSON(github.repository_id) }}
+      repository_key: ${{ github.repository }}
+      source_sha: ${{ needs.authorize-vendor.outputs.source_sha }}
+      garden_lock_digest: ${{ needs.artifact-build.outputs.garden_lock_digest }}
+      artifact_digest: ${{ needs.artifact-build.outputs.artifact_digest }}
+      vendor_manifest: .diene/ci/vendors.v1.yaml
+      action_id: ${{ inputs.action_id }}

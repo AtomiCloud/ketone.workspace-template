@@ -1,0 +1,18 @@
+{
+  "apiVersion": "diene.atomi.cloud/ci-fixture/v1",
+  "id": "bootstrap-fleet-independence-v1",
+  "version": "1.0.0",
+  "profile": "ditto",
+  "buildMode": "build-local",
+  "secrets": [],
+  "externalArtifacts": [],
+  "allowedExternalEndpoints": [],
+  "localGraph": {
+    "baseline": "authoritative-primordial-sulfoxide",
+    "application": "synthetic-readiness-echo",
+    "forbiddenResources": [
+      "ArgoApplication", "KargoStage", "RegisteredClusterSecret",
+      "EnteiAllocation", "VCluster", "PublicDNS", "PublicCertificate"
+    ]
+  }
+}
