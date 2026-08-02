@@ -223,6 +223,309 @@ VALIDATOR
   chmod 0500 "$target"
 }
 
+# One fixed pre-Nix remote program. The tagged shell is verified but remains
+# mode 0600 and is never executed; only the independently pinned binary gains
+# execute permission. Identity acceptance is deferred to the in-shell
+# preflight, which runs before policy or application mutation.
+orchestrator_fixed_remote_command() {
+  local contract installer_digest installer_bytes payload_digest payload_bytes remote_command
+  local guest_nix_stage2
+  contract=$(diene_guest_nix_contract) || return $?
+  installer_digest=$(jq -er '.installerDigest' <<<"$contract") ||
+    diene_die InputContractInvalid 'guest Nix provenance digest is absent from the fixed contract'
+  installer_bytes=$(jq -er '.installerBytes' <<<"$contract") ||
+    diene_die InputContractInvalid 'guest Nix provenance length is absent from the fixed contract'
+  payload_digest=$(jq -er '.payloadDigest' <<<"$contract") ||
+    diene_die InputContractInvalid 'guest Nix payload digest is absent from the fixed contract'
+  payload_bytes=$(jq -er '.payloadBytes' <<<"$contract") ||
+    diene_die InputContractInvalid 'guest Nix payload length is absent from the fixed contract'
+  diene_require_digest guest-nix-remote-installer-digest "$installer_digest"
+  diene_require_digest guest-nix-remote-payload-digest "$payload_digest"
+  [[ $installer_bytes =~ ^[1-9][0-9]*$ && $payload_bytes =~ ^[1-9][0-9]*$ ]] ||
+    diene_die InputContractInvalid 'guest Nix remote pin lengths are invalid'
+
+  remote_command=$(cat <<'REMOTE'
+set -eu
+umask 077
+guest_nix_inherited_nix_command=absent
+if command -v nix >/dev/null 2>&1; then
+  guest_nix_inherited_nix_command=present
+fi
+GUEST_NIX_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$GUEST_NIX_PATH
+export PATH
+LC_ALL=C
+export LC_ALL
+guest_nix_fail() { printf '%s: %s\n' "$1" "$2" >&2; exit 64; }
+
+# --- BEGIN guest nix environment contract ---
+# POSIX env prints NAME=VALUE per line, so an inherited name always begins a
+# line. An embedded NIX-shaped line in a value can only over-refuse, which is
+# the fail-closed direction; diagnostics intentionally print names, not values.
+guest_nix_inherited_nix_names() {
+  guest_nix_environment=$(env) || return 1
+  printf '%s\n' "$guest_nix_environment" |
+    sed -n 's/^\(NIX[A-Za-z0-9_]*\)=.*$/\1/p'
+}
+guest_nix_require_clean_nix_env() {
+  inherited=$(guest_nix_inherited_nix_names) ||
+    guest_nix_fail GuestNixInstallerUntrusted \
+      'the fixed-path inherited environment could not be enumerated'
+  [ -z "$inherited" ] ||
+    guest_nix_fail GuestNixInstallerUntrusted \
+      "inherited Nix-family environment variables are prohibited: $(printf '%s' "$inherited" | tr '\n' ' ')"
+}
+guest_nix_require_commands() {
+  for guest_nix_cmd in env sed tr id install cd sha256sum chmod wc cat printf uname \
+    readlink sort cut tar find awk mktemp rm; do
+    command -v "$guest_nix_cmd" >/dev/null 2>&1 ||
+      guest_nix_fail GuestNixInstallerUntrusted \
+        "a required guest command is absent from the fixed PATH: $guest_nix_cmd"
+  done
+}
+# --- END guest nix environment contract ---
+
+guest_nix_require_commands
+guest_nix_require_clean_nix_env
+test "$(id -u)" = 0
+install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out
+GUEST_NIX_HOME=/run/diene-ci/home
+install -d -m 0700 "$GUEST_NIX_HOME" "$GUEST_NIX_HOME/.config"
+HOME=$GUEST_NIX_HOME
+XDG_CONFIG_HOME=$GUEST_NIX_HOME/.config
+TMPDIR=/run/diene-ci/tmp
+export HOME XDG_CONFIG_HOME TMPDIR
+cd /run/diene-ci
+sha256sum -c archive-validator.sha256
+chmod 0500 archive-validator.sh
+./archive-validator.sh source.tar source
+install -m 0600 receipt.json receipts/exact.json
+install -d -m 0700 evidence/guest-nix
+guest_nix_pinned_asset_valid() {
+  asset=$1
+  sidecar=$2
+  expected_digest=$3
+  expected_bytes=$4
+  expected_line=${expected_digest#sha256:}'  '"$asset"
+  [ -f "$asset" ] && [ ! -L "$asset" ] &&
+    [ -f "$sidecar" ] && [ ! -L "$sidecar" ] &&
+    [ "$(wc -c <"$asset")" -eq "$expected_bytes" ] &&
+    [ "$(wc -l <"$sidecar")" -eq 1 ] &&
+    [ "$(sha256sum "$asset")" = "$expected_line" ] &&
+    [ "$(cat "$sidecar")" = "$expected_line" ] &&
+    sha256sum -c "$sidecar" >/dev/null 2>&1
+}
+guest_nix_exact_output_valid() {
+  stdout_file=$1
+  stderr_file=$2
+  expected_output=$3
+  expected_output_bytes=$4
+  [ -f "$stdout_file" ] && [ ! -L "$stdout_file" ] &&
+    [ -f "$stderr_file" ] && [ ! -L "$stderr_file" ] &&
+    [ ! -s "$stderr_file" ] &&
+    [ "$(wc -c <"$stdout_file")" -eq "$expected_output_bytes" ] &&
+    [ "$(wc -l <"$stdout_file")" -eq 1 ] &&
+    [ "$(cat "$stdout_file")" = "$expected_output" ]
+}
+guest_nix_hash_etc_config() {
+  [ -d /etc/nix ] && [ ! -L /etc/nix ] &&
+    [ -f /etc/nix/nix.conf ] && [ ! -L /etc/nix/nix.conf ] &&
+    [ -r /etc/nix/nix.conf ] || return 1
+  sha256sum /etc/nix/nix.conf | cut -d" " -f1
+}
+guest_nix_plain_sha256_valid() {
+  [ "${#1}" -eq 64 ] || return 1
+  case $1 in *[!0-9a-f]*) return 1 ;; esac
+}
+guest_nix_installer_digest=__DIENE_GUEST_NIX_INSTALLER_DIGEST__
+guest_nix_installer_bytes=__DIENE_GUEST_NIX_INSTALLER_BYTES__
+guest_nix_payload_digest=__DIENE_GUEST_NIX_PAYLOAD_DIGEST__
+guest_nix_payload_bytes=__DIENE_GUEST_NIX_PAYLOAD_BYTES__
+[ "$(uname -m)" = x86_64 ] || guest_nix_fail GuestNixInstallerUnsupportedArch 'the guest architecture is not the pinned x86_64 target'
+if [ "$guest_nix_inherited_nix_command" = present ] || [ -e /nix ] || [ -L /nix ] ||
+  [ -e /etc/nix ] || [ -L /etc/nix ]; then
+  guest_nix_fail GuestNixPreexistingState \
+    'the ephemeral guest already contains Nix, /nix state, or /etc/nix state'
+fi
+guest_nix_pinned_asset_valid guest-nix-bootstrap.sh guest-nix-bootstrap.sha256 \
+  "$guest_nix_installer_digest" "$guest_nix_installer_bytes" &&
+  guest_nix_pinned_asset_valid guest-nix-installer guest-nix-installer.sha256 \
+    "$guest_nix_payload_digest" "$guest_nix_payload_bytes" ||
+  guest_nix_fail GuestNixInstallerUntrusted 'an uploaded guest Nix artifact or sidecar changed'
+{
+  cat guest-nix-bootstrap.sha256 guest-nix-installer.sha256
+  printf '%s\n' 'executionMode=direct-pinned-binary' 'payloadDigestVerified=true'
+} >evidence/guest-nix/verified.txt
+chmod 0600 evidence/guest-nix/verified.txt guest-nix-bootstrap.sh guest-nix-installer
+chmod 0500 guest-nix-installer
+installer_version_stdout=evidence/guest-nix/installer-version.txt
+installer_version_stderr=evidence/guest-nix/installer-version.stderr
+: >"$installer_version_stdout"
+: >"$installer_version_stderr"
+chmod 0600 "$installer_version_stdout" "$installer_version_stderr"
+if ! env -i PATH="$GUEST_NIX_PATH" HOME="$GUEST_NIX_HOME" TMPDIR=/run/diene-ci/tmp LC_ALL=C \
+  ./guest-nix-installer --version >"$installer_version_stdout" 2>"$installer_version_stderr"; then
+  guest_nix_fail GuestNixInstallerUntrusted 'the pinned installer version probe failed'
+fi
+guest_nix_exact_output_valid "$installer_version_stdout" "$installer_version_stderr" \
+  'nix-installer 3.21.9' 21 ||
+  guest_nix_fail GuestNixInstallerUntrusted 'the pinned installer version output is not exact'
+install_rc=0
+env -i PATH="$GUEST_NIX_PATH" HOME="$GUEST_NIX_HOME" TMPDIR=/run/diene-ci/tmp LC_ALL=C \
+  NIX_INSTALLER_DIAGNOSTIC_ENDPOINT= \
+  ./guest-nix-installer install linux --no-confirm --init none \
+  >evidence/guest-nix/install.log 2>&1 || install_rc=$?
+chmod 0600 evidence/guest-nix/install.log
+[ "$install_rc" -eq 0 ] || guest_nix_fail GuestNixInstallFailed 'the pinned guest Nix installer failed'
+guest_nix_etc_config_digest=$(guest_nix_hash_etc_config) ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the pinned installer did not create a safe regular /etc/nix/nix.conf'
+guest_nix_plain_sha256_valid "$guest_nix_etc_config_digest" ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the installed /etc/nix/nix.conf digest is malformed'
+guest_nix_profile=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+guest_nix_profile_resolved=$(readlink -f "$guest_nix_profile" 2>/dev/null || printf '')
+case $guest_nix_profile_resolved in
+  /nix/store/*/etc/profile.d/nix-daemon.sh) ;;
+  *) guest_nix_fail GuestNixIdentityUnexpected \
+    'the exact guest Nix profile does not resolve into the pinned Nix store' ;;
+esac
+[ -f "$guest_nix_profile" ] && [ -r "$guest_nix_profile" ] ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    'the exact guest Nix profile is absent, unreadable, or not a regular file'
+# Everything after the profile is sourced runs in shells that never saw the
+# profile. Stage 2's whole program text, and the nix.conf digest bound before
+# the profile existed, are fixed inside stage 1's text before stage 1 starts,
+# and a freshly executed shell begins with an empty function table, its own
+# variables and an argument list it did not choose. So no name the profile can
+# reach - variable, function, alias, PATH entry, positional parameter, shell
+# option or trap - is consulted by the recheck. Stage 1 runs no bare command
+# after the profile returns, because BusyBox ash lets a sourced file shadow
+# exec, exit, return and set, and expands a profile-defined alias into lines
+# of the same program text parsed after the dot. An alias name cannot contain
+# a slash and no function can shadow an absolute path, in either shell, so the
+# one command stage 1 issues is /bin/sh spelled absolutely. Stage 2 restores
+# the profile PATH only for the final fixed-path handoff.
+guest_nix_stage2=$(cat <<'GUEST_NIX_STAGE2'
+set -eu
+umask 077
+guest_nix_bound_config_digest=$1
+guest_nix_profile_rc=$2
+guest_nix_develop_path=$PATH
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+cd /run/diene-ci
+guest_nix_fail() { printf "%s: %s\n" "$1" "$2" >&2; exit 64; }
+guest_nix_hash_etc_config() {
+  [ -d /etc/nix ] && [ ! -L /etc/nix ] &&
+    [ -f /etc/nix/nix.conf ] && [ ! -L /etc/nix/nix.conf ] &&
+    [ -r /etc/nix/nix.conf ] || return 1
+  sha256sum /etc/nix/nix.conf | cut -d" " -f1
+}
+[ "$guest_nix_profile_rc" -eq 0 ] ||
+  guest_nix_fail GuestNixProfileSourceFailed "the exact guest Nix profile returned nonzero while being sourced"
+guest_nix_profile_environment=$(env) ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    "the post-profile environment could not be enumerated"
+guest_nix_profile_names_unsorted=$(printf "%s\n" "$guest_nix_profile_environment" |
+  sed -n "s/^\(NIX[A-Za-z0-9_]*\)=.*\$/profileNixVar=\1/p") ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    "the post-profile Nix-family names could not be parsed"
+guest_nix_profile_names=$(printf "%s\n" "$guest_nix_profile_names_unsorted" | LC_ALL=C sort) ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    "the post-profile Nix-family names could not be sorted"
+if ! {
+  printf "%s\n" "inheritedNixFamily=none"
+  if [ -n "$guest_nix_profile_names" ]; then
+    printf "%s\n" "$guest_nix_profile_names"
+  fi
+} >evidence/guest-nix/environment.txt; then
+  guest_nix_fail GuestNixIdentityUnexpected \
+    "the post-profile environment evidence could not be written"
+fi
+HOME=/run/diene-ci/home
+XDG_CONFIG_HOME=/run/diene-ci/home/.config
+NIX_USER_CONF_FILES=/run/diene-ci/nix-user.conf
+export HOME XDG_CONFIG_HOME NIX_USER_CONF_FILES
+: >"$NIX_USER_CONF_FILES"
+chmod 0600 "$NIX_USER_CONF_FILES"
+guest_nix_etc_config_digest_after_profile=$(guest_nix_hash_etc_config) ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    "the installed /etc/nix/nix.conf became unsafe before develop"
+[ "$guest_nix_etc_config_digest_after_profile" = "$guest_nix_bound_config_digest" ] ||
+  guest_nix_fail GuestNixIdentityUnexpected \
+    "the installed /etc/nix/nix.conf changed before develop"
+if ! {
+  printf "home=%s\n" "$HOME"
+  printf "xdgConfigHome=%s\n" "$XDG_CONFIG_HOME"
+  printf "userConfFiles=%s\n" "$NIX_USER_CONF_FILES"
+  printf "etcNixConf=%s\n" "$guest_nix_bound_config_digest"
+} >>evidence/guest-nix/environment.txt; then
+  guest_nix_fail GuestNixIdentityUnexpected \
+    "the reviewed Nix environment evidence could not be completed"
+fi
+chmod 0600 evidence/guest-nix/environment.txt
+[ -x /nix/var/nix/profiles/default/bin/nix ] || { printf "GuestNixToolchainAbsent: %s\n" "the instance provides no fixed-path nix command for the driver entry" >&2; exit 64; }
+if ! /nix/var/nix/profiles/default/bin/nix --version >evidence/guest-nix/version.txt \
+  2>evidence/guest-nix/version.stderr; then
+  guest_nix_fail GuestNixIdentityUnexpected "the direct installed Nix identity probe failed"
+fi
+chmod 0600 evidence/guest-nix/version.txt evidence/guest-nix/version.stderr
+PATH=$guest_nix_develop_path
+export PATH
+cd /run/diene-ci/source
+exec /nix/var/nix/profiles/default/bin/nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci
+GUEST_NIX_STAGE2
+)
+# Stage 1 reads the profile path from its own argument list before the profile
+# exists, so a later "set --" inside the profile cannot redirect it, and every
+# "set" it needs runs before the profile is sourced. After the dot returns it
+# performs exactly two operations: one variable assignment, which no function
+# can intercept, and /bin/sh by absolute path. Nothing else is admissible
+# here - BusyBox ash lets a sourced file shadow "return" and "set" as well as
+# "exec" and "exit", so a helper that restored options or returned a status
+# after the dot would let a profile erase its own nonzero source result. The
+# stage-2 text and the bound digest are the opposite case: they are consulted
+# after the profile has run, so they are carried as literal program text
+# rather than as variables the profile could rebind.
+guest_nix_stage1_head=$(cat <<'GUEST_NIX_STAGE1'
+set -eu
+guest_nix_profile=$1
+set +eu
+. "$guest_nix_profile"
+guest_nix_profile_rc=$?
+GUEST_NIX_STAGE1
+)
+guest_nix_stage1="$guest_nix_stage1_head
+/bin/sh -c '$guest_nix_stage2' guest-nix-stage2 $guest_nix_etc_config_digest \"\$guest_nix_profile_rc\""
+exec /bin/sh -c "$guest_nix_stage1" guest-nix-stage1 "$guest_nix_profile"
+REMOTE
+  )
+  # The only runtime material inserted into the reviewed fixed template comes
+  # from diene_guest_nix_contract after its strict URL/digest/length admission.
+  # No uploaded file or sidecar contributes to these expected values.
+  remote_command=${remote_command//__DIENE_GUEST_NIX_INSTALLER_DIGEST__/$installer_digest}
+  remote_command=${remote_command//__DIENE_GUEST_NIX_INSTALLER_BYTES__/$installer_bytes}
+  remote_command=${remote_command//__DIENE_GUEST_NIX_PAYLOAD_DIGEST__/$payload_digest}
+  remote_command=${remote_command//__DIENE_GUEST_NIX_PAYLOAD_BYTES__/$payload_bytes}
+  [[ $remote_command != *'__DIENE_GUEST_NIX_'* ]] ||
+    diene_die InputContractInvalid 'guest Nix fixed remote command contains an unresolved pin placeholder'
+  # Stage 2 is carried inside stage 1 as one single-quoted word, so a single
+  # quote anywhere in its body would end that word and silently rewrite the
+  # pristine program. The constraint is enforced on the materialized bytes so
+  # a later edit of the template cannot corrupt the embedding unnoticed.
+  guest_nix_stage2=$(awk '
+    /^guest_nix_stage2=\$\(cat <<.GUEST_NIX_STAGE2.$/ { inside=1; next }
+    /^GUEST_NIX_STAGE2$/ { inside=0 }
+    inside
+  ' <<<"$remote_command")
+  [[ -n $guest_nix_stage2 && $guest_nix_stage2 != *"'"* ]] ||
+    diene_die InputContractInvalid 'guest Nix pristine stage-2 text is absent or contains a single quote'
+  printf '%s\n' "$remote_command"
+}
+
 orchestrator_synthetic_report() {
   local target=${1:?synthetic report required}
   local journey_digest=$DIENE_ZERO_DIGEST component=K9 permission=ditto-vendor-demo
@@ -570,6 +873,7 @@ orchestrate() {
 
   local nsc_bin nsc_identity nsc_version nsc_artifact_digest nsc_binary_digest
   local source_digest subject_digest contract_digest validator_digest create_started create_rc
+  local guest_nix_contract guest_nix_installer_digest guest_nix_payload_digest
   nsc_bin=$(diene_nsc_bin)
   nsc_identity=$(diene_nsc_identity)
   nsc_version=$(jq -r '.version' <<<"$nsc_identity")
@@ -586,6 +890,20 @@ orchestrate() {
   printf '%s  archive-validator.sh\n' "${validator_digest#sha256:}" \
     >"$ORCH_STATE/archive-validator.sha256"
   chmod 0600 "$ORCH_STATE/archive-validator.sha256"
+  guest_nix_contract=$(diene_guest_nix_contract) || exit $?
+  guest_nix_installer_digest=$(jq -r '.installerDigest' <<<"$guest_nix_contract")
+  guest_nix_payload_digest=$(jq -r '.payloadDigest' <<<"$guest_nix_contract")
+  diene_fetch_pinned_artifact "$(jq -r '.installerUrl' <<<"$guest_nix_contract")" \
+    "$guest_nix_installer_digest" "$(jq -r '.installerBytes' <<<"$guest_nix_contract")" \
+    "$ORCH_STATE/guest-nix-bootstrap.sh"
+  diene_fetch_pinned_artifact "$(jq -r '.payloadUrl' <<<"$guest_nix_contract")" \
+    "$guest_nix_payload_digest" "$(jq -r '.payloadBytes' <<<"$guest_nix_contract")" \
+    "$ORCH_STATE/guest-nix-installer"
+  printf '%s  guest-nix-bootstrap.sh\n' "${guest_nix_installer_digest#sha256:}" \
+    >"$ORCH_STATE/guest-nix-bootstrap.sha256"
+  printf '%s  guest-nix-installer\n' "${guest_nix_payload_digest#sha256:}" \
+    >"$ORCH_STATE/guest-nix-installer.sha256"
+  chmod 0600 "$ORCH_STATE/guest-nix-bootstrap.sha256" "$ORCH_STATE/guest-nix-installer.sha256"
   source_digest=$(diene_file_digest "$ORCH_STATE/source.tar")
   subject_digest=$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")
   contract_digest=$(diene_file_digest "$ORCH_STATE/egress-contract.json")
@@ -651,7 +969,8 @@ orchestrate() {
     --arg serviceCidr "${DIENE_K3S_SERVICE_CIDR:-10.143.0.0/16}" \
     --arg venue "${DIENE_ORCHESTRATOR_VENUE:-namespace}" \
     --arg label "${DIENE_ORCHESTRATOR_LABEL:-nscloud-ubuntu-26.04-amd64-16x32}" \
-    --arg fallback "${DIENE_ORCHESTRATOR_FALLBACK_REASON:-}" '
+    --arg fallback "${DIENE_ORCHESTRATOR_FALLBACK_REASON:-}" \
+    --argjson guestNix "$guest_nix_contract" '
     {apiVersion:"diene.atomi.cloud/ci-driver-inputs/v1",trustedRuntimeContext:"protected-base",
      duration:"2h",platformPolicyStatus:"platform per-instance policy pending (support ask #4)",
      owner:{repositoryId:$repositoryId,repositoryKey:$repositoryKey,sourceSha:$sourceSha,
@@ -666,7 +985,7 @@ orchestrate() {
      sourceArchiveDigest:$sourceDigest,artifactSubjectDigest:$subjectDigest,
      admittedK3sVersion:$k3s,admittedServiceCidr:$serviceCidr,cacheAttached:false,
      egress:{contractDigest:$contractDigest,canaryImage:$canaryImage,l7Enforcer:$l7,probeBin:$probe},
-     vendorCredentialBroker:$vendorBroker,
+     vendorCredentialBroker:$vendorBroker,guestNix:$guestNix,
      orchestrator:{venue:$venue,label:$label,fallbackReason:(if $fallback == "" then null else $fallback end)}}' |
     diene_write_json "$ORCH_STATE/inputs.json"
 
@@ -687,8 +1006,21 @@ orchestrate() {
   ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/archive-validator.sha256" \
     /run/diene-ci/archive-validator.sha256 --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
     2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/guest-nix-bootstrap.sh" \
+    /run/diene-ci/guest-nix-bootstrap.sh --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/guest-nix-bootstrap.sha256" \
+    /run/diene-ci/guest-nix-bootstrap.sha256 --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/guest-nix-installer" \
+    /run/diene-ci/guest-nix-installer --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/guest-nix-installer.sha256" \
+    /run/diene-ci/guest-nix-installer.sha256 --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
+    2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
   ORCH_TRANSFER_SECONDS=$((SECONDS - transfer_started))
-  ORCH_TRANSFER_DIGEST=$(phase_digest transfer "$source_digest" "$contract_digest|$validator_digest")
+  ORCH_TRANSFER_DIGEST=$(phase_digest transfer "$source_digest|$guest_nix_installer_digest" \
+    "$contract_digest|$validator_digest|$guest_nix_payload_digest")
   if ((transfer_rc != 0)); then
     ORCH_TRANSFER_OUTCOME=Fail
     ORCH_TRANSFER_REASON=NamespaceTransferFailed
@@ -699,9 +1031,7 @@ orchestrate() {
   ORCH_TRANSFER_REASON=ImmutableInputsUploaded
 
   local remote_command ssh_started ssh_rc=0
-  # The command is intentionally expanded only by the remote shell.
-  # shellcheck disable=SC2016
-  remote_command='set -eu; umask 077; test "$(id -u)" = 0; install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out; cd /run/diene-ci; sha256sum -c archive-validator.sha256; chmod 0500 archive-validator.sh; ./archive-validator.sh source.tar source; install -m 0600 receipt.json receipts/exact.json; cd source; command -v nix >/dev/null 2>&1 || { printf "GuestNixToolchainAbsent: %s\n" "the instance provides no nix command for the driver entry" >&2; exit 64; }; exec nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci'
+  remote_command=$(orchestrator_fixed_remote_command)
   ssh_started=$SECONDS
   "$nsc_bin" ssh "$ORCH_CLUSTER_ID" -T "$remote_command" \
     >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || ssh_rc=$?

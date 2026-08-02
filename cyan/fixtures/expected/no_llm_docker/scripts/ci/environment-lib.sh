@@ -9,6 +9,21 @@ set -euo pipefail
 DIENE_REASON_EXIT=64
 DIENE_ZERO_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
 DIENE_NSC_EXPECTED_VERSION=v0.0.532
+DIENE_GUEST_NIX_INSTALLER_URL=https://install.determinate.systems/nix/tag/v3.21.9
+DIENE_GUEST_NIX_INSTALLER_DIGEST=sha256:ed6067b13423cfd36c50e5b156b9e08eb3a7bea4dde8cb1c8d997d757b37b7f6
+DIENE_GUEST_NIX_INSTALLER_BYTES=19299
+DIENE_GUEST_NIX_PAYLOAD_URL=https://install.determinate.systems/nix/tag/v3.21.9/nix-installer-x86_64-linux
+DIENE_GUEST_NIX_PAYLOAD_DIGEST=sha256:58cf15422853e95187405d66b0cdb306e66f602218ee0032386c46b1b776a6d1
+DIENE_GUEST_NIX_PAYLOAD_BYTES=73234640
+DIENE_GUEST_NIX_EXPECTED_INSTALLER_VERSION='nix-installer 3.21.9'
+DIENE_GUEST_NIX_EXPECTED_IDENTITY='nix (Determinate Nix 3.21.9) 2.34.8'
+DIENE_GUEST_NIX_EXPECTED_IDENTITY_BYTES=36
+DIENE_GUEST_NIX_ARCH=x86_64
+DIENE_GUEST_NIX_EXECUTION_MODE=direct-pinned-binary
+DIENE_GUEST_NIX_PROFILE=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+DIENE_GUEST_NIX_BIN=/nix/var/nix/profiles/default/bin/nix
+DIENE_GUEST_NIX_STORE_ROOT=/nix/store
+DIENE_GUEST_NIX_INSTALLED_COPY=/nix/nix-installer
 
 diene_die() {
   local code=${1:?reason code required}
@@ -64,6 +79,342 @@ diene_write_json() {
   cat >"$tmp"
   chmod 0600 "$tmp"
   mv -- "$tmp" "$target"
+}
+
+# The tagged shell is retained only as an unexecuted provenance witness. The
+# architecture-specific binary is the sole execution trust root. This helper
+# emits the one canonical schema-free contract object consumed by the host
+# acquisition path, immutable driver inputs, and in-guest identity proof.
+diene_guest_nix_contract() {
+  local installer_url=$DIENE_GUEST_NIX_INSTALLER_URL
+  local installer_digest=$DIENE_GUEST_NIX_INSTALLER_DIGEST
+  local installer_bytes=$DIENE_GUEST_NIX_INSTALLER_BYTES
+  local payload_url=$DIENE_GUEST_NIX_PAYLOAD_URL
+  local payload_digest=$DIENE_GUEST_NIX_PAYLOAD_DIGEST
+  local payload_bytes=$DIENE_GUEST_NIX_PAYLOAD_BYTES
+  local architecture=$DIENE_GUEST_NIX_ARCH
+  local installer_version=$DIENE_GUEST_NIX_EXPECTED_INSTALLER_VERSION
+  local nix_version=$DIENE_GUEST_NIX_EXPECTED_IDENTITY
+  local execution_mode=$DIENE_GUEST_NIX_EXECUTION_MODE
+  local major minor patch LC_ALL=C
+
+  if [[ $installer_url =~ ^https://install\.determinate\.systems/nix/tag/v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+    patch=${BASH_REMATCH[3]}
+  else
+    diene_die InputContractInvalid 'guest Nix provenance URL must be one immutable tagged HTTPS endpoint'
+  fi
+  [[ $architecture == x86_64 ]] ||
+    diene_die InputContractInvalid 'guest Nix contract supports only the pinned x86_64 architecture'
+  [[ $payload_url == "$installer_url/nix-installer-$architecture-linux" ]] ||
+    diene_die InputContractInvalid 'guest Nix payload URL is not the exact pinned tag and architecture asset'
+  diene_require_digest guest-nix-installer-digest "$installer_digest"
+  diene_require_digest guest-nix-payload-digest "$payload_digest"
+  [[ $installer_bytes =~ ^[1-9][0-9]*$ && $payload_bytes =~ ^[1-9][0-9]*$ ]] ||
+    diene_die InputContractInvalid 'guest Nix pinned byte lengths must be positive decimal integers'
+  [[ $installer_version == "nix-installer $major.$minor.$patch" ]] ||
+    diene_die InputContractInvalid 'guest Nix installer version does not match the pinned tag'
+  [[ $nix_version =~ ^[[:print:]]+$ && ${#nix_version} == 35 &&
+    $DIENE_GUEST_NIX_EXPECTED_IDENTITY_BYTES == 36 ]] ||
+    diene_die InputContractInvalid \
+      'guest Nix expected identity must be the exact 35-byte printable line plus one newline'
+  [[ $execution_mode == direct-pinned-binary ]] ||
+    diene_die InputContractInvalid 'guest Nix execution mode must be the direct pinned binary'
+  [[ $DIENE_GUEST_NIX_PROFILE == /nix/* && $DIENE_GUEST_NIX_BIN == /nix/* &&
+    $DIENE_GUEST_NIX_STORE_ROOT == /nix/store && $DIENE_GUEST_NIX_INSTALLED_COPY == /nix/* ]] ||
+    diene_die InputContractInvalid 'guest Nix fixed profile and identity paths are invalid'
+
+  jq -cn \
+    --arg installerUrl "$installer_url" --arg installerDigest "$installer_digest" \
+    --argjson installerBytes "$installer_bytes" --arg payloadUrl "$payload_url" \
+    --arg payloadDigest "$payload_digest" --argjson payloadBytes "$payload_bytes" \
+    --arg architecture "$architecture" --arg executionMode "$execution_mode" \
+    --arg installerVersion "$installer_version" --arg nixVersion "$nix_version" \
+    --arg profilePath "$DIENE_GUEST_NIX_PROFILE" --arg nixBinPath "$DIENE_GUEST_NIX_BIN" \
+    --arg storeRoot "$DIENE_GUEST_NIX_STORE_ROOT" \
+    --arg installedCopyPath "$DIENE_GUEST_NIX_INSTALLED_COPY" '
+    {installerUrl:$installerUrl,installerDigest:$installerDigest,installerBytes:$installerBytes,
+     payloadUrl:$payloadUrl,payloadDigest:$payloadDigest,payloadBytes:$payloadBytes,
+     payloadDigestVerified:true,architecture:$architecture,executionMode:$executionMode,
+     argv:["install","linux","--no-confirm","--init","none"],
+     installerVersion:$installerVersion,nixVersion:$nixVersion,initMode:"none",
+     profilePath:$profilePath,nixBinPath:$nixBinPath,storeRoot:$storeRoot,
+     installedCopyPath:$installedCopyPath}'
+}
+
+# Resolve the reviewed production downloader to its immutable Nix-store
+# executable. Tests may redefine this function only inside their isolated
+# scratch copy; no inherited path-valued override is an accepted seam.
+diene_pinned_downloader() {
+  local candidate resolved
+  candidate=$(command -v curl) ||
+    diene_die DependencyUnavailable 'curl is required for pinned guest Nix acquisition'
+  resolved=$(readlink -f -- "$candidate") ||
+    diene_die GuestNixInstallerUntrusted 'the reviewed curl executable could not be resolved'
+  [[ $resolved == /nix/store/*/bin/curl && -f $resolved && -x $resolved ]] ||
+    diene_die GuestNixInstallerUntrusted \
+      'the reviewed curl executable is not an immutable Nix-store binary'
+  printf '%s\n' "$resolved"
+}
+
+# Acquire one immutable artifact without publishing partial or unverified
+# bytes. --location with a zero redirect budget makes every 3xx a refusal.
+diene_fetch_pinned_artifact() {
+  local url=${1:?artifact URL required} digest=${2:?artifact digest required}
+  local expected_bytes=${3:?artifact byte length required} target=${4:?artifact target required}
+  local curl_bin target_dir tmp actual_bytes actual_digest
+  [[ ${DIENE_CURL_BIN+x} != x ]] ||
+    diene_die GuestNixInstallerUntrusted \
+      'an ambient guest Nix downloader override is prohibited'
+  curl_bin=$(diene_pinned_downloader) || return $?
+  diene_require_digest guest-nix-artifact-digest "$digest"
+  [[ $url == https://* && $expected_bytes =~ ^[1-9][0-9]*$ ]] ||
+    diene_die InputContractInvalid 'guest Nix artifact acquisition inputs are invalid'
+  diene_require_command "$curl_bin"
+  diene_require_command ln
+  diene_require_command mktemp
+  diene_require_command stat
+  diene_require_command wc
+  target_dir=$(dirname -- "$target")
+  [[ -d $target_dir && ! -L $target_dir ]] ||
+    diene_die GuestNixInstallerUntrusted \
+      'guest Nix publication directory is absent, linked, or not a real directory'
+  [[ ! -e $target && ! -L $target ]] ||
+    diene_die GuestNixInstallerUntrusted \
+      'guest Nix publication target is not fresh'
+  tmp=$(mktemp "$target.tmp.XXXXXX") ||
+    diene_die GuestNixInstallerUntrusted 'private guest Nix artifact temporary file could not be created'
+  chmod 0600 "$tmp" || {
+    rm -f -- "$tmp"
+    diene_die GuestNixInstallerUntrusted 'guest Nix artifact temporary file could not be sealed'
+  }
+  if ! "$curl_bin" --fail --show-error --silent --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --location --max-redirs 0 --max-time 120 --retry 0 --output "$tmp" "$url"; then
+    rm -f -- "$tmp"
+    diene_die GuestNixInstallerUntrusted 'guest Nix pinned HTTPS acquisition failed or redirected'
+  fi
+  actual_bytes=$(wc -c <"$tmp")
+  if [[ $actual_bytes != "$expected_bytes" ]]; then
+    rm -f -- "$tmp"
+    diene_die GuestNixInstallerUntrusted 'guest Nix artifact byte length does not match the pin'
+  fi
+  actual_digest=$(diene_file_digest "$tmp")
+  if [[ $actual_digest != "$digest" ]]; then
+    rm -f -- "$tmp"
+    diene_die GuestNixInstallerUntrusted 'guest Nix artifact digest does not match the pin'
+  fi
+  # A same-directory hard-link publication is atomic and, unlike a replacing
+  # rename, fails if a regular or symlink target appears before publication.
+  if ! chmod 0600 "$tmp" || ! ln -- "$tmp" "$target"; then
+    rm -f -- "$tmp"
+    diene_die GuestNixInstallerUntrusted 'verified guest Nix artifact could not be atomically published'
+  fi
+  if ! rm -f -- "$tmp"; then
+    rm -f -- "$target" "$tmp"
+    diene_die GuestNixInstallerUntrusted 'guest Nix publication temporary link could not be removed'
+  fi
+  [[ -f $target && ! -L $target && $(stat -c %a -- "$target") == 600 ]] ||
+    diene_die GuestNixInstallerUntrusted 'published guest Nix artifact is not a private regular file'
+}
+
+diene_guest_nix_evidence_dir() {
+  local staging=${DIENE_EVIDENCE_STAGING:-} dir
+  [[ $staging == /* && -d $staging && ! -L $staging && ${staging##*/} == staging ]] ||
+    diene_die GuestNixIdentityUnexpected \
+      'guest Nix identity requires an absolute driver-owned evidence staging directory'
+  dir="${staging%/staging}/guest-nix"
+  [[ ! -L $dir ]] ||
+    diene_die GuestNixIdentityUnexpected 'guest Nix evidence directory is a symlink'
+  install -d -m 0700 "$dir" ||
+    diene_die GuestNixIdentityUnexpected 'guest Nix evidence directory could not be created'
+  [[ -d $dir && ! -L $dir ]] ||
+    diene_die GuestNixIdentityUnexpected 'guest Nix evidence directory is not a real directory'
+  printf '%s\n' "$dir"
+}
+
+diene_source_guest_nix_profile() {
+  local profile=${1:?guest Nix profile required} test_root=${2:-} profile_rc resolved
+  [[ -f $profile && -r $profile ]] ||
+    diene_die GuestNixIdentityUnexpected \
+      'the exact guest Nix profile is absent, unreadable, or not a regular file'
+  resolved=$(readlink -f -- "$profile") ||
+    diene_die GuestNixIdentityUnexpected \
+      'the exact guest Nix profile could not be resolved'
+  if [[ -n $test_root ]]; then
+    [[ $test_root == /* && -d $test_root && ! -L $test_root &&
+      $profile == "$test_root"/* && $resolved == "$test_root"/* ]] ||
+      diene_die InputContractInvalid \
+        'the fake guest Nix profile is outside its explicit test root'
+  else
+    [[ $profile == "$DIENE_GUEST_NIX_PROFILE" &&
+      $resolved == /nix/store/*/etc/profile.d/nix-daemon.sh ]] ||
+      diene_die GuestNixIdentityUnexpected \
+        'the exact guest Nix profile does not resolve into the pinned Nix store'
+  fi
+  set +eu
+  # shellcheck disable=SC1090
+  source "$profile"
+  profile_rc=$?
+  set -eu
+  set -o pipefail
+  ((profile_rc == 0)) ||
+    diene_die GuestNixProfileSourceFailed \
+      'the exact guest Nix profile returned nonzero while being sourced'
+}
+
+# Verify the installed toolchain through literal paths supplied by the caller,
+# write one canonical mode-0600 identity receipt, and print the same object plus
+# the receipt digest for embedding in preflight evidence. Tests may pass an
+# isolated store root; the production caller supplies the fixed /nix paths.
+diene_guest_nix_identity() {
+  local input=${1:?driver inputs required} evidence_dir=${2:?guest Nix evidence directory required}
+  local nix_bin=${3:?direct Nix binary required} store_root=${4:?Nix store root required}
+  local installed_copy=${5:?installed installer copy required}
+  local bootstrap_asset=${6:?provenance shell asset required}
+  local payload_asset=${7:?installer payload asset required} observed_arch=${8:?observed architecture required}
+  local test_root=${9:-}
+  local contract expected_nix expected_installer live_version live_stderr recorded_version recorded_stderr
+  local recorded_installer recorded_installer_stderr expected_bytes store_path store_digest
+  local installed_copy_digest environment_file environment_digest nix_config nix_config_digest
+  local bootstrap_digest payload_digest identity receipt receipt_digest
+  local LC_ALL=C
+
+  contract=$(diene_guest_nix_contract) || exit $?
+  jq -e --argjson contract "$contract" '.guestNix == $contract' "$input" >/dev/null ||
+    diene_die GuestNixIdentityUnexpected 'admitted guest Nix contract differs from the fixed contract'
+  [[ $observed_arch == "$(jq -r '.architecture' <<<"$contract")" ]] ||
+    diene_die GuestNixIdentityUnexpected 'guest Nix architecture changed after installation'
+  [[ $nix_bin == "$test_root$(jq -r '.nixBinPath' <<<"$contract")" &&
+    $store_root == "$test_root$(jq -r '.storeRoot' <<<"$contract")" &&
+    $installed_copy == "$test_root$(jq -r '.installedCopyPath' <<<"$contract")" ]] ||
+    diene_die GuestNixIdentityUnexpected 'guest Nix identity paths differ from the admitted contract'
+  [[ -d $evidence_dir && ! -L $evidence_dir ]] ||
+    diene_die GuestNixIdentityUnexpected 'guest Nix evidence directory is unavailable'
+  environment_file="$evidence_dir/environment.txt"
+  nix_config="$test_root/etc/nix/nix.conf"
+  [[ -f $environment_file && ! -L $environment_file &&
+    $(stat -c %a -- "$environment_file") == 600 ]] ||
+    diene_die GuestNixIdentityUnexpected \
+      'the guest Nix environment evidence is absent, linked, or not mode 0600'
+  [[ -f $nix_config && ! -L $nix_config && -r $nix_config ]] ||
+    diene_die GuestNixIdentityUnexpected \
+      'the installed Nix configuration is absent, linked, or unreadable'
+  nix_config_digest=$(diene_file_digest "$nix_config")
+  LC_ALL=C awk -v config="${nix_config_digest#sha256:}" '
+    { line[NR]=$0 }
+    END {
+      if (NR < 5 || line[1] != "inheritedNixFamily=none" ||
+          line[NR-3] != "home=/run/diene-ci/home" ||
+          line[NR-2] != "xdgConfigHome=/run/diene-ci/home/.config" ||
+          line[NR-1] != "userConfFiles=/run/diene-ci/nix-user.conf" ||
+          line[NR] != "etcNixConf=" config) exit 1
+      previous=""
+      for (i=2; i<=NR-4; i++) {
+        if (line[i] !~ /^profileNixVar=NIX[A-Za-z0-9_]*$/ ||
+            (previous != "" && line[i] <= previous)) exit 1
+        previous=line[i]
+      }
+    }
+  ' "$environment_file" ||
+    diene_die GuestNixIdentityUnexpected \
+      'the guest Nix environment evidence fields or profile-created names are invalid'
+  environment_digest=$(diene_file_digest "$environment_file")
+  [[ -x $nix_bin ]] ||
+    diene_die GuestNixIdentityUnexpected 'the direct installed Nix binary is absent or not executable'
+
+  live_version="$evidence_dir/live-version.txt"
+  live_stderr="$evidence_dir/live-version.stderr"
+  : >"$live_version"
+  : >"$live_stderr"
+  chmod 0600 "$live_version" "$live_stderr"
+  if ! "$nix_bin" --version >"$live_version" 2>"$live_stderr"; then
+    diene_die GuestNixIdentityUnexpected 'the direct installed Nix identity command failed'
+  fi
+  expected_nix=$(jq -r '.nixVersion' <<<"$contract")
+  expected_bytes=$((${#expected_nix} + 1))
+  if [[ -s $live_stderr || $(wc -c <"$live_version") != "$expected_bytes" ]] ||
+    ! grep -Fxq -- "$expected_nix" "$live_version"; then
+    diene_die GuestNixIdentityUnexpected 'the direct installed Nix identity is not the exact pinned line'
+  fi
+
+  recorded_version="$evidence_dir/version.txt"
+  if [[ ! -f $recorded_version || -L $recorded_version ]] ||
+    ! cmp -s -- "$recorded_version" "$live_version"; then
+    diene_die GuestNixIdentityUnexpected 'recorded and live guest Nix identities disagree'
+  fi
+  recorded_stderr="$evidence_dir/version.stderr"
+  [[ -f $recorded_stderr && ! -L $recorded_stderr && ! -s $recorded_stderr ]] ||
+    diene_die GuestNixIdentityUnexpected 'the recorded guest Nix identity emitted unexpected stderr'
+  recorded_installer="$evidence_dir/installer-version.txt"
+  expected_installer=$(jq -r '.installerVersion' <<<"$contract")
+  expected_bytes=$((${#expected_installer} + 1))
+  if [[ ! -f $recorded_installer || -L $recorded_installer ||
+    $(wc -c <"$recorded_installer") != "$expected_bytes" ]] ||
+    ! grep -Fxq -- "$expected_installer" "$recorded_installer"; then
+    diene_die GuestNixIdentityUnexpected 'recorded guest Nix installer identity disagrees with the pin'
+  fi
+  recorded_installer_stderr="$evidence_dir/installer-version.stderr"
+  [[ -f $recorded_installer_stderr && ! -L $recorded_installer_stderr &&
+    ! -s $recorded_installer_stderr ]] ||
+    diene_die GuestNixIdentityUnexpected \
+      'the recorded guest Nix installer identity emitted unexpected stderr'
+
+  if ! store_path=$(readlink -f -- "$nix_bin"); then
+    diene_die GuestNixIdentityUnexpected 'the direct installed Nix binary cannot be resolved'
+  fi
+  case $store_path in
+    "$store_root"/*/bin/nix) ;;
+    *) diene_die GuestNixIdentityUnexpected 'the direct installed Nix binary does not resolve into the store' ;;
+  esac
+  [[ -f $store_path && ! -L $store_path && -x $store_path ]] ||
+    diene_die GuestNixIdentityUnexpected 'the resolved Nix store target is not a regular executable'
+  [[ -f $installed_copy && ! -L $installed_copy && -f $bootstrap_asset && ! -L $bootstrap_asset &&
+    -f $payload_asset && ! -L $payload_asset ]] ||
+    diene_die GuestNixIdentityUnexpected 'a guest Nix installer or uploaded artifact is absent'
+  store_digest=$(diene_file_digest "$store_path")
+  installed_copy_digest=$(diene_file_digest "$installed_copy")
+  bootstrap_digest=$(diene_file_digest "$bootstrap_asset")
+  payload_digest=$(diene_file_digest "$payload_asset")
+  [[ $bootstrap_digest == "$(jq -r '.installerDigest' <<<"$contract")" &&
+    $payload_digest == "$(jq -r '.payloadDigest' <<<"$contract")" ]] ||
+    diene_die GuestNixIdentityUnexpected 'uploaded guest Nix artifacts changed after installation'
+  [[ $(stat -c %a -- "$bootstrap_asset") == 600 ]] ||
+    diene_die GuestNixIdentityUnexpected 'the provenance shell witness gained execute permission'
+  [[ $installed_copy_digest == "$(jq -r '.payloadDigest' <<<"$contract")" ]] ||
+    diene_die GuestNixIdentityUnexpected 'the installed Nix installer copy does not match the pinned payload'
+
+  identity=$(jq -Scn --argjson contract "$contract" --arg storePath "$store_path" \
+    --arg storePathDigest "$store_digest" --arg installedCopyDigest "$installed_copy_digest" \
+    --arg environmentDigest "$environment_digest" '
+    $contract + {storePath:$storePath,storePathDigest:$storePathDigest,
+      installedCopyDigest:$installedCopyDigest,environmentDigest:$environmentDigest,
+      profileSourced:true}')
+  receipt="$evidence_dir/identity.json"
+  printf '%s\n' "$identity" | diene_write_json "$receipt"
+  receipt_digest=$(diene_file_digest "$receipt")
+  jq -c --arg digest "$receipt_digest" '. + {identityReceiptDigest:$digest}' "$receipt"
+}
+
+diene_require_guest_nix_preflight_agreement() {
+  local preflight=${1:?preflight evidence required} receipt=${2:?identity receipt required}
+  local receipt_digest environment environment_digest
+  [[ -f $preflight && ! -L $preflight && -f $receipt && ! -L $receipt ]] ||
+    diene_die GuestNixIdentityUnexpected 'guest Nix preflight or identity receipt is absent'
+  environment="$(dirname -- "$receipt")/environment.txt"
+  [[ -f $environment && ! -L $environment && $(stat -c %a -- "$environment") == 600 ]] ||
+    diene_die GuestNixIdentityUnexpected \
+      'guest Nix environment evidence is absent, linked, or not mode 0600'
+  receipt_digest=$(diene_file_digest "$receipt")
+  environment_digest=$(diene_file_digest "$environment")
+  jq -e --arg digest "$receipt_digest" --arg environmentDigest "$environment_digest" \
+    --slurpfile identity "$receipt" '
+    (.guestNix | del(.identityReceiptDigest)) == $identity[0] and
+    .guestNix.identityReceiptDigest == $digest and
+    $identity[0].environmentDigest == $environmentDigest
+  ' "$preflight" >/dev/null ||
+    diene_die GuestNixIdentityUnexpected \
+      'guest Nix identity receipt and preflight evidence do not agree exactly'
 }
 
 diene_archive_is_safe() {
@@ -963,7 +1314,7 @@ diene_load_remote_inputs() {
   local state_dir=${1:?state directory required}
   [[ $state_dir == /run/diene-ci && ! -L $state_dir ]] ||
     diene_die InputContractInvalid 'driver state directory must be the fixed /run/diene-ci path'
-  local input="$state_dir/inputs.json"
+  local input="$state_dir/inputs.json" guest_nix_contract
   [[ -f $input && ! -L $input ]] || diene_die InputContractInvalid 'immutable driver inputs are absent'
   jq -e '
     .apiVersion == "diene.atomi.cloud/ci-driver-inputs/v1" and
@@ -979,8 +1330,12 @@ diene_load_remote_inputs() {
     (.admittedK3sVersion | test("^v[0-9]+\\.[0-9]+\\.[0-9]+\\+k3s[0-9]+$")) and
     (.admittedServiceCidr | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$")) and
     (.egress.contractDigest | test("^sha256:[0-9a-f]{64}$")) and
-    (.egress.canaryImage | test("@sha256:[0-9a-f]{64}$"))
+    (.egress.canaryImage | test("@sha256:[0-9a-f]{64}$")) and
+    (.guestNix | type == "object")
   ' "$input" >/dev/null || diene_die InputContractInvalid 'immutable driver input shape is invalid'
+  guest_nix_contract=$(diene_guest_nix_contract) || exit $?
+  jq -e --argjson contract "$guest_nix_contract" '.guestNix == $contract' "$input" >/dev/null ||
+    diene_die InputContractInvalid 'immutable guest Nix input differs from the fixed pinned contract'
 
   export GITHUB_REPOSITORY_ID GITHUB_REPOSITORY GITHUB_SHA GITHUB_RUN_ID GITHUB_RUN_ATTEMPT
   export DIENE_BASE_WORKFLOW_REF DIENE_LANE DIENE_GARDEN_LOCK_DIGEST DIENE_ARTIFACT_DIGEST
@@ -996,6 +1351,7 @@ diene_load_remote_inputs() {
   export DIENE_EGRESS_CONTRACT DIENE_EGRESS_L7_ENFORCER_BIN DIENE_EGRESS_PROBE_BIN
   export DIENE_K3S_SERVICE_CIDR
   export DIENE_VENDOR_CREDENTIAL_BROKER_BIN
+  export DIENE_GUEST_NIX_INPUT DIENE_GUEST_NIX_INSTALLER_PATH DIENE_GUEST_NIX_PAYLOAD_PATH
 
   GITHUB_REPOSITORY_ID=$(jq -r '.owner.repositoryId' "$input")
   GITHUB_REPOSITORY=$(jq -r '.owner.repositoryKey' "$input")
@@ -1034,6 +1390,9 @@ diene_load_remote_inputs() {
   DIENE_VENDOR_CREDENTIAL_BROKER_BIN=$(jq -r '.vendorCredentialBroker // ""' "$input")
   DIENE_EGRESS_CONTRACT="$state_dir/egress-contract.json"
   DIENE_ARTIFACT_SUBJECT="$state_dir/artifact-subject.json"
+  DIENE_GUEST_NIX_INPUT=$input
+  DIENE_GUEST_NIX_INSTALLER_PATH="$state_dir/guest-nix-bootstrap.sh"
+  DIENE_GUEST_NIX_PAYLOAD_PATH="$state_dir/guest-nix-installer"
   export DIENE_ARTIFACT_SUBJECT
 
   [[ $(diene_file_digest "$state_dir/source.tar") == "$DIENE_SOURCE_ARCHIVE_DIGEST" ]] ||
