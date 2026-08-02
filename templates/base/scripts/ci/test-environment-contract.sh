@@ -97,8 +97,135 @@ guest_nix_fixture_dir=$scratch/guest-nix-fixture
 install -d -m 0700 "$guest_nix_fixture_dir"
 printf '%s\n' '#!/bin/sh' 'printf provenance-witness-only' \
   >"$guest_nix_fixture_dir/guest-nix-bootstrap.sh"
-printf '%s\n' 'synthetic-direct-installer-payload' \
-  >"$guest_nix_fixture_dir/guest-nix-installer"
+cat >"$guest_nix_fixture_dir/guest-nix-installer" <<'GUEST_NIX_INSTALLER'
+#!/bin/sh
+set -eu
+
+rail_harness=/run/diene-ci/harness
+rail_scenario=$(cat "$rail_harness/scenario")
+
+record_rail_event() {
+  printf '%s\n' "$1" >>"$rail_harness/events"
+  chmod 0600 "$rail_harness/events"
+}
+
+record_rail_environment() {
+  rail_environment_target=$1
+  tr '\000' '\n' <"/proc/$$/environ" | LC_ALL=C sort >"$rail_environment_target"
+  chmod 0600 "$rail_environment_target"
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = --version ]; then
+  grep -Fxq 'executionMode=direct-pinned-binary' \
+    /run/diene-ci/evidence/guest-nix/verified.txt
+  grep -Fxq 'payloadDigestVerified=true' \
+    /run/diene-ci/evidence/guest-nix/verified.txt
+  record_rail_event uploads-verified
+  printf '%s\n' "$@" >"$rail_harness/installer-version.argv"
+  chmod 0600 "$rail_harness/installer-version.argv"
+  record_rail_environment "$rail_harness/installer-version.env"
+  record_rail_event installer-version
+  case $rail_scenario in
+    version-wrong) printf '%s\n' 'nix-installer 3.21.8' ;;
+    version-stderr)
+      printf '%s\n' 'nix-installer 3.21.9'
+      printf '%s\n' warning >&2
+      ;;
+    *) printf '%s\n' 'nix-installer 3.21.9' ;;
+  esac
+  exit 0
+fi
+
+if [ "$#" -ne 5 ] || [ "$1" != install ] || [ "$2" != linux ] ||
+  [ "$3" != --no-confirm ] || [ "$4" != --init ] || [ "$5" != none ]; then
+  exit 97
+fi
+printf '%s\n' "$@" >"$rail_harness/installer-install.argv"
+chmod 0600 "$rail_harness/installer-install.argv"
+record_rail_environment "$rail_harness/installer-install.env"
+record_rail_event installer-install
+[ "$rail_scenario" != install-fail ] || exit 23
+[ "$rail_scenario" != config-unsafe ] || exit 0
+
+install -d -m 0700 /etc/nix /nix /nix/var/nix/profiles/default/bin \
+  /nix/var/nix/profiles/default/etc/profile.d \
+  /nix/store/diene-guest-rail/etc/profile.d
+printf '%s\n' 'sandbox = false' >/etc/nix/nix.conf
+chmod 0600 /etc/nix/nix.conf
+install -m 0500 /run/diene-ci/guest-nix-installer /nix/nix-installer
+
+case $rail_scenario in
+  profile-missing) ;;
+  profile-dangling)
+    ln -s /nix/store/diene-guest-rail-missing/etc/profile.d/nix-daemon.sh \
+      /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+    ;;
+  profile-outside)
+    printf '%s\n' 'return 0' >"$rail_harness/outside-profile.sh"
+    chmod 0600 "$rail_harness/outside-profile.sh"
+    ln -s /run/diene-ci/harness/outside-profile.sh \
+      /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+    ;;
+  *)
+    cat >/nix/store/diene-guest-rail/etc/profile.d/nix-daemon.sh <<'GUEST_NIX_PROFILE'
+rail_harness=/run/diene-ci/harness
+rail_scenario=$(cat "$rail_harness/scenario")
+[ -f /etc/nix/nix.conf ] || return 91
+printf '%s\n' nix-config-bound profile-resolved >>"$rail_harness/events"
+chmod 0600 "$rail_harness/events"
+if [ "$rail_scenario" = profile-source-fail ]; then
+  return 23
+fi
+if [ "$rail_scenario" = config-mutated ]; then
+  printf '%s\n' 'post-profile-mutation = true' >>/etc/nix/nix.conf
+fi
+PATH=/nix/var/nix/profiles/default/bin:$PATH
+NIX_PROFILES=/nix/var/nix/profiles/default
+NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export PATH NIX_PROFILES NIX_SSL_CERT_FILE
+printf '%s\n' profile-sourced >>"$rail_harness/events"
+chmod 0600 "$rail_harness/events"
+return 0
+GUEST_NIX_PROFILE
+    chmod 0600 /nix/store/diene-guest-rail/etc/profile.d/nix-daemon.sh
+    ln -s /nix/store/diene-guest-rail/etc/profile.d/nix-daemon.sh \
+      /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+    ;;
+esac
+
+if [ "$rail_scenario" != nix-absent ]; then
+  cat >/nix/var/nix/profiles/default/bin/nix <<'GUEST_NIX_STUB'
+#!/bin/sh
+set -eu
+rail_harness=/run/diene-ci/harness
+if [ "$#" -eq 1 ] && [ "$1" = --version ]; then
+  printf '%s\n' "$@" >"$rail_harness/nix-version.argv"
+  grep -Fxq 'home=/run/diene-ci/home' /run/diene-ci/evidence/guest-nix/environment.txt
+  grep -Fxq 'xdgConfigHome=/run/diene-ci/home/.config' \
+    /run/diene-ci/evidence/guest-nix/environment.txt
+  grep -Fxq 'userConfFiles=/run/diene-ci/nix-user.conf' \
+    /run/diene-ci/evidence/guest-nix/environment.txt
+  rail_config_digest=$(sha256sum /etc/nix/nix.conf | cut -d' ' -f1)
+  grep -Fxq "etcNixConf=$rail_config_digest" \
+    /run/diene-ci/evidence/guest-nix/environment.txt
+  sha256sum /nix/nix-installer >"$rail_harness/installed-copy.sha256"
+  printf '%s\n' environment-bound nix-config-rechecked direct-nix-version \
+    >>"$rail_harness/events"
+  chmod 0600 "$rail_harness/nix-version.argv" \
+    "$rail_harness/installed-copy.sha256" "$rail_harness/events"
+  printf '%s\n' 'nix (Determinate Nix 3.21.9) 2.34.8'
+  exit 0
+fi
+printf '%s\n' "$@" >"$rail_harness/nix-develop.argv"
+pwd >"$rail_harness/nix-develop.cwd"
+printf '%s\n' nix-develop >>"$rail_harness/events"
+chmod 0600 "$rail_harness/nix-develop.argv" "$rail_harness/nix-develop.cwd" \
+  "$rail_harness/events"
+exit 0
+GUEST_NIX_STUB
+  chmod 0500 /nix/var/nix/profiles/default/bin/nix
+fi
+GUEST_NIX_INSTALLER
 chmod 0600 "$guest_nix_fixture_dir/guest-nix-bootstrap.sh" \
   "$guest_nix_fixture_dir/guest-nix-installer"
 guest_nix_fixture_installer_digest="sha256:$(sha256sum "$guest_nix_fixture_dir/guest-nix-bootstrap.sh" | awk '{print $1}')"
@@ -3850,6 +3977,64 @@ production_remote_command=$scratch/guest-nix-production-remote-command
 ! rg -q '__DIENE_GUEST_NIX_' "$production_remote_command" ||
   fail 'the materialized fixed remote command retained an unresolved pin placeholder'
 
+work_remote_command=$scratch/guest-nix-work-remote-command
+(
+  # shellcheck source=/dev/null
+  source "$work/scripts/ci/environment-k3d-run.sh"
+  orchestrator_fixed_remote_command
+) >"$work_remote_command"
+[[ $(grep -Fxc -- "guest_nix_installer_digest=$guest_nix_fixture_installer_digest" \
+  "$work_remote_command") == 1 &&
+  $(grep -Fxc -- "guest_nix_installer_bytes=$guest_nix_fixture_installer_bytes" \
+    "$work_remote_command") == 1 &&
+  $(grep -Fxc -- "guest_nix_payload_digest=$guest_nix_fixture_payload_digest" \
+    "$work_remote_command") == 1 &&
+  $(grep -Fxc -- "guest_nix_payload_bytes=$guest_nix_fixture_payload_bytes" \
+    "$work_remote_command") == 1 ]] ||
+  fail 'the executable work-copy remote command is not bound to all four synthetic fixture pins'
+! rg -q '__DIENE_GUEST_NIX_' "$work_remote_command" ||
+  fail 'the executable work-copy remote command retained an unresolved pin placeholder'
+
+normalize_guest_rail_pins() {
+  sed -E \
+    's/^(guest_nix_(installer|payload)_(digest|bytes)=).*/\1__SYNTHETIC_PIN__/' \
+    "$1"
+}
+normalize_guest_rail_pins "$production_remote_command" >"$scratch/guest-nix-production-normalized-command"
+normalize_guest_rail_pins "$work_remote_command" >"$scratch/guest-nix-work-normalized-command"
+cmp -s "$scratch/guest-nix-production-normalized-command" \
+  "$scratch/guest-nix-work-normalized-command" ||
+  fail 'the executable work-copy remote command differs outside the four admitted pin assignments'
+
+guest_rail_pin_diff=$scratch/guest-nix-production-work-pin.diff
+guest_rail_pin_diff_rc=0
+if diff --old-line-format='-%L' --new-line-format='+%L' --unchanged-line-format='' \
+  "$production_remote_command" "$work_remote_command" >"$guest_rail_pin_diff"; then
+  fail 'the production and synthetic-pin remote commands unexpectedly have identical bytes'
+else
+  guest_rail_pin_diff_rc=$?
+fi
+[[ $guest_rail_pin_diff_rc == 1 ]] ||
+  fail "the production-to-work remote command diff failed (got $guest_rail_pin_diff_rc)"
+guest_rail_expected_pin_diff=$scratch/guest-nix-expected-pin.diff
+{
+  printf '%s\n' \
+    "-guest_nix_installer_digest=$pinned_shell_digest" \
+    '-guest_nix_installer_bytes=19299' \
+    "-guest_nix_payload_digest=$pinned_payload_digest" \
+    '-guest_nix_payload_bytes=73234640' \
+    "+guest_nix_installer_digest=$guest_nix_fixture_installer_digest" \
+    "+guest_nix_installer_bytes=$guest_nix_fixture_installer_bytes" \
+    "+guest_nix_payload_digest=$guest_nix_fixture_payload_digest" \
+    "+guest_nix_payload_bytes=$guest_nix_fixture_payload_bytes"
+} | LC_ALL=C sort >"$guest_rail_expected_pin_diff"
+LC_ALL=C sort "$guest_rail_pin_diff" >"$scratch/guest-nix-actual-pin.diff"
+diff -u "$guest_rail_expected_pin_diff" "$scratch/guest-nix-actual-pin.diff" >/dev/null ||
+  fail 'the production-to-work remote command diff is not exactly four logical pin replacements'
+/usr/bin/dash -n "$production_remote_command" "$work_remote_command" ||
+  fail 'the exact production or synthetic-pin remote program is not valid POSIX dash syntax'
+ok 'the executable program differs from production only at the four admitted synthetic pin assignments'
+
 guest_nix_env_contract=$scratch/guest-nix-environment-contract.sh
 sed -n '/BEGIN guest nix environment contract/,/END guest nix environment contract/p' \
   "$production_remote_command" >"$guest_nix_env_contract"
@@ -4188,6 +4373,373 @@ FAKE_NSC_ROOT=$nix_guard_binding_root FAKE_NSC_LOG=$nix_guard_binding_root/log \
 [[ $nix_guard_binding_rc == 69 ]] ||
   fail 'the fake ssh leg does not bind the fixed guest nix guard to production text'
 ok 'the fixed rail preserves GuestNixToolchainAbsent while admitting only exact direct-binary pins'
+
+printf '== the complete fixed remote rail executes in a disposable guest ==\n'
+
+guest_rail_image='cgr.dev/chainguard/wolfi-base@sha256:003627df3c1e1bba0c4116afcddb314aca9594ee2328c7e876a8081a6c988b2e'
+command -v docker >/dev/null 2>&1 ||
+  fail 'Docker is required for the disposable guest execution fixture'
+docker info >/dev/null 2>&1 ||
+  fail 'the Docker daemon is unavailable for the disposable guest execution fixture'
+docker image inspect "$guest_rail_image" >/dev/null 2>&1 ||
+  fail 'the immutable Wolfi image is absent for the disposable guest execution fixture'
+guest_rail_docker_options=(
+  --rm
+  --pull=never
+  --network=none
+  --cap-drop=ALL
+  --security-opt no-new-privileges
+  --label "diene.contract.guest-rail=$$"
+  --entrypoint /usr/bin/busybox
+)
+if ! docker run "${guest_rail_docker_options[@]}" "$guest_rail_image" ash -c '
+  set -eu
+  [ "$(id -u)" = 0 ]
+  [ ! -e /nix ] && [ ! -L /nix ]
+  [ ! -e /etc/nix ] && [ ! -L /etc/nix ]
+  for command in ash env sed tr id install cd sha256sum chmod wc cat printf uname \
+    readlink sort cut tar find awk mktemp rm grep ln cp; do
+    command -v "$command" >/dev/null 2>&1
+  done
+' >/dev/null 2>&1; then
+  fail 'the disposable guest execution fixture cannot obtain a clean uid-0 Wolfi root'
+fi
+if ! docker run -i "${guest_rail_docker_options[@]}" "$guest_rail_image" \
+  ash -n <"$work_remote_command" >/dev/null 2>&1; then
+  fail 'the exact synthetic-pin remote program is not valid Wolfi BusyBox ash syntax'
+fi
+ok 'the required immutable uid-0 Wolfi ash execution vehicle is locally available and fail-closed'
+
+guest_rail_container_program=$(cat <<'GUEST_RAIL_CONTAINER'
+set -eu
+[ "$(id -u)" = 0 ]
+[ ! -e /nix ] && [ ! -L /nix ]
+[ ! -e /etc/nix ] && [ ! -L /etc/nix ]
+install -d -m 0700 /run/diene-ci
+tar -xf - -C /run/diene-ci
+cd /run/diene-ci
+sha256sum -c remote-program.sha256 >/dev/null
+printf '%s\n' 'uid=0' 'nix=absent' 'etcNix=absent' 'shell=busybox-ash' \
+  >harness/initial-state
+: >harness/remote.stdout
+: >harness/remote.stderr
+chmod 0600 harness/initial-state harness/remote.stdout harness/remote.stderr
+set +e
+/usr/bin/busybox ash /run/diene-ci/remote-program \
+  >harness/remote.stdout 2>harness/remote.stderr
+rail_rc=$?
+set -e
+printf '%s\n' "$rail_rc" >harness/remote.rc
+chmod 0600 harness/remote.rc
+if [ -f /etc/nix/nix.conf ] && [ ! -L /etc/nix/nix.conf ]; then
+  install -m 0600 /etc/nix/nix.conf harness/final-nix.conf
+fi
+guest_rail_profile=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+if [ -e "$guest_rail_profile" ] || [ -L "$guest_rail_profile" ]; then
+  if readlink -f "$guest_rail_profile" >harness/profile.resolved 2>/dev/null; then
+    :
+  else
+    : >harness/profile.resolved
+  fi
+  chmod 0600 harness/profile.resolved
+fi
+tar -cf - -C /run/diene-ci .
+exit "$rail_rc"
+GUEST_RAIL_CONTAINER
+)
+
+guest_rail_uploaded_files=(
+  archive-validator.sh
+  archive-validator.sha256
+  artifact-subject.json
+  egress-contract.json
+  guest-nix-bootstrap.sh
+  guest-nix-bootstrap.sha256
+  guest-nix-installer
+  guest-nix-installer.sha256
+  inputs.json
+  receipt.json
+  source.tar
+)
+
+guest_rail_prepare_seed() {
+  local seed=${1:?guest rail seed required} scenario=${2:?guest rail scenario required}
+  local mutation=${3:-none} uploaded changed_digest
+  install -d -m 0700 "$seed" "$seed/harness"
+  for uploaded in "${guest_rail_uploaded_files[@]}"; do
+    [[ -f $happy_instance_state/$uploaded && ! -L $happy_instance_state/$uploaded ]] ||
+      fail "the real post-upload guest seed is missing $uploaded"
+    install -m 0600 "$happy_instance_state/$uploaded" "$seed/$uploaded"
+  done
+  install -m 0600 "$work_remote_command" "$seed/remote-program"
+  (cd "$seed" && sha256sum remote-program >remote-program.sha256)
+  chmod 0600 "$seed/remote-program.sha256"
+  printf '%s\n' "$scenario" >"$seed/harness/scenario"
+  chmod 0600 "$seed/harness/scenario"
+  if [[ $mutation == payload-pair ]]; then
+    printf X | dd of="$seed/guest-nix-installer" bs=1 seek=0 conv=notrunc status=none
+    (cd "$seed" && sha256sum guest-nix-installer >guest-nix-installer.sha256)
+    chmod 0600 "$seed/guest-nix-installer" "$seed/guest-nix-installer.sha256"
+    (cd "$seed" && sha256sum -c guest-nix-installer.sha256 >/dev/null) ||
+      fail 'the hostile changed asset and sidecar are not a self-consistent pair'
+    changed_digest="sha256:$(sha256sum "$seed/guest-nix-installer" | awk '{print $1}')"
+    [[ $changed_digest != "$guest_nix_fixture_payload_digest" ]] ||
+      fail 'the hostile changed asset pair did not diverge from the admitted payload pin'
+  fi
+}
+
+guest_rail_assert_safe_records() {
+  local result=${1:?guest rail result required} record
+  for record_root in "$result/harness" "$result/evidence" "$result/receipts"; do
+    [[ -d $record_root ]] || continue
+    while IFS= read -r -d '' record; do
+      [[ $(stat -c %a -- "$record") == 600 ]] ||
+        fail "the disposable guest retained a non-0600 evidence record: $record"
+    done < <(find "$record_root" -type f -print0)
+  done
+  if [[ -d $result/evidence ]]; then
+    while IFS= read -r -d '' record; do
+      [[ $(stat -c %a -- "$record") == 700 ]] ||
+        fail "the disposable guest retained a non-0700 evidence directory: $record"
+    done < <(find "$result/evidence" -type d -print0)
+  fi
+}
+
+guest_rail_run_case() {
+  local label=${1:?guest rail case label required} scenario=${2:?guest rail scenario required}
+  local expected_rc=${3:?expected guest rail rc required} expected_reason=${4-}
+  local root=$scratch/guest-rail/$label seed result seed_tar result_tar docker_error
+  local mutation=none rail_rc=0
+  local -a guest_environment=()
+  seed=$root/seed
+  result=$root/result
+  seed_tar=$root/seed.tar
+  result_tar=$root/result.tar
+  docker_error=$root/docker.stderr
+  install -d -m 0700 "$root" "$result"
+  case $label in
+    S1) mutation='payload-pair' ;;
+    S2) guest_environment=(--env 'NIX_INSTALLER_EXTRA_CONF=guest-rail-secret-extra') ;;
+    S3) guest_environment=(--env 'NIX_CONFIG=guest-rail-secret-config') ;;
+  esac
+  guest_rail_prepare_seed "$seed" "$scenario" "$mutation"
+  tar --owner=0 --group=0 --numeric-owner -cf "$seed_tar" -C "$seed" .
+  if docker run -i "${guest_rail_docker_options[@]}" "${guest_environment[@]}" \
+    "$guest_rail_image" ash -c "$guest_rail_container_program" \
+    <"$seed_tar" >"$result_tar" 2>"$docker_error"; then
+    rail_rc=0
+  else
+    rail_rc=$?
+  fi
+  if [[ $rail_rc != "$expected_rc" ]]; then
+    sed -n '1,160p' "$docker_error" >&2
+    fail "$label disposable guest returned $rail_rc instead of $expected_rc"
+  fi
+  tar -tf "$result_tar" >/dev/null 2>&1 || {
+    sed -n '1,160p' "$docker_error" >&2
+    fail "$label disposable guest did not return a complete state archive"
+  }
+  tar -xf "$result_tar" -C "$result"
+  [[ $(cat "$result/harness/remote.rc") == "$rail_rc" ]] ||
+    fail "$label Docker rc disagrees with the exact remote program rc"
+  cmp -s "$work_remote_command" "$result/remote-program" ||
+    fail "$label did not execute the exact materialized synthetic-pin program bytes"
+  grep -Fxq -- 'shell=busybox-ash' "$result/harness/initial-state" ||
+    fail "$label did not execute the exact program under Wolfi BusyBox ash"
+  grep -Fxq -- 'nix=absent' "$result/harness/initial-state" ||
+    fail "$label began with /nix pre-created"
+  grep -Fxq -- 'etcNix=absent' "$result/harness/initial-state" ||
+    fail "$label began with /etc/nix pre-created"
+  guest_rail_assert_safe_records "$result"
+  GUEST_RAIL_RESULT=$result
+  if [[ $expected_rc == 0 ]]; then
+    [[ -z $expected_reason && ! -s $result/harness/remote.stderr ]] ||
+      fail "$label successful exact rail emitted an unexpected refusal"
+    return
+  fi
+  [[ $expected_rc == 64 && -n $expected_reason ]] ||
+    fail "$label hostile rail expectation is not a stable exit-64 refusal"
+  grep -Fq -- "$expected_reason:" "$result/harness/remote.stderr" || {
+    sed -n '1,160p' "$result/harness/remote.stderr" >&2
+    fail "$label exact rail emitted no stable $expected_reason refusal"
+  }
+  [[ $(grep -Ec '^GuestNix[A-Za-z]+:' "$result/harness/remote.stderr") == 1 ]] ||
+    fail "$label exact rail did not emit exactly one stable GuestNix refusal class"
+  for forbidden_green in \
+    "$result/evidence/guest-nix/version.txt" \
+    "$result/evidence/guest-nix/version.stderr" \
+    "$result/harness/nix-version.argv" \
+    "$result/harness/nix-develop.argv" \
+    "$result/harness/installed-copy.sha256" \
+    "$result/out/proof.tar" \
+    "$result/out/proof.sha256"; do
+    [[ ! -e $forbidden_green && ! -L $forbidden_green ]] ||
+      fail "$label hostile rail created green identity or reached the Nix stub"
+  done
+  if [[ -d $result/evidence || -d $result/receipts ]]; then
+    ! find "$result/evidence" "$result/receipts" -type f \
+      \( -iname '*identity*' -o -iname '*preflight*' \) -print 2>/dev/null | grep -q . ||
+      fail "$label hostile rail created a green identity/preflight record"
+  fi
+  ok "$label executes the exact rail and refuses $expected_reason before direct Nix"
+}
+
+guest_rail_run_case S0 happy 0 ''
+guest_rail_happy=$GUEST_RAIL_RESULT
+[[ $(cat "$guest_rail_happy/harness/remote.stdout") == 'archive-validator.sh: OK' ]] ||
+  fail 'S0 exact remote program stdout is not the one archive-validator receipt'
+cat >"$scratch/guest-rail-expected-events" <<'GUEST_RAIL_EVENTS'
+uploads-verified
+installer-version
+installer-install
+nix-config-bound
+profile-resolved
+profile-sourced
+environment-bound
+nix-config-rechecked
+direct-nix-version
+nix-develop
+GUEST_RAIL_EVENTS
+diff -u "$scratch/guest-rail-expected-events" "$guest_rail_happy/harness/events" >/dev/null ||
+  fail 'S0 did not retain the exact ordered fixed-rail observations'
+ok 'S0 executes the complete fixed rail in its exact observable order'
+
+cat >"$scratch/guest-rail-version.env" <<'GUEST_RAIL_VERSION_ENV'
+HOME=/run/diene-ci/home
+LC_ALL=C
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+TMPDIR=/run/diene-ci/tmp
+GUEST_RAIL_VERSION_ENV
+cat >"$scratch/guest-rail-install.env" <<'GUEST_RAIL_INSTALL_ENV'
+HOME=/run/diene-ci/home
+LC_ALL=C
+NIX_INSTALLER_DIAGNOSTIC_ENDPOINT=
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+TMPDIR=/run/diene-ci/tmp
+GUEST_RAIL_INSTALL_ENV
+diff -u "$scratch/guest-rail-version.env" \
+  "$guest_rail_happy/harness/installer-version.env" >/dev/null ||
+  fail 'S0 version probe did not inherit the exact env -i capsule'
+diff -u "$scratch/guest-rail-install.env" \
+  "$guest_rail_happy/harness/installer-install.env" >/dev/null ||
+  fail 'S0 install did not inherit the exact env -i capsule and empty diagnostic endpoint'
+printf '%s\n' --version >"$scratch/guest-rail-version.argv"
+printf '%s\n' install linux --no-confirm --init none >"$scratch/guest-rail-install.argv"
+diff -u "$scratch/guest-rail-version.argv" \
+  "$guest_rail_happy/harness/installer-version.argv" >/dev/null ||
+  fail 'S0 did not retain the exact installer version argv'
+diff -u "$scratch/guest-rail-install.argv" \
+  "$guest_rail_happy/harness/installer-install.argv" >/dev/null ||
+  fail 'S0 did not retain the exact installer install argv'
+ok 'S0 empirically proves both exact env -i capsules and installer argv vectors'
+
+guest_rail_expected_verified=$scratch/guest-rail-expected-verified
+printf '%s\n' \
+  "${guest_nix_fixture_installer_digest#sha256:}  guest-nix-bootstrap.sh" \
+  "${guest_nix_fixture_payload_digest#sha256:}  guest-nix-installer" \
+  'executionMode=direct-pinned-binary' 'payloadDigestVerified=true' \
+  >"$guest_rail_expected_verified"
+diff -u "$guest_rail_expected_verified" \
+  "$guest_rail_happy/evidence/guest-nix/verified.txt" >/dev/null ||
+  fail 'S0 lost exact direct-pinned-binary upload identity evidence'
+grep -Fxq -- 'nix-installer 3.21.9' \
+  "$guest_rail_happy/evidence/guest-nix/installer-version.txt" ||
+  fail 'S0 lost the exact pinned installer version output'
+[[ $(wc -c <"$guest_rail_happy/evidence/guest-nix/installer-version.txt") == 21 &&
+  ! -s $guest_rail_happy/evidence/guest-nix/installer-version.stderr &&
+  ! -s $guest_rail_happy/evidence/guest-nix/install.log ]] ||
+  fail 'S0 did not retain exact raw installer output and an empty successful install log'
+grep -Fxq -- 'nix (Determinate Nix 3.21.9) 2.34.8' \
+  "$guest_rail_happy/evidence/guest-nix/version.txt" ||
+  fail 'S0 lost the direct installed Nix identity output'
+[[ $(wc -c <"$guest_rail_happy/evidence/guest-nix/version.txt") == 36 &&
+  ! -s $guest_rail_happy/evidence/guest-nix/version.stderr ]] ||
+  fail 'S0 direct installed Nix identity output is not exact'
+grep -Fxq -- "${guest_nix_fixture_payload_digest#sha256:}  /nix/nix-installer" \
+  "$guest_rail_happy/harness/installed-copy.sha256" ||
+  fail 'S0 installed-copy digest does not bind the directly executed pinned payload'
+ok 'S0 binds exact installer output, direct payload identity, and direct installed Nix identity'
+
+guest_rail_nix_conf=$scratch/guest-rail-nix.conf
+printf '%s\n' 'sandbox = false' >"$guest_rail_nix_conf"
+guest_rail_nix_conf_digest=$(sha256sum "$guest_rail_nix_conf" | awk '{print $1}')
+cat >"$scratch/guest-rail-environment.txt" <<GUEST_RAIL_ENVIRONMENT
+inheritedNixFamily=none
+profileNixVar=NIX_PROFILES
+profileNixVar=NIX_SSL_CERT_FILE
+home=/run/diene-ci/home
+xdgConfigHome=/run/diene-ci/home/.config
+userConfFiles=/run/diene-ci/nix-user.conf
+etcNixConf=$guest_rail_nix_conf_digest
+GUEST_RAIL_ENVIRONMENT
+diff -u "$scratch/guest-rail-environment.txt" \
+  "$guest_rail_happy/evidence/guest-nix/environment.txt" >/dev/null ||
+  fail 'S0 profile/config evidence does not bind the exact reviewed environment'
+diff -u "$guest_rail_nix_conf" "$guest_rail_happy/harness/final-nix.conf" >/dev/null ||
+  fail 'S0 did not retain the exact bound and rechecked /etc/nix/nix.conf'
+grep -Fxq -- '/nix/store/diene-guest-rail/etc/profile.d/nix-daemon.sh' \
+  "$guest_rail_happy/harness/profile.resolved" ||
+  fail 'S0 profile did not resolve to the exact in-store path'
+ok 'S0 binds, sources, records, and rechecks the exact profile and Nix configuration'
+
+cat >"$scratch/guest-rail-develop.argv" <<'GUEST_RAIL_DEVELOP_ARGV'
+--extra-experimental-features
+nix-command flakes
+develop
+.#ci
+-c
+./scripts/ci/environment-k3d-run.sh
+driver
+/run/diene-ci
+GUEST_RAIL_DEVELOP_ARGV
+diff -u "$scratch/guest-rail-develop.argv" \
+  "$guest_rail_happy/harness/nix-develop.argv" >/dev/null ||
+  fail 'S0 did not reach the exact terminal fixed-path nix develop argv'
+grep -Fxq -- /run/diene-ci/source "$guest_rail_happy/harness/nix-develop.cwd" ||
+  fail 'S0 did not enter nix develop from the exact extracted source CWD'
+ok 'S0 reaches the exact terminal fixed-path nix develop argv from the exact source CWD'
+
+guest_rail_run_case S1 happy 64 GuestNixInstallerUntrusted
+guest_rail_run_case S2 happy 64 GuestNixInstallerUntrusted
+assert_contains "$GUEST_RAIL_RESULT/harness/remote.stderr" NIX_INSTALLER_EXTRA_CONF
+assert_not_contains "$GUEST_RAIL_RESULT/harness/remote.stderr" guest-rail-secret-extra
+guest_rail_run_case S3 happy 64 GuestNixInstallerUntrusted
+assert_contains "$GUEST_RAIL_RESULT/harness/remote.stderr" NIX_CONFIG
+assert_not_contains "$GUEST_RAIL_RESULT/harness/remote.stderr" guest-rail-secret-config
+guest_rail_run_case S4 version-wrong 64 GuestNixInstallerUntrusted
+grep -Fxq -- 'nix-installer 3.21.8' \
+  "$GUEST_RAIL_RESULT/evidence/guest-nix/installer-version.txt" ||
+  fail 'S4 did not exercise the wrong installer stdout injection'
+guest_rail_run_case S5 version-stderr 64 GuestNixInstallerUntrusted
+grep -Fxq -- warning "$GUEST_RAIL_RESULT/evidence/guest-nix/installer-version.stderr" ||
+  fail 'S5 did not exercise the installer stderr injection'
+guest_rail_run_case S6 install-fail 64 GuestNixInstallFailed
+grep -Fxq -- installer-install "$GUEST_RAIL_RESULT/harness/events" ||
+  fail 'S6 did not exercise the nonzero installer call'
+guest_rail_run_case S7 config-unsafe 64 GuestNixIdentityUnexpected
+[[ ! -e $GUEST_RAIL_RESULT/harness/final-nix.conf ]] ||
+  fail 'S7 unexpectedly created a safe regular Nix configuration'
+guest_rail_run_case S8 profile-missing 64 GuestNixIdentityUnexpected
+[[ ! -e $GUEST_RAIL_RESULT/harness/profile.resolved ]] ||
+  fail 'S8 unexpectedly created the required profile'
+guest_rail_run_case S9 profile-dangling 64 GuestNixIdentityUnexpected
+[[ -f $GUEST_RAIL_RESULT/harness/profile.resolved ]] ||
+  fail 'S9 did not exercise the dangling fixed profile link'
+guest_rail_run_case S10 profile-outside 64 GuestNixIdentityUnexpected
+grep -Fxq -- /run/diene-ci/harness/outside-profile.sh \
+  "$GUEST_RAIL_RESULT/harness/profile.resolved" ||
+  fail 'S10 did not exercise an out-of-store resolved profile'
+guest_rail_run_case S11 profile-source-fail 64 GuestNixProfileSourceFailed
+grep -Fxq -- profile-resolved "$GUEST_RAIL_RESULT/harness/events" ||
+  fail 'S11 did not reach the nonzero profile source'
+assert_not_contains "$GUEST_RAIL_RESULT/harness/events" profile-sourced
+guest_rail_run_case S12 config-mutated 64 GuestNixIdentityUnexpected
+grep -Fxq -- 'post-profile-mutation = true' "$GUEST_RAIL_RESULT/harness/final-nix.conf" ||
+  fail 'S12 did not mutate /etc/nix/nix.conf between binding and recheck'
+guest_rail_run_case S13 nix-absent 64 GuestNixToolchainAbsent
+grep -Fxq -- '/nix/store/diene-guest-rail/etc/profile.d/nix-daemon.sh' \
+  "$GUEST_RAIL_RESULT/harness/profile.resolved" ||
+  fail 'S13 did not reach the fixed direct-Nix availability guard'
 
 printf '== pinned guest Nix bootstrap fails closed ==\n'
 
