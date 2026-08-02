@@ -6088,9 +6088,47 @@ guest_rail_run_case() {
 # The fixed remote program's whole stdout, in order. The session-start contract
 # requires the ready marker to be the first complete line, so the rail's stdout
 # is the marker followed by the one archive-validator receipt and nothing else.
-# Kept as an exact equality rather than a substring or line-count test: an extra
-# line, a reorder, or a missing marker must all still fail.
+#
+# The expected bytes are materialized into a private file with exactly one final
+# newline and compared with cmp, NOT with $(cat file) inside [[ == ]]. Command
+# substitution strips every trailing newline and drops NUL bytes, so the string
+# form silently admits an appended blank line or an appended NUL while claiming
+# to be exact. The negative self-tests below prove this comparison rejects both.
 guest_rail_expected_stdout=$'DieneNscSshSessionReady:v1\narchive-validator.sh: OK'
+guest_rail_expected_stdout_file=$scratch/guest-rail-expected.stdout
+printf '%s\n' "$guest_rail_expected_stdout" >"$guest_rail_expected_stdout_file"
+chmod 0600 "$guest_rail_expected_stdout_file"
+
+guest_rail_stdout_is_exact() {
+  local observed=${1:?observed rail stdout required}
+  [[ -f $observed && ! -L $observed ]] || return 1
+  cmp -s "$guest_rail_expected_stdout_file" "$observed"
+}
+
+# Non-vacuity: the comparison must accept its own expected bytes and must reject
+# each byte-level escape the previous string comparison admitted.
+guest_rail_stdout_probe=$scratch/guest-rail-stdout-probe
+install -d -m 0700 "$guest_rail_stdout_probe"
+install -m 0600 "$guest_rail_expected_stdout_file" "$guest_rail_stdout_probe/exact"
+install -m 0600 "$guest_rail_expected_stdout_file" "$guest_rail_stdout_probe/blank-line"
+printf '\n' >>"$guest_rail_stdout_probe/blank-line"
+install -m 0600 "$guest_rail_expected_stdout_file" "$guest_rail_stdout_probe/nul"
+printf '\000' >>"$guest_rail_stdout_probe/nul"
+guest_rail_expected_stdout_bytes=$(wc -c <"$guest_rail_expected_stdout_file")
+guest_rail_probe_bytes=$((guest_rail_expected_stdout_bytes + 1))
+for guest_rail_stdout_variant in blank-line nul; do
+  [[ $(wc -c <"$guest_rail_stdout_probe/$guest_rail_stdout_variant") == "$guest_rail_probe_bytes" ]] ||
+    fail "the guest rail $guest_rail_stdout_variant probe did not really append one extra byte"
+done
+guest_rail_stdout_is_exact "$guest_rail_stdout_probe/exact" ||
+  fail 'the guest rail stdout comparison rejects its own expected bytes'
+! guest_rail_stdout_is_exact "$guest_rail_stdout_probe/blank-line" ||
+  fail 'the guest rail stdout comparison accepts an appended blank line'
+! guest_rail_stdout_is_exact "$guest_rail_stdout_probe/nul" ||
+  fail 'the guest rail stdout comparison accepts an appended NUL byte'
+! guest_rail_stdout_is_exact "$guest_rail_stdout_probe/absent" ||
+  fail 'the guest rail stdout comparison accepts a missing capture'
+ok 'the guest rail stdout comparison is byte exact and rejects appended blank and NUL bytes'
 
 guest_rail_assert_post_profile_refusal() {
   local scenario=${1:?profile injection scenario required}
@@ -6124,7 +6162,7 @@ guest_rail_assert_post_profile_refusal() {
     [[ ! -e $forbidden_stub && ! -L $forbidden_stub ]] ||
       fail "$scenario reached the direct Nix stub"
   done
-  [[ $(cat "$result/harness/remote.stdout") == "$guest_rail_expected_stdout" ]] ||
+  guest_rail_stdout_is_exact "$result/harness/remote.stdout" ||
     fail "$scenario emitted output after the archive-validator receipt"
 }
 
@@ -6144,8 +6182,8 @@ guest_rail_profile_refusal_case() {
 
 guest_rail_run_case S0 happy 0 ''
 guest_rail_happy=$GUEST_RAIL_RESULT
-[[ $(cat "$guest_rail_happy/harness/remote.stdout") == "$guest_rail_expected_stdout" ]] || {
-  sed -n '1,160p' "$guest_rail_happy/harness/remote.stdout" >&2
+guest_rail_stdout_is_exact "$guest_rail_happy/harness/remote.stdout" || {
+  od -c -- "$guest_rail_happy/harness/remote.stdout" | sed -n '1,40p' >&2
   fail 'S0 exact remote program stdout is not the ready marker then the archive-validator receipt'
 }
 cat >"$scratch/guest-rail-expected-events" <<'GUEST_RAIL_EVENTS'
@@ -6355,7 +6393,7 @@ diff -u "$scratch/guest-rail-develop.argv" \
   fail 'S12l did not preserve the exact terminal nix develop argv'
 grep -Fxq -- /run/diene-ci/source "$GUEST_RAIL_RESULT/harness/nix-develop.cwd" ||
   fail 'S12l let CDPATH redirect nix develop to the decoy source'
-[[ $(cat "$GUEST_RAIL_RESULT/harness/remote.stdout") == "$guest_rail_expected_stdout" ]] ||
+guest_rail_stdout_is_exact "$GUEST_RAIL_RESULT/harness/remote.stdout" ||
   fail 'S12l emitted output from a CDPATH-selected decoy'
 ok 'S12l ignores profile CDPATH and develops from the exact absolute source CWD'
 
