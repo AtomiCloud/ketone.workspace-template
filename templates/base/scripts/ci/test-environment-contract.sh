@@ -6085,6 +6085,13 @@ guest_rail_run_case() {
   fi
 }
 
+# The fixed remote program's whole stdout, in order. The session-start contract
+# requires the ready marker to be the first complete line, so the rail's stdout
+# is the marker followed by the one archive-validator receipt and nothing else.
+# Kept as an exact equality rather than a substring or line-count test: an extra
+# line, a reorder, or a missing marker must all still fail.
+guest_rail_expected_stdout=$'DieneNscSshSessionReady:v1\narchive-validator.sh: OK'
+
 guest_rail_assert_post_profile_refusal() {
   local scenario=${1:?profile injection scenario required}
   local environment_mode=${2:?profile environment expectation required}
@@ -6117,7 +6124,7 @@ guest_rail_assert_post_profile_refusal() {
     [[ ! -e $forbidden_stub && ! -L $forbidden_stub ]] ||
       fail "$scenario reached the direct Nix stub"
   done
-  [[ $(cat "$result/harness/remote.stdout") == 'archive-validator.sh: OK' ]] ||
+  [[ $(cat "$result/harness/remote.stdout") == "$guest_rail_expected_stdout" ]] ||
     fail "$scenario emitted output after the archive-validator receipt"
 }
 
@@ -6137,8 +6144,10 @@ guest_rail_profile_refusal_case() {
 
 guest_rail_run_case S0 happy 0 ''
 guest_rail_happy=$GUEST_RAIL_RESULT
-[[ $(cat "$guest_rail_happy/harness/remote.stdout") == 'archive-validator.sh: OK' ]] ||
-  fail 'S0 exact remote program stdout is not the one archive-validator receipt'
+[[ $(cat "$guest_rail_happy/harness/remote.stdout") == "$guest_rail_expected_stdout" ]] || {
+  sed -n '1,160p' "$guest_rail_happy/harness/remote.stdout" >&2
+  fail 'S0 exact remote program stdout is not the ready marker then the archive-validator receipt'
+}
 cat >"$scratch/guest-rail-expected-events" <<'GUEST_RAIL_EVENTS'
 uploads-verified
 installer-version
@@ -6346,7 +6355,7 @@ diff -u "$scratch/guest-rail-develop.argv" \
   fail 'S12l did not preserve the exact terminal nix develop argv'
 grep -Fxq -- /run/diene-ci/source "$GUEST_RAIL_RESULT/harness/nix-develop.cwd" ||
   fail 'S12l let CDPATH redirect nix develop to the decoy source'
-[[ $(cat "$GUEST_RAIL_RESULT/harness/remote.stdout") == 'archive-validator.sh: OK' ]] ||
+[[ $(cat "$GUEST_RAIL_RESULT/harness/remote.stdout") == "$guest_rail_expected_stdout" ]] ||
   fail 'S12l emitted output from a CDPATH-selected decoy'
 ok 'S12l ignores profile CDPATH and develops from the exact absolute source CWD'
 
