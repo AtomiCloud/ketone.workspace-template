@@ -229,6 +229,7 @@ VALIDATOR
 # preflight, which runs before policy or application mutation.
 orchestrator_fixed_remote_command() {
   local contract installer_digest installer_bytes payload_digest payload_bytes remote_command
+  local guest_nix_stage2
   contract=$(diene_guest_nix_contract) || return $?
   installer_digest=$(jq -er '.installerDigest' <<<"$contract") ||
     diene_die InputContractInvalid 'guest Nix provenance digest is absent from the fixed contract'
@@ -326,19 +327,11 @@ guest_nix_exact_output_valid() {
     [ "$(wc -l <"$stdout_file")" -eq 1 ] &&
     [ "$(cat "$stdout_file")" = "$expected_output" ]
 }
-guest_nix_source_profile() {
-  profile=$1
-  set +eu
-  . "$profile"
-  profile_rc=$?
-  set -eu
-  return "$profile_rc"
-}
 guest_nix_hash_etc_config() {
   [ -d /etc/nix ] && [ ! -L /etc/nix ] &&
     [ -f /etc/nix/nix.conf ] && [ ! -L /etc/nix/nix.conf ] &&
     [ -r /etc/nix/nix.conf ] || return 1
-  sha256sum /etc/nix/nix.conf | cut -d' ' -f1
+  sha256sum /etc/nix/nix.conf | cut -d" " -f1
 }
 guest_nix_plain_sha256_valid() {
   [ "${#1}" -eq 64 ] || return 1
@@ -400,26 +393,57 @@ esac
 [ -f "$guest_nix_profile" ] && [ -r "$guest_nix_profile" ] ||
   guest_nix_fail GuestNixIdentityUnexpected \
     'the exact guest Nix profile is absent, unreadable, or not a regular file'
-guest_nix_source_profile "$guest_nix_profile" ||
-  guest_nix_fail GuestNixProfileSourceFailed 'the exact guest Nix profile returned nonzero while being sourced'
+# Everything after the profile is sourced runs in shells that never saw the
+# profile. Stage 2's whole program text, and the nix.conf digest bound before
+# the profile existed, are fixed inside stage 1's text before stage 1 starts,
+# and a freshly executed shell begins with an empty function table, its own
+# variables and an argument list it did not choose. So no name the profile can
+# reach - variable, function, alias, PATH entry, positional parameter, shell
+# option or trap - is consulted by the recheck. Stage 1 runs no bare command
+# after the profile returns, because BusyBox ash lets a sourced file shadow
+# exec, exit, return and set, and expands a profile-defined alias into lines
+# of the same program text parsed after the dot. An alias name cannot contain
+# a slash and no function can shadow an absolute path, in either shell, so the
+# one command stage 1 issues is /bin/sh spelled absolutely. Stage 2 restores
+# the profile PATH only for the final fixed-path handoff.
+guest_nix_stage2=$(cat <<'GUEST_NIX_STAGE2'
+set -eu
+umask 077
+guest_nix_bound_config_digest=$1
+guest_nix_profile_rc=$2
+guest_nix_develop_path=$PATH
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+cd /run/diene-ci
+guest_nix_fail() { printf "%s: %s\n" "$1" "$2" >&2; exit 64; }
+guest_nix_hash_etc_config() {
+  [ -d /etc/nix ] && [ ! -L /etc/nix ] &&
+    [ -f /etc/nix/nix.conf ] && [ ! -L /etc/nix/nix.conf ] &&
+    [ -r /etc/nix/nix.conf ] || return 1
+  sha256sum /etc/nix/nix.conf | cut -d" " -f1
+}
+[ "$guest_nix_profile_rc" -eq 0 ] ||
+  guest_nix_fail GuestNixProfileSourceFailed "the exact guest Nix profile returned nonzero while being sourced"
 guest_nix_profile_environment=$(env) ||
   guest_nix_fail GuestNixIdentityUnexpected \
-    'the post-profile environment could not be enumerated'
-guest_nix_profile_names_unsorted=$(printf '%s\n' "$guest_nix_profile_environment" |
-  sed -n 's/^\(NIX[A-Za-z0-9_]*\)=.*$/profileNixVar=\1/p') ||
+    "the post-profile environment could not be enumerated"
+guest_nix_profile_names_unsorted=$(printf "%s\n" "$guest_nix_profile_environment" |
+  sed -n "s/^\(NIX[A-Za-z0-9_]*\)=.*\$/profileNixVar=\1/p") ||
   guest_nix_fail GuestNixIdentityUnexpected \
-    'the post-profile Nix-family names could not be parsed'
-guest_nix_profile_names=$(printf '%s\n' "$guest_nix_profile_names_unsorted" | LC_ALL=C sort) ||
+    "the post-profile Nix-family names could not be parsed"
+guest_nix_profile_names=$(printf "%s\n" "$guest_nix_profile_names_unsorted" | LC_ALL=C sort) ||
   guest_nix_fail GuestNixIdentityUnexpected \
-    'the post-profile Nix-family names could not be sorted'
+    "the post-profile Nix-family names could not be sorted"
 if ! {
-  printf '%s\n' 'inheritedNixFamily=none'
+  printf "%s\n" "inheritedNixFamily=none"
   if [ -n "$guest_nix_profile_names" ]; then
-    printf '%s\n' "$guest_nix_profile_names"
+    printf "%s\n" "$guest_nix_profile_names"
   fi
 } >evidence/guest-nix/environment.txt; then
   guest_nix_fail GuestNixIdentityUnexpected \
-    'the post-profile environment evidence could not be written'
+    "the post-profile environment evidence could not be written"
 fi
 HOME=/run/diene-ci/home
 XDG_CONFIG_HOME=/run/diene-ci/home/.config
@@ -429,28 +453,54 @@ export HOME XDG_CONFIG_HOME NIX_USER_CONF_FILES
 chmod 0600 "$NIX_USER_CONF_FILES"
 guest_nix_etc_config_digest_after_profile=$(guest_nix_hash_etc_config) ||
   guest_nix_fail GuestNixIdentityUnexpected \
-    'the installed /etc/nix/nix.conf became unsafe before develop'
-[ "$guest_nix_etc_config_digest_after_profile" = "$guest_nix_etc_config_digest" ] ||
+    "the installed /etc/nix/nix.conf became unsafe before develop"
+[ "$guest_nix_etc_config_digest_after_profile" = "$guest_nix_bound_config_digest" ] ||
   guest_nix_fail GuestNixIdentityUnexpected \
-    'the installed /etc/nix/nix.conf changed before develop'
+    "the installed /etc/nix/nix.conf changed before develop"
 if ! {
-  printf 'home=%s\n' "$HOME"
-  printf 'xdgConfigHome=%s\n' "$XDG_CONFIG_HOME"
-  printf 'userConfFiles=%s\n' "$NIX_USER_CONF_FILES"
-  printf 'etcNixConf=%s\n' "$guest_nix_etc_config_digest"
+  printf "home=%s\n" "$HOME"
+  printf "xdgConfigHome=%s\n" "$XDG_CONFIG_HOME"
+  printf "userConfFiles=%s\n" "$NIX_USER_CONF_FILES"
+  printf "etcNixConf=%s\n" "$guest_nix_bound_config_digest"
 } >>evidence/guest-nix/environment.txt; then
   guest_nix_fail GuestNixIdentityUnexpected \
-    'the reviewed Nix environment evidence could not be completed'
+    "the reviewed Nix environment evidence could not be completed"
 fi
 chmod 0600 evidence/guest-nix/environment.txt
 [ -x /nix/var/nix/profiles/default/bin/nix ] || { printf "GuestNixToolchainAbsent: %s\n" "the instance provides no fixed-path nix command for the driver entry" >&2; exit 64; }
 if ! /nix/var/nix/profiles/default/bin/nix --version >evidence/guest-nix/version.txt \
   2>evidence/guest-nix/version.stderr; then
-  guest_nix_fail GuestNixIdentityUnexpected 'the direct installed Nix identity probe failed'
+  guest_nix_fail GuestNixIdentityUnexpected "the direct installed Nix identity probe failed"
 fi
 chmod 0600 evidence/guest-nix/version.txt evidence/guest-nix/version.stderr
-cd source
+PATH=$guest_nix_develop_path
+export PATH
+cd /run/diene-ci/source
 exec /nix/var/nix/profiles/default/bin/nix --extra-experimental-features "nix-command flakes" develop .#ci -c ./scripts/ci/environment-k3d-run.sh driver /run/diene-ci
+GUEST_NIX_STAGE2
+)
+# Stage 1 reads the profile path from its own argument list before the profile
+# exists, so a later "set --" inside the profile cannot redirect it, and every
+# "set" it needs runs before the profile is sourced. After the dot returns it
+# performs exactly two operations: one variable assignment, which no function
+# can intercept, and /bin/sh by absolute path. Nothing else is admissible
+# here - BusyBox ash lets a sourced file shadow "return" and "set" as well as
+# "exec" and "exit", so a helper that restored options or returned a status
+# after the dot would let a profile erase its own nonzero source result. The
+# stage-2 text and the bound digest are the opposite case: they are consulted
+# after the profile has run, so they are carried as literal program text
+# rather than as variables the profile could rebind.
+guest_nix_stage1_head=$(cat <<'GUEST_NIX_STAGE1'
+set -eu
+guest_nix_profile=$1
+set +eu
+. "$guest_nix_profile"
+guest_nix_profile_rc=$?
+GUEST_NIX_STAGE1
+)
+guest_nix_stage1="$guest_nix_stage1_head
+/bin/sh -c '$guest_nix_stage2' guest-nix-stage2 $guest_nix_etc_config_digest \"\$guest_nix_profile_rc\""
+exec /bin/sh -c "$guest_nix_stage1" guest-nix-stage1 "$guest_nix_profile"
 REMOTE
   )
   # The only runtime material inserted into the reviewed fixed template comes
@@ -462,6 +512,17 @@ REMOTE
   remote_command=${remote_command//__DIENE_GUEST_NIX_PAYLOAD_BYTES__/$payload_bytes}
   [[ $remote_command != *'__DIENE_GUEST_NIX_'* ]] ||
     diene_die InputContractInvalid 'guest Nix fixed remote command contains an unresolved pin placeholder'
+  # Stage 2 is carried inside stage 1 as one single-quoted word, so a single
+  # quote anywhere in its body would end that word and silently rewrite the
+  # pristine program. The constraint is enforced on the materialized bytes so
+  # a later edit of the template cannot corrupt the embedding unnoticed.
+  guest_nix_stage2=$(awk '
+    /^guest_nix_stage2=\$\(cat <<.GUEST_NIX_STAGE2.$/ { inside=1; next }
+    /^GUEST_NIX_STAGE2$/ { inside=0 }
+    inside
+  ' <<<"$remote_command")
+  [[ -n $guest_nix_stage2 && $guest_nix_stage2 != *"'"* ]] ||
+    diene_die InputContractInvalid 'guest Nix pristine stage-2 text is absent or contains a single quote'
   printf '%s\n' "$remote_command"
 }
 
