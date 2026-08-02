@@ -116,6 +116,9 @@ validate protected trust, immutable subject, closure, declarations and fixtures
   -> privately fetch the tagged guest-Nix provenance witness and the separately
      pinned x86_64 installer payload; reject redirects, byte or digest drift
      before nsc create
+  -> privately fetch the exact ten-package Wolfi GNU closure; allow its immutable
+     APK endpoint one HTTPS redirect only, then reject byte or digest drift
+     before nsc create
   -> materialize the exact egress contract
   -> derive the admitted full k3s version and its single Kubernetes feature
      selector from one helper, refusing malformed or unsupported admission
@@ -126,11 +129,15 @@ validate protected trust, immutable subject, closure, declarations and fixtures
   -> bind that exact cluster_id to the run/attempt receipt
   -> bind exact nsc version/artifact/executable identity to the receipt
   -> nsc instance upload <id> <local> <remote> --mkdir
-  -> nsc ssh <id> -T <fixed-command>
-  -> reverify both guest-Nix assets and sidecars, refuse ambient Nix state,
-     execute only the pinned installer binary, and enter the pinned Nix shell
+  -> nsc ssh <id> -T -- <fixed-command> under one lane-derived aggregate bound
+  -> require DieneNscSshSessionReady:v1 as the first complete remote stdout line
+  -> refuse inherited NIX*/APK* authority and any pre-existing Nix state
+  -> stage 0 reverifies all ten APKs and sidecars, installs the offline pinned
+     GNU closure, and proves absolute-path GNU behavior plus BusyBox tar
   -> verify the separately uploaded fixed validator and repeat source safety
      before constrained extraction into a fresh directory
+  -> reverify both guest-Nix assets and sidecars, execute only the pinned
+     installer binary, and enter the pinned Nix shell
   -> run the copied driver against built-in k3s
   -> nsc instance download <id> <remote> <local> --mkdir
   -> verify digest and safely extract the fixed proof archive
@@ -144,17 +151,35 @@ exit code without a positive exact-ID absence query is red. Prefix, name,
 profile, repository-wide, and label-wide destructive selection is forbidden.
 The two-hour TTL is a backstop, not successful cleanup.
 
+The SSH leg has one fixed aggregate deadline per lane: 45 minutes for
+`fleet-independence`, 60 for both non-vendor Ditto lanes, 75 for
+`ditto-vendor`, and 105 for `absol`. These are the corresponding workflow job
+limits minus one 15-minute margin for runner setup, collection, exact cleanup,
+absence proof, and proof upload. The deadline starts before the first SSH
+attempt and is never renewed. An unmarked session gets a 30-second start
+watchdog and may retry once against the same exact cluster ID with a 120-second
+watchdog, capped by the aggregate time remaining, only when the unmarked call
+ends with status 124 or 137. A marked call that returns either status is a
+distinct driver timeout and is never retried; every other nonzero driver status
+remains an ordinary driver failure. Each attempt uses `-T --`, closed stdin, a
+hard kill-after, private mode-`0600` output files, and append-once evidence.
+Session retries consume neither a create nor a readiness ordinal.
+
 The primary EXIT/TERM/INT trap preserves the first failure while attempting
 collection, exact destroy, and absence. The later `cleanup` step may close an
 exact survivor debt but always returns red for that run; late success cannot
 rewrite failure green. A hard runner loss can still bypass Actions cleanup,
 which is why any post-TTL survivor is an incident and a fresh run is required.
+Once cancellation begins, later TERM/HUP/INT signals are ignored until the
+tracked SSH process is stopped and exact finalization completes; the first
+signal's 143/130 status and cancellation reason remain authoritative.
 
 Only immutable files cross into `/run/diene-ci`, which is mode `0700`: source
 archive, driver inputs, artifact subject, egress contract, the safe receipt
 projection, a separately uploaded fixed archive validator plus checksum, and
 the tagged guest-Nix provenance witness, pinned x86_64 installer payload, and
-their checksum sidecars.
+their checksum sidecars, followed by ten exact Wolfi APKs and their ten checksum
+sidecars.
 The outer and remote validators accept only unique normalized relative names
 and regular-file/directory members. Collection repeats those checks before
 extraction and rejects any unreadable, linked, or special extracted object.
@@ -162,6 +187,72 @@ No `NSC_TOKEN`, GitHub token, SSH agent, destroy authority, vendor credential,
 kubeconfig body, or other capability is copied. The shared shell may expose
 the pinned client binary on the guest, but the driver has no Namespace
 authority and never invokes it.
+
+## Stage-0 GNU toolchain on Wolfi
+
+The fixed SSH program contains one stage 0 before the archive validator or any
+other climb code. Each bounded same-ID SSH attempt receives the same one fixed
+program with the exact ready marker first; retry does not split bootstrap and
+driver execution into separate SSH phases. Before
+stage 0, the program fixes `PATH`, refuses every inherited `NIX*` and `APK*`
+name, and proves that ambient `nix`, `/nix`, and `/etc/nix` state is absent.
+Only the two deliberate ordering relocations and this pre-Nix stage change the
+existing guest-Nix sequence.
+
+The ruled packages are `coreutils`, `findutils`, `sed`, `grep`, and `gawk`.
+Their measured offline closure also requires exactly `libacl1`, `libattr1`,
+`libpcre2-8-0`, `libsepol`, and `libselinux`. All ten names, versions, byte
+lengths, and SHA-256 digests are a fixed canonical contract. The orchestrator
+fetches every APK before `nsc create`, publishes only a fresh private regular
+file, writes one exact checksum sidecar, and uploads the twenty files in a
+deterministic order. Wolfi package URLs receive a transport budget of one HTTPS
+redirect because the immutable endpoint answers with a 303 to an expiring
+object URL. That exception applies only to the exact APK repository prefix;
+guest-Nix acquisition keeps a zero-redirect budget.
+
+The guest has no package-network seam. Stage 0 validates each APK and sidecar
+against the independently materialized byte and digest pins before running one
+literal command:
+
+```text
+/usr/bin/apk add --no-progress --no-network --allow-untrusted <ten absolute pinned APK paths>
+```
+
+`--allow-untrusted` does not make repository metadata or the transport a trust
+root. APK never sees unverified bytes and `--no-network` forbids repository
+resolution; the exact SHA-256 and length pins are the trust root, matching the
+direct pinned-binary guest-Nix posture. Stage 0 captures all APK stdout and
+stderr only in private mode-0600 `evidence/gnu-toolchain/install.log`. Its
+`pins.txt` and completed `identity.txt` are also mode 0600, and a refusal never
+creates a green identity or preflight artifact.
+
+Identity is proven with literal system paths, never PATH lookup or a shell
+builtin. `/usr/bin/sed` and `/usr/bin/grep` must resolve to themselves,
+`/usr/bin/awk` to `/usr/bin/gawk`, `/usr/bin/find` and `/usr/bin/xargs` to their
+own GNU findutils paths, and the admitted coreutils applets (`sha256sum`,
+`stat`, `cut`, `sort`, `head`, `wc`, `date`, `tr`, `cat`, `install`, `readlink`,
+`id`, `mktemp`, `chmod`, `rm`, and `uname`) to `/usr/bin/coreutils`. Every
+`--version` probe must succeed with empty stderr and contain its fixed GNU
+token. Separate behavior probes require GNU `sha256sum --check` to produce the
+exact `OK` result for known bytes and GNU `sed -i` to change `a` to `b`.
+
+`tar` deliberately remains BusyBox. `/usr/bin/tar` must resolve to
+`/usr/bin/busybox`, and a positive scratch-archive probe covers only `-cf`,
+`-tf`, `-tvf`, `-xf`, `-C`, and `-f`, including the validator's leading `-`
+regular-member assumption. No `tar --version` inference is used, GNU tar is not
+claimed, and `bsdtar` is not introduced. The production guest-side remote and
+archive-validator surfaces therefore remain BusyBox-tar-compatible.
+
+Preflight runs after the fixed handoff into `nix develop .#ci`, where the driver
+already has GNU tools from the Nix dev shell. The system bootstrap changes only
+the pre-Nix remote and validator surface; it is not needed to make post-profile
+driver code GNU-capable. Preflight nevertheless re-proves every `/usr/bin`
+identity and both behaviors independently so it measures the Wolfi system, not
+the dev-shell PATH. The canonical toolchain contract digest and stage evidence
+digests flow through `inputs.json` to
+`evidence/gnu-toolchain/identity.json`, `preflight.json`, and the existing
+`instance-preflight` checkpoint. This adds no receipt-schema field or second
+lifecycle phase.
 
 ## Pinned guest Nix acquisition and identity
 
@@ -402,6 +493,8 @@ A green terminal report requires:
   and report;
 - a schema-free guest-Nix identity receipt whose digest agrees with preflight
   and is bound by the `instance-preflight` checkpoint;
+- a schema-free guest-toolchain identity receipt whose contract and evidence
+  digests agree with preflight and are bound by the same checkpoint;
 - host and actual-pod hostile probes;
 - a valid immutable checkpoint predecessor chain ending in a non-resumed
   `final-clean-pass`;
@@ -431,7 +524,9 @@ types, pre-create refusals, remote revalidation, SSH and collection loss,
 unreadable/special proof suppression, grep status errors, stale-artifact
 removal, destroy failure, signals, parallel tuple isolation, report namespaces,
 policy probes/removal, leakage, checkpoint chains, forbidden substrate strings,
-and the hostile guest-Nix acquisition/install/identity matrix. It also checks
+the hostile guest-Nix acquisition/install/identity matrix, and the zero-network
+Wolfi GNU stage-0 matrix including package, identity, tar, ordering, retry, and
+cancellation attacks. It also checks
 the collected kernel-socket observation against the digest bound in collected
 `policy.json`; production keeps the dual-source socket contract unchanged.
 

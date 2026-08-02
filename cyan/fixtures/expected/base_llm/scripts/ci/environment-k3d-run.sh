@@ -2,7 +2,8 @@
 # Retained environment-k3d compatibility entrypoint.
 #
 #   orchestrate (default): trusted ordinary-runner controller for the exact
-#     nsc create -> upload -> ssh -T -> collect -> destroy -> absence sequence.
+#     nsc create -> upload -> ssh -T -- command -> collect -> destroy -> absence
+#     sequence.
 #   driver: copied, credential-free on-instance core driver. A vendor input is
 #     dispatched to environment-vendor-run.sh's driver mode.
 #
@@ -67,6 +68,163 @@ ORCH_ABSENCE_REASON=AbsenceNotAttempted
 ORCH_ABSENCE_SECONDS=0
 ORCH_ABSENCE_DIGEST=$DIENE_ZERO_DIGEST
 ORCH_STARTED=0
+ORCH_SSH_READY_MARKER=DieneNscSshSessionReady:v1
+ORCH_SSH_ACTIVE_PID=
+ORCH_SSH_ACTIVE_STDOUT=
+ORCH_SSH_ACTIVE_STDERR=
+ORCH_SSH_ACTIVE_EVIDENCE_FLUSHED=1
+ORCH_SSH_ATTEMPT_RC=0
+ORCH_SSH_ATTEMPT_READY=false
+
+orchestrator_ssh_leg_budget_seconds() {
+  # These are the canonical workflow job limits minus a fixed fifteen-minute
+  # margin for runner setup, collection, exact destroy/absence, and upload.
+  # The returned value bounds the aggregate SSH leg, including both session
+  # watchdogs and their reap time; it is never renewed for attempt two.
+  case ${DIENE_LANE:?} in
+    fleet-independence) printf '2700\n' ;;
+    ditto-build-local | ditto-target-pull) printf '3600\n' ;;
+    ditto-vendor) printf '4500\n' ;;
+    absol) printf '6300\n' ;;
+    *) diene_die InputContractInvalid 'no aggregate nsc SSH budget exists for the admitted lane' ;;
+  esac
+}
+
+orchestrator_ssh_ready_marker_seen() {
+  local stdout_path=${1:?SSH stdout path required}
+  local marker_bytes
+  [[ -f $stdout_path && ! -L $stdout_path ]] || return 1
+  marker_bytes=$(printf '%s\n' "$ORCH_SSH_READY_MARKER" | wc -c) || return 1
+  # cmp includes the marker's newline in the prefix. Thus an incomplete line,
+  # any preceding byte (including NUL), or a marker on a later line refuses.
+  cmp -n "$marker_bytes" <(printf '%s\n' "$ORCH_SSH_READY_MARKER") "$stdout_path" \
+    >/dev/null 2>&1
+}
+
+orchestrator_flush_active_ssh_evidence() {
+  ((ORCH_SSH_ACTIVE_EVIDENCE_FLUSHED == 0)) || return 0
+  local failed=0
+  if [[ -f $ORCH_SSH_ACTIVE_STDOUT && ! -L $ORCH_SSH_ACTIVE_STDOUT ]]; then
+    cat -- "$ORCH_SSH_ACTIVE_STDOUT" >>"$DIENE_EVIDENCE_STAGING/stdout" || failed=1
+  else
+    failed=1
+  fi
+  if [[ -f $ORCH_SSH_ACTIVE_STDERR && ! -L $ORCH_SSH_ACTIVE_STDERR ]]; then
+    cat -- "$ORCH_SSH_ACTIVE_STDERR" >>"$DIENE_EVIDENCE_STAGING/stderr" || failed=1
+  else
+    failed=1
+  fi
+  ORCH_SSH_ACTIVE_EVIDENCE_FLUSHED=1
+  if ((failed != 0)); then
+    ORCH_PUBLICATION_SAFE=0
+    return 1
+  fi
+}
+
+orchestrator_stop_active_ssh() {
+  local pid=${ORCH_SSH_ACTIVE_PID:-}
+  if [[ -n $pid ]]; then
+    if kill -0 "$pid" 2>/dev/null; then
+      # GNU timeout relays this TERM to nsc and its fixed kill-after bounds a
+      # TERM-ignoring direct child. wait then reaps the tracked timeout.
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+    ORCH_SSH_ACTIVE_PID=
+  fi
+  orchestrator_flush_active_ssh_evidence || true
+}
+
+orchestrator_run_ssh_attempt() {
+  local nsc_bin=${1:?nsc binary required}
+  local remote_command=${2:?remote command required}
+  local attempt=${3:?SSH attempt required}
+  local remaining_seconds=${4:?aggregate SSH remainder required}
+  local watchdog_seconds=${5:?session watchdog required}
+  local attempt_stdout="$ORCH_STATE/ssh-attempt-$attempt.stdout"
+  local attempt_stderr="$ORCH_STATE/ssh-attempt-$attempt.stderr"
+  local marker_deadline rc=0 ready=false final_marker_seen=false watchdog_stopped=false
+  local aggregate_capped=false capped_timeout_reaped=false observed_exited=false
+
+  # Start the session window before any attempt-local setup. In particular,
+  # compute this before launching GNU timeout so an aggregate-capped watchdog
+  # can never extend beyond the timeout and observe its TERM-handler bytes.
+  marker_deadline=$((SECONDS + watchdog_seconds))
+
+  : >"$attempt_stdout"
+  : >"$attempt_stderr"
+  chmod 0600 "$attempt_stdout" "$attempt_stderr"
+  ORCH_SSH_ACTIVE_STDOUT=$attempt_stdout
+  ORCH_SSH_ACTIVE_STDERR=$attempt_stderr
+  ORCH_SSH_ACTIVE_EVIDENCE_FLUSHED=0
+
+  if ((watchdog_seconds >= remaining_seconds)); then
+    aggregate_capped=true
+  fi
+
+  timeout --foreground --kill-after=10s "${remaining_seconds}s" \
+    "$nsc_bin" ssh "$ORCH_CLUSTER_ID" -T -- "$remote_command" </dev/null \
+    >"$attempt_stdout" 2>"$attempt_stderr" &
+  ORCH_SSH_ACTIVE_PID=$!
+
+  while ((SECONDS < marker_deadline)); do
+    if orchestrator_ssh_ready_marker_seen "$attempt_stdout"; then
+      ready=true
+      break
+    fi
+    if ! kill -0 "$ORCH_SSH_ACTIVE_PID" 2>/dev/null; then
+      observed_exited=true
+      break
+    fi
+    sleep 1
+  done
+
+  # Scan once at the boundary before stopping a still-live unmarked session.
+  # A marker written in the final polling interval therefore wins the race,
+  # unless the aggregate deadline itself capped this watchdog. At that shared
+  # boundary GNU timeout may already have signalled its child; only a process
+  # observed exited before the boundary can still earn the voluntary-exit scan.
+  if [[ $ready != true &&
+    ( $aggregate_capped != true || $observed_exited == true ) ]] &&
+    orchestrator_ssh_ready_marker_seen "$attempt_stdout"; then
+    ready=true
+  fi
+  if [[ $ready == true ]]; then
+    wait "$ORCH_SSH_ACTIVE_PID" || rc=$?
+    ORCH_SSH_ACTIVE_PID=
+  elif kill -0 "$ORCH_SSH_ACTIVE_PID" 2>/dev/null; then
+    watchdog_stopped=true
+    orchestrator_stop_active_ssh
+    rc=124
+  else
+    wait "$ORCH_SSH_ACTIVE_PID" || rc=$?
+    ORCH_SSH_ACTIVE_PID=
+    # At a shared aggregate/watchdog boundary, GNU timeout's own TERM path is
+    # distinguishable only after reap. Timeout signatures freeze readiness;
+    # a naturally reaped non-timeout child still earns the required final scan.
+    if [[ $aggregate_capped == true && $observed_exited != true &&
+      $rc =~ ^(124|137)$ ]]; then
+      capped_timeout_reaped=true
+    fi
+  fi
+  if [[ $watchdog_stopped == true ]]; then
+    rc=124
+  fi
+
+  # Always retain the post-reap observation. A naturally exited child may emit
+  # its marker between polls; bytes from a watchdog/timeout stop are still
+  # scanned for evidence but may never upgrade the frozen unready state.
+  if orchestrator_ssh_ready_marker_seen "$attempt_stdout"; then
+    final_marker_seen=true
+  fi
+  if [[ $watchdog_stopped != true && $capped_timeout_reaped != true &&
+    $final_marker_seen == true ]]; then
+    ready=true
+  fi
+  orchestrator_flush_active_ssh_evidence || true
+  ORCH_SSH_ATTEMPT_RC=$rc
+  ORCH_SSH_ATTEMPT_READY=$ready
+}
 
 orchestrator_fail() {
   local rc=${1:?failure status required}
@@ -229,8 +387,11 @@ VALIDATOR
 # preflight, which runs before policy or application mutation.
 orchestrator_fixed_remote_command() {
   local contract installer_digest installer_bytes payload_digest payload_bytes remote_command
-  local guest_nix_stage2
+  local guest_toolchain_contract guest_toolchain_name guest_toolchain_version
+  local guest_toolchain_bytes guest_toolchain_digest guest_toolchain_placeholder
+  local guest_nix_stage2 guest_toolchain_stage0
   contract=$(diene_guest_nix_contract) || return $?
+  guest_toolchain_contract=$(diene_guest_toolchain_contract) || return $?
   installer_digest=$(jq -er '.installerDigest' <<<"$contract") ||
     diene_die InputContractInvalid 'guest Nix provenance digest is absent from the fixed contract'
   installer_bytes=$(jq -er '.installerBytes' <<<"$contract") ||
@@ -244,8 +405,9 @@ orchestrator_fixed_remote_command() {
   [[ $installer_bytes =~ ^[1-9][0-9]*$ && $payload_bytes =~ ^[1-9][0-9]*$ ]] ||
     diene_die InputContractInvalid 'guest Nix remote pin lengths are invalid'
 
-  remote_command=$(cat <<'REMOTE'
+remote_command=$(cat <<'REMOTE'
 set -eu
+printf '%s\n' 'DieneNscSshSessionReady:v1'
 umask 077
 guest_nix_inherited_nix_command=absent
 if command -v nix >/dev/null 2>&1; then
@@ -275,6 +437,19 @@ guest_nix_require_clean_nix_env() {
     guest_nix_fail GuestNixInstallerUntrusted \
       "inherited Nix-family environment variables are prohibited: $(printf '%s' "$inherited" | tr '\n' ' ')"
 }
+guest_toolchain_inherited_apk_names() {
+  guest_toolchain_environment=$(env) || return 1
+  printf '%s\n' "$guest_toolchain_environment" |
+    sed -n 's/^\(APK[A-Za-z0-9_]*\)=.*$/\1/p'
+}
+guest_toolchain_require_clean_apk_env() {
+  inherited=$(guest_toolchain_inherited_apk_names) ||
+    guest_nix_fail GuestToolchainUnavailable \
+      'the fixed-path inherited environment could not be enumerated for APK names'
+  [ -z "$inherited" ] ||
+    guest_nix_fail GuestToolchainUnavailable \
+      "inherited APK-family environment variables are prohibited: $(printf '%s' "$inherited" | tr '\n' ' ')"
+}
 guest_nix_require_commands() {
   for guest_nix_cmd in env sed tr id install cd sha256sum chmod wc cat printf uname \
     readlink sort cut tar find awk mktemp rm; do
@@ -285,8 +460,317 @@ guest_nix_require_commands() {
 }
 # --- END guest nix environment contract ---
 
-guest_nix_require_commands
+for guest_toolchain_env_cmd in env sed tr; do
+  command -v "$guest_toolchain_env_cmd" >/dev/null 2>&1 ||
+    guest_nix_fail GuestToolchainUnavailable \
+      "a required environment-refusal command is absent: $guest_toolchain_env_cmd"
+done
 guest_nix_require_clean_nix_env
+guest_toolchain_require_clean_apk_env
+if [ "$guest_nix_inherited_nix_command" = present ] || [ -e /nix ] || [ -L /nix ] ||
+  [ -e /etc/nix ] || [ -L /etc/nix ]; then
+  guest_nix_fail GuestNixPreexistingState \
+    'the ephemeral guest already contains Nix, /nix state, or /etc/nix state'
+fi
+
+# --- BEGIN guest toolchain stage 0 ---
+guest_toolchain_scratch=
+guest_toolchain_fail() {
+  if [ -n "$guest_toolchain_scratch" ]; then
+    /usr/bin/rm -rf -- "$guest_toolchain_scratch" >/dev/null 2>&1 || true
+  fi
+  guest_nix_fail "$1" "$2"
+}
+for guest_toolchain_bootstrap_path in \
+  /usr/bin/apk /usr/bin/cat /usr/bin/chmod /usr/bin/install /usr/bin/sha256sum \
+  /usr/bin/uname /usr/bin/wc; do
+  [ -x "$guest_toolchain_bootstrap_path" ] ||
+    guest_toolchain_fail GuestToolchainUnavailable \
+      "a required absolute-path bootstrap command is absent: $guest_toolchain_bootstrap_path"
+done
+[ "$(/usr/bin/uname -m)" = x86_64 ] ||
+  guest_toolchain_fail GuestToolchainUnavailable \
+    "the guest architecture is not the pinned x86_64 toolchain target"
+[ -d /run/diene-ci ] && [ ! -L /run/diene-ci ] &&
+  [ -d /run/diene-ci/gnu ] && [ ! -L /run/diene-ci/gnu ] ||
+  guest_toolchain_fail GuestToolchainUntrusted \
+    "the uploaded guest toolchain directory is absent, linked, or unsafe"
+/usr/bin/install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence \
+  /run/diene-ci/evidence/gnu-toolchain ||
+  guest_toolchain_fail GuestToolchainUnavailable \
+    "the private guest toolchain evidence directories could not be created"
+cd /run/diene-ci/gnu ||
+  guest_toolchain_fail GuestToolchainUntrusted \
+    "the uploaded guest toolchain directory could not be entered"
+guest_toolchain_pinned_asset_valid() {
+  asset=$1
+  sidecar=$2
+  expected_digest=$3
+  expected_bytes=$4
+  expected_line="${expected_digest#sha256:}  $asset"
+  [ -f "$asset" ] && [ ! -L "$asset" ] &&
+    [ -f "$sidecar" ] && [ ! -L "$sidecar" ] &&
+    [ "$(/usr/bin/wc -c <"$asset")" -eq "$expected_bytes" ] &&
+    [ "$(/usr/bin/wc -l <"$sidecar")" -eq 1 ] &&
+    [ "$(/usr/bin/sha256sum "$asset")" = "$expected_line" ] &&
+    [ "$(/usr/bin/cat "$sidecar")" = "$expected_line" ] &&
+    /usr/bin/sha256sum -c "$sidecar" >/dev/null 2>&1
+}
+guest_toolchain_libacl1_digest=__DIENE_GUEST_TOOLCHAIN_LIBACL1_DIGEST__
+guest_toolchain_libacl1_bytes=__DIENE_GUEST_TOOLCHAIN_LIBACL1_BYTES__
+guest_toolchain_libattr1_digest=__DIENE_GUEST_TOOLCHAIN_LIBATTR1_DIGEST__
+guest_toolchain_libattr1_bytes=__DIENE_GUEST_TOOLCHAIN_LIBATTR1_BYTES__
+guest_toolchain_libpcre2_8_0_digest=__DIENE_GUEST_TOOLCHAIN_LIBPCRE2_8_0_DIGEST__
+guest_toolchain_libpcre2_8_0_bytes=__DIENE_GUEST_TOOLCHAIN_LIBPCRE2_8_0_BYTES__
+guest_toolchain_libsepol_digest=__DIENE_GUEST_TOOLCHAIN_LIBSEPOL_DIGEST__
+guest_toolchain_libsepol_bytes=__DIENE_GUEST_TOOLCHAIN_LIBSEPOL_BYTES__
+guest_toolchain_libselinux_digest=__DIENE_GUEST_TOOLCHAIN_LIBSELINUX_DIGEST__
+guest_toolchain_libselinux_bytes=__DIENE_GUEST_TOOLCHAIN_LIBSELINUX_BYTES__
+guest_toolchain_coreutils_digest=__DIENE_GUEST_TOOLCHAIN_COREUTILS_DIGEST__
+guest_toolchain_coreutils_bytes=__DIENE_GUEST_TOOLCHAIN_COREUTILS_BYTES__
+guest_toolchain_findutils_digest=__DIENE_GUEST_TOOLCHAIN_FINDUTILS_DIGEST__
+guest_toolchain_findutils_bytes=__DIENE_GUEST_TOOLCHAIN_FINDUTILS_BYTES__
+guest_toolchain_gawk_digest=__DIENE_GUEST_TOOLCHAIN_GAWK_DIGEST__
+guest_toolchain_gawk_bytes=__DIENE_GUEST_TOOLCHAIN_GAWK_BYTES__
+guest_toolchain_grep_digest=__DIENE_GUEST_TOOLCHAIN_GREP_DIGEST__
+guest_toolchain_grep_bytes=__DIENE_GUEST_TOOLCHAIN_GREP_BYTES__
+guest_toolchain_sed_digest=__DIENE_GUEST_TOOLCHAIN_SED_DIGEST__
+guest_toolchain_sed_bytes=__DIENE_GUEST_TOOLCHAIN_SED_BYTES__
+guest_toolchain_pinned_asset_valid libacl1-2.4.0-r1.apk libacl1-2.4.0-r1.apk.sha256 \
+  "$guest_toolchain_libacl1_digest" "$guest_toolchain_libacl1_bytes" &&
+  guest_toolchain_pinned_asset_valid libattr1-2.6.0-r1.apk libattr1-2.6.0-r1.apk.sha256 \
+    "$guest_toolchain_libattr1_digest" "$guest_toolchain_libattr1_bytes" &&
+  guest_toolchain_pinned_asset_valid libpcre2-8-0-10.47-r0.apk libpcre2-8-0-10.47-r0.apk.sha256 \
+    "$guest_toolchain_libpcre2_8_0_digest" "$guest_toolchain_libpcre2_8_0_bytes" &&
+  guest_toolchain_pinned_asset_valid libsepol-3.11-r0.apk libsepol-3.11-r0.apk.sha256 \
+    "$guest_toolchain_libsepol_digest" "$guest_toolchain_libsepol_bytes" &&
+  guest_toolchain_pinned_asset_valid libselinux-3.11-r0.apk libselinux-3.11-r0.apk.sha256 \
+    "$guest_toolchain_libselinux_digest" "$guest_toolchain_libselinux_bytes" &&
+  guest_toolchain_pinned_asset_valid coreutils-9.11-r3.apk coreutils-9.11-r3.apk.sha256 \
+    "$guest_toolchain_coreutils_digest" "$guest_toolchain_coreutils_bytes" &&
+  guest_toolchain_pinned_asset_valid findutils-4.11.0-r1.apk findutils-4.11.0-r1.apk.sha256 \
+    "$guest_toolchain_findutils_digest" "$guest_toolchain_findutils_bytes" &&
+  guest_toolchain_pinned_asset_valid gawk-5.4.1-r0.apk gawk-5.4.1-r0.apk.sha256 \
+    "$guest_toolchain_gawk_digest" "$guest_toolchain_gawk_bytes" &&
+  guest_toolchain_pinned_asset_valid grep-3.12-r6.apk grep-3.12-r6.apk.sha256 \
+    "$guest_toolchain_grep_digest" "$guest_toolchain_grep_bytes" &&
+  guest_toolchain_pinned_asset_valid sed-4.10-r1.apk sed-4.10-r1.apk.sha256 \
+    "$guest_toolchain_sed_digest" "$guest_toolchain_sed_bytes" ||
+  guest_toolchain_fail GuestToolchainUntrusted \
+    "an uploaded guest toolchain package or sidecar changed"
+if ! {
+  printf "%s\n" "executionMode=offline-pinned-apk"
+  printf "%s\n" \
+    "libacl1 2.4.0-r1 $guest_toolchain_libacl1_bytes $guest_toolchain_libacl1_digest" \
+    "libattr1 2.6.0-r1 $guest_toolchain_libattr1_bytes $guest_toolchain_libattr1_digest" \
+    "libpcre2-8-0 10.47-r0 $guest_toolchain_libpcre2_8_0_bytes $guest_toolchain_libpcre2_8_0_digest" \
+    "libsepol 3.11-r0 $guest_toolchain_libsepol_bytes $guest_toolchain_libsepol_digest" \
+    "libselinux 3.11-r0 $guest_toolchain_libselinux_bytes $guest_toolchain_libselinux_digest" \
+    "coreutils 9.11-r3 $guest_toolchain_coreutils_bytes $guest_toolchain_coreutils_digest" \
+    "findutils 4.11.0-r1 $guest_toolchain_findutils_bytes $guest_toolchain_findutils_digest" \
+    "gawk 5.4.1-r0 $guest_toolchain_gawk_bytes $guest_toolchain_gawk_digest" \
+    "grep 3.12-r6 $guest_toolchain_grep_bytes $guest_toolchain_grep_digest" \
+    "sed 4.10-r1 $guest_toolchain_sed_bytes $guest_toolchain_sed_digest"
+} >/run/diene-ci/evidence/gnu-toolchain/pins.txt; then
+  guest_toolchain_fail GuestToolchainUntrusted \
+    "the fixed guest toolchain pin evidence could not be written"
+fi
+/usr/bin/chmod 0600 /run/diene-ci/evidence/gnu-toolchain/pins.txt \
+  libacl1-2.4.0-r1.apk libacl1-2.4.0-r1.apk.sha256 \
+  libattr1-2.6.0-r1.apk libattr1-2.6.0-r1.apk.sha256 \
+  libpcre2-8-0-10.47-r0.apk libpcre2-8-0-10.47-r0.apk.sha256 \
+  libsepol-3.11-r0.apk libsepol-3.11-r0.apk.sha256 \
+  libselinux-3.11-r0.apk libselinux-3.11-r0.apk.sha256 \
+  coreutils-9.11-r3.apk coreutils-9.11-r3.apk.sha256 \
+  findutils-4.11.0-r1.apk findutils-4.11.0-r1.apk.sha256 \
+  gawk-5.4.1-r0.apk gawk-5.4.1-r0.apk.sha256 \
+  grep-3.12-r6.apk grep-3.12-r6.apk.sha256 \
+  sed-4.10-r1.apk sed-4.10-r1.apk.sha256 ||
+  guest_toolchain_fail GuestToolchainUntrusted \
+    "the verified guest toolchain packages could not be sealed"
+guest_toolchain_install_rc=0
+/usr/bin/apk add --no-progress --no-network --allow-untrusted \
+  /run/diene-ci/gnu/libacl1-2.4.0-r1.apk \
+  /run/diene-ci/gnu/libattr1-2.6.0-r1.apk \
+  /run/diene-ci/gnu/libpcre2-8-0-10.47-r0.apk \
+  /run/diene-ci/gnu/libsepol-3.11-r0.apk \
+  /run/diene-ci/gnu/libselinux-3.11-r0.apk \
+  /run/diene-ci/gnu/coreutils-9.11-r3.apk \
+  /run/diene-ci/gnu/findutils-4.11.0-r1.apk \
+  /run/diene-ci/gnu/gawk-5.4.1-r0.apk \
+  /run/diene-ci/gnu/grep-3.12-r6.apk \
+  /run/diene-ci/gnu/sed-4.10-r1.apk \
+  >/run/diene-ci/evidence/gnu-toolchain/install.log 2>&1 || guest_toolchain_install_rc=$?
+/usr/bin/chmod 0600 /run/diene-ci/evidence/gnu-toolchain/install.log ||
+  guest_toolchain_fail GuestToolchainInstallFailed \
+    "the guest toolchain install log could not be sealed"
+[ "$guest_toolchain_install_rc" -eq 0 ] ||
+  guest_toolchain_fail GuestToolchainInstallFailed \
+    "the offline pinned guest toolchain install failed"
+
+guest_toolchain_identity_lines=
+guest_toolchain_prove_gnu() {
+  guest_toolchain_name=$1
+  guest_toolchain_binary=$2
+  guest_toolchain_expected=$3
+  guest_toolchain_token=$4
+  [ -x "$guest_toolchain_binary" ] ||
+    guest_toolchain_fail GuestToolchainIdentityUnexpected \
+      "the absolute-path GNU binary is absent: $guest_toolchain_binary"
+  guest_toolchain_resolved=$(/usr/bin/readlink -f "$guest_toolchain_binary" 2>/dev/null) ||
+    guest_toolchain_fail GuestToolchainIdentityUnexpected \
+      "the absolute-path GNU binary cannot be resolved: $guest_toolchain_binary"
+  [ "$guest_toolchain_resolved" = "$guest_toolchain_expected" ] &&
+    [ "${guest_toolchain_resolved##*/}" != busybox ] ||
+    guest_toolchain_fail GuestToolchainIdentityUnexpected \
+      "the absolute-path GNU binary resolved unexpectedly: $guest_toolchain_binary"
+  guest_toolchain_stdout="/run/diene-ci/evidence/gnu-toolchain/$guest_toolchain_name-version.txt"
+  guest_toolchain_stderr="/run/diene-ci/evidence/gnu-toolchain/$guest_toolchain_name-version.stderr"
+  if ! {
+    : >"$guest_toolchain_stdout"
+    : >"$guest_toolchain_stderr"
+    /usr/bin/chmod 0600 "$guest_toolchain_stdout" "$guest_toolchain_stderr"
+  }; then
+    guest_toolchain_fail GuestToolchainIdentityUnexpected \
+      "the absolute-path GNU identity output could not be sealed: $guest_toolchain_name"
+  fi
+  if ! "$guest_toolchain_binary" --version >"$guest_toolchain_stdout" \
+    2>"$guest_toolchain_stderr"; then
+    guest_toolchain_fail GuestToolchainIdentityUnexpected \
+      "the absolute-path GNU identity probe failed: $guest_toolchain_name"
+  fi
+  [ ! -s "$guest_toolchain_stderr" ] &&
+    /usr/bin/grep -Fq -- "$guest_toolchain_token" "$guest_toolchain_stdout" ||
+    guest_toolchain_fail GuestToolchainIdentityUnexpected \
+      "the absolute-path identity lacks its fixed GNU token: $guest_toolchain_name"
+  guest_toolchain_identity_lines="${guest_toolchain_identity_lines}${guest_toolchain_name}|${guest_toolchain_binary}|${guest_toolchain_resolved}|${guest_toolchain_token}
+"
+}
+guest_toolchain_prove_gnu sed /usr/bin/sed /usr/bin/sed "(GNU sed) "
+guest_toolchain_prove_gnu grep /usr/bin/grep /usr/bin/grep "(GNU grep) "
+guest_toolchain_prove_gnu awk /usr/bin/awk /usr/bin/gawk "GNU Awk "
+guest_toolchain_prove_gnu find /usr/bin/find /usr/bin/find "(GNU findutils) "
+guest_toolchain_prove_gnu xargs /usr/bin/xargs /usr/bin/xargs "(GNU findutils) "
+guest_toolchain_prove_gnu sha256sum /usr/bin/sha256sum /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu stat /usr/bin/stat /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu cut /usr/bin/cut /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu sort /usr/bin/sort /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu head /usr/bin/head /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu wc /usr/bin/wc /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu date /usr/bin/date /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu tr /usr/bin/tr /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu cat /usr/bin/cat /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu install /usr/bin/install /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu readlink /usr/bin/readlink /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu id /usr/bin/id /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu mktemp /usr/bin/mktemp /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu chmod /usr/bin/chmod /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu rm /usr/bin/rm /usr/bin/coreutils "(GNU coreutils) "
+guest_toolchain_prove_gnu uname /usr/bin/uname /usr/bin/coreutils "(GNU coreutils) "
+
+guest_toolchain_scratch=$(/usr/bin/mktemp -d /run/diene-ci/tmp/gnu-toolchain.XXXXXX) ||
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "the guest toolchain behavior scratch directory could not be created"
+if ! {
+  /usr/bin/chmod 0700 "$guest_toolchain_scratch"
+  printf "%s\n" "diene-gnu-toolchain" >"$guest_toolchain_scratch/known.txt"
+  printf "%s  %s\n" \
+    "c28908b77b6613d7f8595ab582fa4bbf7042b8fbb163625ab3522f79a8dc88a9" "known.txt" \
+    >"$guest_toolchain_scratch/known.sha256"
+}; then
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "the GNU behavior proof inputs could not be written privately"
+fi
+if ! (cd "$guest_toolchain_scratch" && /usr/bin/sha256sum --check known.sha256 \
+  >sha256.stdout 2>sha256.stderr); then
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "GNU sha256sum --check failed the fixed known-byte behavior probe"
+fi
+[ ! -s "$guest_toolchain_scratch/sha256.stderr" ] &&
+  [ "$(/usr/bin/wc -l <"$guest_toolchain_scratch/sha256.stdout")" -eq 1 ] &&
+  [ "$(/usr/bin/cat "$guest_toolchain_scratch/sha256.stdout")" = "known.txt: OK" ] ||
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "GNU sha256sum --check emitted unexpected behavior evidence"
+printf "%s\n" "a" >"$guest_toolchain_scratch/sed.txt" ||
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "the GNU sed behavior proof input could not be written"
+if ! /usr/bin/sed -i "s/a/b/" "$guest_toolchain_scratch/sed.txt" \
+  >"$guest_toolchain_scratch/sed.stdout" 2>"$guest_toolchain_scratch/sed.stderr"; then
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "GNU sed -i failed the fixed in-place behavior probe"
+fi
+[ ! -s "$guest_toolchain_scratch/sed.stdout" ] &&
+  [ ! -s "$guest_toolchain_scratch/sed.stderr" ] &&
+  /usr/bin/grep -Fxq -- "b" "$guest_toolchain_scratch/sed.txt" ||
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "GNU sed -i did not change the fixed input from a to b"
+
+guest_toolchain_tar_resolved=$(/usr/bin/readlink -f /usr/bin/tar 2>/dev/null) ||
+  guest_toolchain_fail GuestToolchainTarUnexpected \
+    "the absolute-path guest tar cannot be resolved"
+[ "$guest_toolchain_tar_resolved" = /usr/bin/busybox ] ||
+  guest_toolchain_fail GuestToolchainTarUnexpected \
+    "the guest tar implementation is not the fixed BusyBox binary"
+if ! {
+  /usr/bin/install -d -m 0700 "$guest_toolchain_scratch/tar-source" \
+    "$guest_toolchain_scratch/tar-output"
+  printf "%s\n" "portable" >"$guest_toolchain_scratch/tar-source/member"
+  : >"$guest_toolchain_scratch/tar.stdout"
+  : >"$guest_toolchain_scratch/tar.stderr"
+}; then
+  guest_toolchain_fail GuestToolchainTarUnexpected \
+    "the BusyBox tar behavior proof inputs could not be written privately"
+fi
+if ! /usr/bin/tar -cf "$guest_toolchain_scratch/probe.tar" \
+  -C "$guest_toolchain_scratch/tar-source" member \
+  >>"$guest_toolchain_scratch/tar.stdout" 2>>"$guest_toolchain_scratch/tar.stderr"; then
+  guest_toolchain_fail GuestToolchainTarUnexpected \
+    "BusyBox tar refused the portable create flags"
+fi
+guest_toolchain_tar_listing=$(/usr/bin/tar -tf "$guest_toolchain_scratch/probe.tar" \
+  2>>"$guest_toolchain_scratch/tar.stderr") ||
+  guest_toolchain_fail GuestToolchainTarUnexpected \
+    "BusyBox tar refused the portable list flags"
+guest_toolchain_tar_types=$(/usr/bin/tar -tvf "$guest_toolchain_scratch/probe.tar" \
+  2>>"$guest_toolchain_scratch/tar.stderr") ||
+  guest_toolchain_fail GuestToolchainTarUnexpected \
+    "BusyBox tar refused the portable verbose-list flags"
+if ! /usr/bin/tar -xf "$guest_toolchain_scratch/probe.tar" \
+  -C "$guest_toolchain_scratch/tar-output" \
+  >>"$guest_toolchain_scratch/tar.stdout" 2>>"$guest_toolchain_scratch/tar.stderr"; then
+  guest_toolchain_fail GuestToolchainTarUnexpected \
+    "BusyBox tar refused the portable extract flags"
+fi
+guest_toolchain_tar_type=$(printf "%s\n" "$guest_toolchain_tar_types" | /usr/bin/cut -c1) ||
+  guest_toolchain_fail GuestToolchainTarUnexpected \
+    "the BusyBox tar regular-member type could not be read"
+[ ! -s "$guest_toolchain_scratch/tar.stderr" ] &&
+  [ "$guest_toolchain_tar_listing" = member ] && [ "$guest_toolchain_tar_type" = - ] &&
+  [ -f "$guest_toolchain_scratch/tar-output/member" ] &&
+  /usr/bin/grep -Fxq -- "portable" "$guest_toolchain_scratch/tar-output/member" ||
+  guest_toolchain_fail GuestToolchainTarUnexpected \
+    "BusyBox tar did not preserve the portable archive or regular-member type"
+/usr/bin/rm -rf -- "$guest_toolchain_scratch" ||
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "the guest toolchain behavior scratch directory could not be removed"
+guest_toolchain_scratch=
+guest_toolchain_identity_lines="${guest_toolchain_identity_lines}behaviorSha256sumCheck=pass
+behaviorSedInPlace=pass
+tarImplementation=busybox
+tarResolvedPath=/usr/bin/busybox
+tarPortableFlags=-cf,-tf,-tvf,-xf,-C,-f
+tarTypeCharacter=-"
+if ! printf "%s\n" "$guest_toolchain_identity_lines" \
+  >/run/diene-ci/evidence/gnu-toolchain/identity.txt; then
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "the completed guest toolchain identity evidence could not be written"
+fi
+/usr/bin/chmod 0600 /run/diene-ci/evidence/gnu-toolchain/identity.txt ||
+  guest_toolchain_fail GuestToolchainIdentityUnexpected \
+    "the completed guest toolchain identity evidence could not be sealed"
+# --- END guest toolchain stage 0 ---
+
+guest_nix_require_commands
 test "$(id -u)" = 0
 install -d -m 0700 /run/diene-ci/tmp /run/diene-ci/evidence /run/diene-ci/receipts /run/diene-ci/out
 GUEST_NIX_HOME=/run/diene-ci/home
@@ -342,11 +826,6 @@ guest_nix_installer_bytes=__DIENE_GUEST_NIX_INSTALLER_BYTES__
 guest_nix_payload_digest=__DIENE_GUEST_NIX_PAYLOAD_DIGEST__
 guest_nix_payload_bytes=__DIENE_GUEST_NIX_PAYLOAD_BYTES__
 [ "$(uname -m)" = x86_64 ] || guest_nix_fail GuestNixInstallerUnsupportedArch 'the guest architecture is not the pinned x86_64 target'
-if [ "$guest_nix_inherited_nix_command" = present ] || [ -e /nix ] || [ -L /nix ] ||
-  [ -e /etc/nix ] || [ -L /etc/nix ]; then
-  guest_nix_fail GuestNixPreexistingState \
-    'the ephemeral guest already contains Nix, /nix state, or /etc/nix state'
-fi
 guest_nix_pinned_asset_valid guest-nix-bootstrap.sh guest-nix-bootstrap.sha256 \
   "$guest_nix_installer_digest" "$guest_nix_installer_bytes" &&
   guest_nix_pinned_asset_valid guest-nix-installer guest-nix-installer.sha256 \
@@ -512,6 +991,34 @@ REMOTE
   remote_command=${remote_command//__DIENE_GUEST_NIX_PAYLOAD_BYTES__/$payload_bytes}
   [[ $remote_command != *'__DIENE_GUEST_NIX_'* ]] ||
     diene_die InputContractInvalid 'guest Nix fixed remote command contains an unresolved pin placeholder'
+  while IFS=$'\t' read -r guest_toolchain_name guest_toolchain_version \
+    guest_toolchain_bytes guest_toolchain_digest; do
+    diene_require_digest "guest-toolchain-remote-$guest_toolchain_name-digest" \
+      "$guest_toolchain_digest"
+    [[ $guest_toolchain_bytes =~ ^[1-9][0-9]*$ &&
+      $remote_command == *"$guest_toolchain_name-$guest_toolchain_version.apk"* ]] ||
+      diene_die InputContractInvalid \
+        "guest toolchain remote pin or fixed package path for $guest_toolchain_name is invalid"
+    guest_toolchain_placeholder=${guest_toolchain_name^^}
+    guest_toolchain_placeholder=${guest_toolchain_placeholder//-/_}
+    remote_command=${remote_command//__DIENE_GUEST_TOOLCHAIN_${guest_toolchain_placeholder}_DIGEST__/$guest_toolchain_digest}
+    remote_command=${remote_command//__DIENE_GUEST_TOOLCHAIN_${guest_toolchain_placeholder}_BYTES__/$guest_toolchain_bytes}
+  done < <(jq -r '.packages[] | [.name,.version,(.bytes|tostring),.digest] | @tsv' \
+    <<<"$guest_toolchain_contract")
+  [[ $remote_command != *'__DIENE_GUEST_TOOLCHAIN_'* ]] ||
+    diene_die InputContractInvalid \
+      'guest toolchain fixed remote command contains an unresolved pin placeholder'
+  # Stage 0 is independently constrained to quote-stable text. Keeping this
+  # check separate from the later stage-2 embedding guard prevents a future
+  # edit from adding an unreviewed shell quoting seam before archive validation.
+  guest_toolchain_stage0=$(awk '
+    /^# --- BEGIN guest toolchain stage 0 ---$/ { inside=1; next }
+    /^# --- END guest toolchain stage 0 ---$/ { inside=0 }
+    inside
+  ' <<<"$remote_command")
+  [[ -n $guest_toolchain_stage0 && $guest_toolchain_stage0 != *"'"* ]] ||
+    diene_die InputContractInvalid \
+      'guest toolchain stage-0 text is absent or contains a single quote'
   # Stage 2 is carried inside stage 1 as one single-quoted word, so a single
   # quote anywhere in its body would end that word and silently rewrite the
   # pristine program. The constraint is enforced on the materialized bytes so
@@ -807,7 +1314,9 @@ orchestrator_finalize_report() {
 
 orchestrator_on_exit() {
   local prior=$?
-  trap - EXIT TERM INT HUP
+  trap - EXIT
+  trap '' TERM INT HUP
+  orchestrator_stop_active_ssh
   ((prior == 0)) || orchestrator_fail "$prior" "${ORCH_FIRST_REASON:-NamespaceLifecycleFailed}" 'orchestrator exited non-zero'
   orchestrator_cleanup
   local final_rc=0
@@ -822,7 +1331,9 @@ orchestrator_on_exit() {
 
 orchestrator_on_signal() {
   local rc=${1:?signal status required}
+  trap '' TERM INT HUP
   orchestrator_fail "$rc" OrchestratorCancelled 'signal received during Namespace lifecycle'
+  orchestrator_stop_active_ssh
   exit "$rc"
 }
 
@@ -835,6 +1346,10 @@ orchestrate() {
   diene_require_command sha256sum
   diene_require_command tar
   diene_require_command git
+  diene_require_command wc
+  diene_require_command cmp
+  diene_require_command sleep
+  diene_require_command timeout
   diene_require_command "${DIENE_SCHEMA_VALIDATOR_BIN:-check-jsonschema}"
   diene_require_command "$(diene_nsc_bin)"
   ORCH_KIND=core
@@ -874,6 +1389,9 @@ orchestrate() {
   local nsc_bin nsc_identity nsc_version nsc_artifact_digest nsc_binary_digest
   local source_digest subject_digest contract_digest validator_digest create_started create_rc
   local guest_nix_contract guest_nix_installer_digest guest_nix_payload_digest
+  local guest_toolchain_contract guest_toolchain_contract_digest
+  local guest_toolchain_name guest_toolchain_version guest_toolchain_bytes
+  local guest_toolchain_digest guest_toolchain_filename
   nsc_bin=$(diene_nsc_bin)
   nsc_identity=$(diene_nsc_identity)
   nsc_version=$(jq -r '.version' <<<"$nsc_identity")
@@ -904,6 +1422,20 @@ orchestrate() {
   printf '%s  guest-nix-installer\n' "${guest_nix_payload_digest#sha256:}" \
     >"$ORCH_STATE/guest-nix-installer.sha256"
   chmod 0600 "$ORCH_STATE/guest-nix-bootstrap.sha256" "$ORCH_STATE/guest-nix-installer.sha256"
+  guest_toolchain_contract=$(diene_guest_toolchain_contract) || exit $?
+  guest_toolchain_contract_digest=$(diene_guest_toolchain_contract_digest) || exit $?
+  install -d -m 0700 "$ORCH_STATE/gnu"
+  while IFS='|' read -r guest_toolchain_name guest_toolchain_version guest_toolchain_bytes \
+    guest_toolchain_digest; do
+    guest_toolchain_filename="$guest_toolchain_name-$guest_toolchain_version.apk"
+    diene_fetch_pinned_artifact \
+      "$DIENE_GUEST_TOOLCHAIN_REPO_BASE/$guest_toolchain_filename" \
+      "$guest_toolchain_digest" "$guest_toolchain_bytes" \
+      "$ORCH_STATE/gnu/$guest_toolchain_filename" 1
+    printf '%s  %s\n' "${guest_toolchain_digest#sha256:}" "$guest_toolchain_filename" \
+      >"$ORCH_STATE/gnu/$guest_toolchain_filename.sha256"
+    chmod 0600 "$ORCH_STATE/gnu/$guest_toolchain_filename.sha256"
+  done <<<"$DIENE_GUEST_TOOLCHAIN_PACKAGES"
   source_digest=$(diene_file_digest "$ORCH_STATE/source.tar")
   subject_digest=$(diene_file_digest "$DIENE_ARTIFACT_SUBJECT")
   contract_digest=$(diene_file_digest "$ORCH_STATE/egress-contract.json")
@@ -970,7 +1502,8 @@ orchestrate() {
     --arg venue "${DIENE_ORCHESTRATOR_VENUE:-namespace}" \
     --arg label "${DIENE_ORCHESTRATOR_LABEL:-nscloud-ubuntu-26.04-amd64-16x32}" \
     --arg fallback "${DIENE_ORCHESTRATOR_FALLBACK_REASON:-}" \
-    --argjson guestNix "$guest_nix_contract" '
+    --argjson guestNix "$guest_nix_contract" \
+    --argjson guestToolchain "$guest_toolchain_contract" '
     {apiVersion:"diene.atomi.cloud/ci-driver-inputs/v1",trustedRuntimeContext:"protected-base",
      duration:"2h",platformPolicyStatus:"platform per-instance policy pending (support ask #4)",
      owner:{repositoryId:$repositoryId,repositoryKey:$repositoryKey,sourceSha:$sourceSha,
@@ -985,7 +1518,7 @@ orchestrate() {
      sourceArchiveDigest:$sourceDigest,artifactSubjectDigest:$subjectDigest,
      admittedK3sVersion:$k3s,admittedServiceCidr:$serviceCidr,cacheAttached:false,
      egress:{contractDigest:$contractDigest,canaryImage:$canaryImage,l7Enforcer:$l7,probeBin:$probe},
-     vendorCredentialBroker:$vendorBroker,guestNix:$guestNix,
+     vendorCredentialBroker:$vendorBroker,guestNix:$guestNix,guestToolchain:$guestToolchain,
      orchestrator:{venue:$venue,label:$label,fallbackReason:(if $fallback == "" then null else $fallback end)}}' |
     diene_write_json "$ORCH_STATE/inputs.json"
 
@@ -1018,9 +1551,21 @@ orchestrate() {
   ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" "$ORCH_STATE/guest-nix-installer.sha256" \
     /run/diene-ci/guest-nix-installer.sha256 --mkdir >>"$DIENE_EVIDENCE_STAGING/stdout" \
     2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  while IFS='|' read -r guest_toolchain_name guest_toolchain_version guest_toolchain_bytes \
+    guest_toolchain_digest; do
+    guest_toolchain_filename="$guest_toolchain_name-$guest_toolchain_version.apk"
+    ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" \
+      "$ORCH_STATE/gnu/$guest_toolchain_filename" \
+      "/run/diene-ci/gnu/$guest_toolchain_filename" --mkdir \
+      >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+    ((transfer_rc != 0)) || "$nsc_bin" instance upload "$ORCH_CLUSTER_ID" \
+      "$ORCH_STATE/gnu/$guest_toolchain_filename.sha256" \
+      "/run/diene-ci/gnu/$guest_toolchain_filename.sha256" --mkdir \
+      >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || transfer_rc=$?
+  done <<<"$DIENE_GUEST_TOOLCHAIN_PACKAGES"
   ORCH_TRANSFER_SECONDS=$((SECONDS - transfer_started))
   ORCH_TRANSFER_DIGEST=$(phase_digest transfer "$source_digest|$guest_nix_installer_digest" \
-    "$contract_digest|$validator_digest|$guest_nix_payload_digest")
+    "$contract_digest|$validator_digest|$guest_nix_payload_digest|$guest_toolchain_contract_digest")
   if ((transfer_rc != 0)); then
     ORCH_TRANSFER_OUTCOME=Fail
     ORCH_TRANSFER_REASON=NamespaceTransferFailed
@@ -1030,20 +1575,78 @@ orchestrate() {
   ORCH_TRANSFER_OUTCOME=Pass
   ORCH_TRANSFER_REASON=ImmutableInputsUploaded
 
-  local remote_command ssh_started ssh_rc=0
+  local remote_command ssh_started ssh_rc=0 ssh_attempt ssh_attempt_trace='' ssh_ready=false
+  local ssh_leg_budget_seconds ssh_leg_deadline ssh_remaining_seconds ssh_watchdog_seconds
+  local ssh_aggregate_exhausted=false
   remote_command=$(orchestrator_fixed_remote_command)
   ssh_started=$SECONDS
-  "$nsc_bin" ssh "$ORCH_CLUSTER_ID" -T "$remote_command" \
-    >>"$DIENE_EVIDENCE_STAGING/stdout" 2>>"$DIENE_EVIDENCE_STAGING/stderr" || ssh_rc=$?
+  # The live instance is already exact-id admitted and uploaded. An nsc SSH
+  # start hang is therefore retried once against that same instance; it is not
+  # instance-readiness evidence and must not consume a create ordinal. The one
+  # deadline charges both watchdogs, both reap intervals, and all driver work.
+  ssh_leg_budget_seconds=$(orchestrator_ssh_leg_budget_seconds)
+  ssh_leg_deadline=$((SECONDS + ssh_leg_budget_seconds))
+  for ssh_attempt in 1 2; do
+    ssh_remaining_seconds=$((ssh_leg_deadline - SECONDS))
+    if ((ssh_remaining_seconds <= 0)); then
+      ssh_rc=124
+      ssh_aggregate_exhausted=true
+      break
+    fi
+    if ((ssh_attempt == 1)); then
+      ssh_watchdog_seconds=30
+    else
+      ssh_watchdog_seconds=120
+    fi
+    if ((ssh_watchdog_seconds > ssh_remaining_seconds)); then
+      ssh_watchdog_seconds=$ssh_remaining_seconds
+    fi
+    orchestrator_run_ssh_attempt "$nsc_bin" "$remote_command" "$ssh_attempt" \
+      "$ssh_remaining_seconds" "$ssh_watchdog_seconds"
+    ssh_rc=$ORCH_SSH_ATTEMPT_RC
+    ssh_ready=$ORCH_SSH_ATTEMPT_READY
+    ssh_attempt_trace+="${ssh_attempt_trace:+,}${ssh_attempt}:$([[ $ssh_ready == true ]] && printf ready || printf unready):${ssh_rc}"
+    if [[ $ssh_ready != true && $ssh_rc =~ ^(124|137)$ ]]; then
+      printf 'NamespaceSshSessionStartTimedOut: exact cluster_id %s attempt %s/2 did not emit %s before %ss (status %s)\n' \
+        "$ORCH_CLUSTER_ID" "$ssh_attempt" "$ORCH_SSH_READY_MARKER" \
+        "$ssh_watchdog_seconds" "$ssh_rc" >>"$DIENE_EVIDENCE_STAGING/stderr"
+      if ((SECONDS >= ssh_leg_deadline)); then
+        ssh_aggregate_exhausted=true
+      elif ((ssh_attempt == 1)); then
+        continue
+      fi
+    fi
+    break
+  done
   ORCH_SSH_SECONDS=$((SECONDS - ssh_started))
-  ORCH_SSH_DIGEST=$(phase_digest ssh "$ORCH_CLUSTER_ID" "$ssh_rc")
-  if ((ssh_rc == 0)); then
+  ORCH_SSH_DIGEST=$(phase_digest ssh "$ORCH_CLUSTER_ID" "$ssh_attempt_trace")
+  if ((ssh_rc == 0)) && [[ $ssh_ready == true ]]; then
     ORCH_SSH_OUTCOME=Pass
-    ORCH_SSH_REASON=NonInteractiveDriverCompleted
+    if ((ssh_attempt == 1)); then
+      ORCH_SSH_REASON=NonInteractiveDriverCompleted
+    else
+      ORCH_SSH_REASON=NonInteractiveDriverCompletedAfterSshSessionRetry
+    fi
   else
     ORCH_SSH_OUTCOME=Fail
-    ORCH_SSH_REASON=NamespaceSshDriverFailed
-    orchestrator_fail "$ssh_rc" NamespaceSshDriverFailed 'nsc ssh -T driver leg failed'
+    if [[ $ssh_ready == true &&
+      ( $ssh_aggregate_exhausted == true || $ssh_rc =~ ^(124|137)$ ) ]]; then
+      ORCH_SSH_REASON=NamespaceSshDriverTimedOut
+      orchestrator_fail "$ssh_rc" NamespaceSshDriverTimedOut \
+        'the marked nsc SSH driver exhausted its aggregate lane deadline'
+    elif [[ $ssh_ready != true &&
+      ( $ssh_aggregate_exhausted == true || $ssh_rc =~ ^(124|137)$ ) ]]; then
+      ORCH_SSH_REASON=NamespaceSshSessionStartTimedOut
+      orchestrator_fail "$ssh_rc" NamespaceSshSessionStartTimedOut \
+        'the exact cluster_id emitted no fixed ready marker across bounded session retries'
+    elif ((ssh_rc == 0)); then
+      ORCH_SSH_REASON=NamespaceSshSessionStartUnproven
+      orchestrator_fail "$DIENE_REASON_EXIT" NamespaceSshSessionStartUnproven \
+        'nsc SSH exited zero without the fixed first-line ready marker'
+    else
+      ORCH_SSH_REASON=NamespaceSshDriverFailed
+      orchestrator_fail "$ssh_rc" NamespaceSshDriverFailed 'nsc ssh -T -- driver leg failed'
+    fi
   fi
 
   local collection_started=$SECONDS collection_rc=0

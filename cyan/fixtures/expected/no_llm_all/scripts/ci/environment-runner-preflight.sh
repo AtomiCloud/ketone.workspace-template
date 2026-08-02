@@ -85,6 +85,17 @@ guest_nix_environment_digest=$(jq -er '.environmentDigest' <<<"$guest_nix") ||
     'guest Nix identity omitted the sanitized environment evidence digest'
 diene_require_digest guest-nix-environment-digest "$guest_nix_environment_digest"
 
+# Stage 0 recorded the offline install and its absolute-path proofs before any
+# archive validation. Re-prove the same system binaries here from inside the
+# Nix dev shell; bare PATH lookups would measure the dev shell, not the guest.
+guest_toolchain_evidence=$(diene_guest_toolchain_evidence_dir) || exit $?
+guest_toolchain=$(diene_guest_toolchain_identity "${DIENE_GUEST_TOOLCHAIN_INPUT:?}" \
+  "$guest_toolchain_evidence") || exit $?
+guest_toolchain_contract_digest=$(jq -er '.contractDigest' <<<"$guest_toolchain") ||
+  diene_die GuestToolchainIdentityUnexpected \
+    'guest toolchain identity omitted the fixed contract digest'
+diene_require_digest guest-toolchain-contract-digest "$guest_toolchain_contract_digest"
+
 nodes=$($kubectl_bin get nodes -o json)
 jq -e '
   (.items | length) == 1 and
@@ -133,7 +144,8 @@ jq -n \
   --arg cpu "$cpu" --arg memory "$memory" --arg iptablesVersion "$iptables_version" \
   --argjson nodeCount "$node_count" --argjson podCidrs "$pod_cidrs" \
   --argjson serviceCidrs "$service_cidrs" --argjson ipv6Disabled "$ipv6_disabled" \
-  --argjson cacheAttached "$DIENE_CACHE_ATTACHED" --argjson guestNix "$guest_nix" '
+  --argjson cacheAttached "$DIENE_CACHE_ATTACHED" --argjson guestNix "$guest_nix" \
+  --argjson guestToolchain "$guest_toolchain" '
   {outcome:"Pass",reasonCode:"NamespaceWolfiBuiltInK3sReady",
    clusterId:$clusterId,identitySource:"cidfile-metadata-exact-id-ssh",
    os:{id:$osId,version:$osVersion,uid:0},
@@ -144,10 +156,13 @@ jq -n \
    storage:{defaultClass:"local-path"},
    policyBackend:{mechanism:"iptables",backend:"nf_tables",version:$iptablesVersion},
    guestNix:$guestNix,
+   guestToolchain:$guestToolchain,
    cacheAttached:$cacheAttached,
    platformStatus:"platform per-instance policy pending (support ask #4)"}' |
   diene_write_json "$output"
 
 diene_require_guest_nix_preflight_agreement "$output" "$guest_nix_evidence/identity.json"
+diene_require_guest_toolchain_preflight_agreement \
+  "$output" "$guest_toolchain_evidence/identity.json"
 
 printf 'NamespaceInstanceReady: %s\n' "$DIENE_NSC_CLUSTER_ID"

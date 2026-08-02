@@ -24,6 +24,23 @@ DIENE_GUEST_NIX_PROFILE=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.s
 DIENE_GUEST_NIX_BIN=/nix/var/nix/profiles/default/bin/nix
 DIENE_GUEST_NIX_STORE_ROOT=/nix/store
 DIENE_GUEST_NIX_INSTALLED_COPY=/nix/nix-installer
+DIENE_GUEST_TOOLCHAIN_EXECUTION_MODE=offline-pinned-apk
+DIENE_GUEST_TOOLCHAIN_APK_BIN=/usr/bin/apk
+DIENE_GUEST_TOOLCHAIN_DIR=/run/diene-ci/gnu
+DIENE_GUEST_TOOLCHAIN_REPO_BASE=https://apk.cgr.dev/chainguard/x86_64
+DIENE_GUEST_TOOLCHAIN_ARCH=x86_64
+DIENE_GUEST_TOOLCHAIN_RULED_SET='coreutils findutils sed grep gawk'
+DIENE_GUEST_TOOLCHAIN_CLOSURE_SET='libacl1 libattr1 libpcre2-8-0 libsepol libselinux coreutils findutils gawk grep sed'
+DIENE_GUEST_TOOLCHAIN_PACKAGES='libacl1|2.4.0-r1|34550|sha256:061726fa4e99053cdf848613d34361f1f983cddb71dbc2928268c2cbc215756f
+libattr1|2.6.0-r1|19401|sha256:5890faac103dcbb230b6a9c7e8ece1bbf9f7b622b5b7a3b2fb88cbe163a0a70a
+libpcre2-8-0|10.47-r0|307247|sha256:579084d2b3f53f6f7224f5eb0e050fbbd01e7a535bdf50551cf51eb74e29b8aa
+libsepol|3.11-r0|459575|sha256:d8ff742c93586933f063b2cec5208fd143681f79cff1ba617d39de04e822d5e2
+libselinux|3.11-r0|332224|sha256:6a03897e1a50cfea06e8575c532591e0e39b8f966797ca2532d08c165aab1606
+coreutils|9.11-r3|859851|sha256:8c4fa14bd0f057ab22e7089a842b7f57a15acf34ec4c63488660c0e05fac22a7
+findutils|4.11.0-r1|222062|sha256:28c342bc2d3bf10b23e6de8544bdcb16fe0d7387ffc57d89391716df051cea88
+gawk|5.4.1-r0|1093813|sha256:2b2d4389aa720ce3baf6d8889fc2589d207828318e55552ba6469c822b6ed392
+grep|3.12-r6|285444|sha256:61d6f87d5968a4b56af721d44328485ed01909b39c260a0729fd4b72ff08ab70
+sed|4.10-r1|341772|sha256:64f97fb24d76be3d835114b93ef77385c82a8f3b432a775ed72394e86171f28c'
 
 diene_die() {
   local code=${1:?reason code required}
@@ -143,34 +160,132 @@ diene_guest_nix_contract() {
      installedCopyPath:$installedCopyPath}'
 }
 
+# Emit the one canonical schema-free Wolfi GNU bootstrap contract. The ruled
+# package set and its measured dependency closure are separate fixed allowlists:
+# neither a missing transitive package nor an extra package can silently widen
+# the offline install. Package objects are name-sorted before serialization,
+# while argv retains the reviewed dependency-first install order.
+diene_guest_toolchain_contract() {
+  local execution_mode=$DIENE_GUEST_TOOLCHAIN_EXECUTION_MODE
+  local apk_bin=$DIENE_GUEST_TOOLCHAIN_APK_BIN package_dir=$DIENE_GUEST_TOOLCHAIN_DIR
+  local repo_base=$DIENE_GUEST_TOOLCHAIN_REPO_BASE architecture=$DIENE_GUEST_TOOLCHAIN_ARCH
+  local ruled_set=$DIENE_GUEST_TOOLCHAIN_RULED_SET closure_set=$DIENE_GUEST_TOOLCHAIN_CLOSURE_SET
+  local expected_ruled='coreutils findutils sed grep gawk'
+  local expected_closure='libacl1 libattr1 libpcre2-8-0 libsepol libselinux coreutils findutils gawk grep sed'
+  local packages='[]' argv_paths='[]' seen=' ' count=0
+  local name version bytes digest extra filename path sidecar_filename sidecar_path package required
+  local LC_ALL=C
+
+  [[ $execution_mode == offline-pinned-apk && $apk_bin == /usr/bin/apk &&
+    $package_dir == /run/diene-ci/gnu &&
+    $repo_base == https://apk.cgr.dev/chainguard/x86_64 &&
+    $architecture == x86_64 ]] ||
+    diene_die InputContractInvalid 'guest toolchain fixed execution, path, repository, or architecture changed'
+  [[ $ruled_set == "$expected_ruled" && $closure_set == "$expected_closure" ]] ||
+    diene_die InputContractInvalid 'guest toolchain ruled or closure allowlist changed'
+
+  while IFS='|' read -r name version bytes digest extra; do
+    [[ -n $name && -n $version && -n $bytes && -n $digest && -z ${extra:-} ]] ||
+      diene_die InputContractInvalid 'guest toolchain package row is malformed'
+    case " $expected_closure " in
+      *" $name "*) ;;
+      *) diene_die InputContractInvalid "guest toolchain package $name is outside the fixed closure" ;;
+    esac
+    [[ $name =~ ^[a-z0-9][a-z0-9-]*$ &&
+      $version =~ ^[0-9][0-9A-Za-z._+-]*-r[0-9]+$ &&
+      $bytes =~ ^[1-9][0-9]*$ ]] ||
+      diene_die InputContractInvalid "guest toolchain package row for $name is malformed"
+    diene_require_digest "guest-toolchain-$name-digest" "$digest"
+    case $seen in
+      *" $name "*) diene_die InputContractInvalid "guest toolchain package $name is duplicated" ;;
+    esac
+    seen+="$name "
+    count=$((count + 1))
+    filename="$name-$version.apk"
+    path="$package_dir/$filename"
+    sidecar_filename="$filename.sha256"
+    sidecar_path="$package_dir/$sidecar_filename"
+    package=$(jq -cn --arg name "$name" --arg version "$version" --argjson bytes "$bytes" \
+      --arg digest "$digest" --arg filename "$filename" --arg path "$path" \
+      --arg sidecarFilename "$sidecar_filename" --arg sidecarPath "$sidecar_path" \
+      '{name:$name,version:$version,bytes:$bytes,digest:$digest,filename:$filename,path:$path,
+        sidecarFilename:$sidecarFilename,sidecarPath:$sidecarPath}')
+    packages=$(jq -cn --argjson old "$packages" --argjson package "$package" '$old + [$package]')
+    argv_paths=$(jq -cn --argjson old "$argv_paths" --arg path "$path" '$old + [$path]')
+  done <<<"$DIENE_GUEST_TOOLCHAIN_PACKAGES"
+
+  [[ $count == 10 ]] ||
+    diene_die InputContractInvalid 'guest toolchain closure must contain exactly ten packages'
+  for required in $expected_closure; do
+    case $seen in
+      *" $required "*) ;;
+      *) diene_die InputContractInvalid "guest toolchain closure is missing $required" ;;
+    esac
+  done
+  packages=$(jq -cS 'sort_by(.name)' <<<"$packages")
+
+  jq -cn --arg executionMode "$execution_mode" --arg apkBinPath "$apk_bin" \
+    --arg packageDir "$package_dir" --arg repositoryBase "$repo_base" \
+    --arg architecture "$architecture" --arg ruledSet "$ruled_set" \
+    --arg closureSet "$closure_set" --argjson packages "$packages" \
+    --argjson argvPaths "$argv_paths" '
+    {executionMode:$executionMode,apkBinPath:$apkBinPath,packageDir:$packageDir,
+     repositoryBase:$repositoryBase,architecture:$architecture,
+     ruledPackages:($ruledSet | split(" ")),closurePackages:($closureSet | split(" ")),
+     packages:$packages,
+     argv:(["add","--no-progress","--no-network","--allow-untrusted"] + $argvPaths)}'
+}
+
+diene_guest_toolchain_contract_digest() {
+  local contract
+  contract=$(diene_guest_toolchain_contract) || return $?
+  diene_sha256_text "$(jq -cS . <<<"$contract")"
+}
+
 # Resolve the reviewed production downloader to its immutable Nix-store
 # executable. Tests may redefine this function only inside their isolated
 # scratch copy; no inherited path-valued override is an accepted seam.
 diene_pinned_downloader() {
+  local untrusted_code=${1:-GuestNixInstallerUntrusted}
+  local artifact_label=${2:-guest Nix}
   local candidate resolved
   candidate=$(command -v curl) ||
-    diene_die DependencyUnavailable 'curl is required for pinned guest Nix acquisition'
+    diene_die DependencyUnavailable "curl is required for pinned $artifact_label acquisition"
   resolved=$(readlink -f -- "$candidate") ||
-    diene_die GuestNixInstallerUntrusted 'the reviewed curl executable could not be resolved'
+    diene_die "$untrusted_code" 'the reviewed curl executable could not be resolved'
   [[ $resolved == /nix/store/*/bin/curl && -f $resolved && -x $resolved ]] ||
-    diene_die GuestNixInstallerUntrusted \
+    diene_die "$untrusted_code" \
       'the reviewed curl executable is not an immutable Nix-store binary'
   printf '%s\n' "$resolved"
 }
 
 # Acquire one immutable artifact without publishing partial or unverified
-# bytes. --location with a zero redirect budget makes every 3xx a refusal.
+# bytes. The default redirect budget remains zero. Wolfi package URLs alone
+# receive an explicit budget of one because the immutable endpoint responds
+# with one HTTPS 303 to an expiring object URL; exact length and digest pins
+# remain the content authority, and --proto-redir forbids downgrade.
 diene_fetch_pinned_artifact() {
   local url=${1:?artifact URL required} digest=${2:?artifact digest required}
   local expected_bytes=${3:?artifact byte length required} target=${4:?artifact target required}
+  local max_redirs=${5:-0}
   local curl_bin target_dir tmp actual_bytes actual_digest
+  local untrusted_code=GuestNixInstallerUntrusted artifact_label='guest Nix'
+  if [[ $max_redirs == 1 ]]; then
+    untrusted_code=GuestToolchainUntrusted
+    artifact_label='guest toolchain'
+  fi
   [[ ${DIENE_CURL_BIN+x} != x ]] ||
-    diene_die GuestNixInstallerUntrusted \
-      'an ambient guest Nix downloader override is prohibited'
-  curl_bin=$(diene_pinned_downloader) || return $?
-  diene_require_digest guest-nix-artifact-digest "$digest"
-  [[ $url == https://* && $expected_bytes =~ ^[1-9][0-9]*$ ]] ||
-    diene_die InputContractInvalid 'guest Nix artifact acquisition inputs are invalid'
+    diene_die "$untrusted_code" \
+      "an ambient $artifact_label downloader override is prohibited"
+  curl_bin=$(diene_pinned_downloader "$untrusted_code" "$artifact_label") || return $?
+  diene_require_digest "$artifact_label-artifact-digest" "$digest"
+  [[ $url == https://* && $expected_bytes =~ ^[1-9][0-9]*$ && $max_redirs =~ ^[01]$ ]] ||
+    diene_die InputContractInvalid "$artifact_label artifact acquisition inputs are invalid"
+  if [[ $max_redirs == 1 &&
+    $url != "$DIENE_GUEST_TOOLCHAIN_REPO_BASE/"*.apk ]]; then
+    diene_die InputContractInvalid \
+      'one redirect is permitted only for the digest-pinned Wolfi package artifact class'
+  fi
   diene_require_command "$curl_bin"
   diene_require_command ln
   diene_require_command mktemp
@@ -178,44 +293,43 @@ diene_fetch_pinned_artifact() {
   diene_require_command wc
   target_dir=$(dirname -- "$target")
   [[ -d $target_dir && ! -L $target_dir ]] ||
-    diene_die GuestNixInstallerUntrusted \
-      'guest Nix publication directory is absent, linked, or not a real directory'
+    diene_die "$untrusted_code" \
+      "$artifact_label publication directory is absent, linked, or not a real directory"
   [[ ! -e $target && ! -L $target ]] ||
-    diene_die GuestNixInstallerUntrusted \
-      'guest Nix publication target is not fresh'
+    diene_die "$untrusted_code" "$artifact_label publication target is not fresh"
   tmp=$(mktemp "$target.tmp.XXXXXX") ||
-    diene_die GuestNixInstallerUntrusted 'private guest Nix artifact temporary file could not be created'
+    diene_die "$untrusted_code" "private $artifact_label artifact temporary file could not be created"
   chmod 0600 "$tmp" || {
     rm -f -- "$tmp"
-    diene_die GuestNixInstallerUntrusted 'guest Nix artifact temporary file could not be sealed'
+    diene_die "$untrusted_code" "$artifact_label artifact temporary file could not be sealed"
   }
   if ! "$curl_bin" --fail --show-error --silent --proto '=https' --proto-redir '=https' --tlsv1.2 \
-    --location --max-redirs 0 --max-time 120 --retry 0 --output "$tmp" "$url"; then
+    --location --max-redirs "$max_redirs" --max-time 120 --retry 0 --output "$tmp" "$url"; then
     rm -f -- "$tmp"
-    diene_die GuestNixInstallerUntrusted 'guest Nix pinned HTTPS acquisition failed or redirected'
+    diene_die "$untrusted_code" "$artifact_label pinned HTTPS acquisition failed or redirected"
   fi
   actual_bytes=$(wc -c <"$tmp")
   if [[ $actual_bytes != "$expected_bytes" ]]; then
     rm -f -- "$tmp"
-    diene_die GuestNixInstallerUntrusted 'guest Nix artifact byte length does not match the pin'
+    diene_die "$untrusted_code" "$artifact_label artifact byte length does not match the pin"
   fi
   actual_digest=$(diene_file_digest "$tmp")
   if [[ $actual_digest != "$digest" ]]; then
     rm -f -- "$tmp"
-    diene_die GuestNixInstallerUntrusted 'guest Nix artifact digest does not match the pin'
+    diene_die "$untrusted_code" "$artifact_label artifact digest does not match the pin"
   fi
   # A same-directory hard-link publication is atomic and, unlike a replacing
   # rename, fails if a regular or symlink target appears before publication.
   if ! chmod 0600 "$tmp" || ! ln -- "$tmp" "$target"; then
     rm -f -- "$tmp"
-    diene_die GuestNixInstallerUntrusted 'verified guest Nix artifact could not be atomically published'
+    diene_die "$untrusted_code" "verified $artifact_label artifact could not be atomically published"
   fi
   if ! rm -f -- "$tmp"; then
     rm -f -- "$target" "$tmp"
-    diene_die GuestNixInstallerUntrusted 'guest Nix publication temporary link could not be removed'
+    diene_die "$untrusted_code" "$artifact_label publication temporary link could not be removed"
   fi
   [[ -f $target && ! -L $target && $(stat -c %a -- "$target") == 600 ]] ||
-    diene_die GuestNixInstallerUntrusted 'published guest Nix artifact is not a private regular file'
+    diene_die "$untrusted_code" "published $artifact_label artifact is not a private regular file"
 }
 
 diene_guest_nix_evidence_dir() {
@@ -415,6 +529,249 @@ diene_require_guest_nix_preflight_agreement() {
   ' "$preflight" >/dev/null ||
     diene_die GuestNixIdentityUnexpected \
       'guest Nix identity receipt and preflight evidence do not agree exactly'
+}
+
+diene_guest_toolchain_evidence_dir() {
+  local staging=${DIENE_EVIDENCE_STAGING:-} dir
+  [[ $staging == /* && -d $staging && ! -L $staging && ${staging##*/} == staging ]] ||
+    diene_die GuestToolchainIdentityUnexpected \
+      'guest toolchain identity requires an absolute driver-owned evidence staging directory'
+  dir="${staging%/staging}/gnu-toolchain"
+  [[ ! -L $dir ]] ||
+    diene_die GuestToolchainIdentityUnexpected 'guest toolchain evidence directory is a symlink'
+  install -d -m 0700 "$dir" ||
+    diene_die GuestToolchainIdentityUnexpected 'guest toolchain evidence directory could not be created'
+  [[ -d $dir && ! -L $dir ]] ||
+    diene_die GuestToolchainIdentityUnexpected \
+      'guest toolchain evidence directory is not a real directory'
+  printf '%s\n' "$dir"
+}
+
+# Independently re-prove the system toolchain through literal /usr/bin paths.
+# An optional test root prefixes those paths without changing the admitted
+# production contract or the logical paths recorded in evidence.
+diene_guest_toolchain_identity() {
+  local input=${1:?driver inputs required}
+  local evidence_dir=${2:?guest toolchain evidence directory required}
+  local test_root=${3:-}
+  local contract contract_digest root_path readlink_bin grep_bin sha256_bin sed_bin tar_bin
+  local name binary logical_expected token binary_path resolved logical_resolved stdout_file stderr_file
+  local pins_file install_log stage_identity expected_pins expected_identity identity_lines=''
+  local scratch sha_stdout sha_stderr sed_stdout sed_stderr tar_stdout tar_stderr
+  local tar_resolved tar_listing tar_types tar_type identity receipt receipt_digest
+  local pins_digest install_log_digest stage_identity_digest
+  local LC_ALL=C
+
+  contract=$(diene_guest_toolchain_contract) || exit $?
+  contract_digest=$(diene_guest_toolchain_contract_digest) || exit $?
+  jq -e --argjson contract "$contract" '.guestToolchain == $contract' "$input" >/dev/null ||
+    diene_die GuestToolchainIdentityUnexpected \
+      'admitted guest toolchain contract differs from the fixed contract'
+  if [[ -n $test_root ]]; then
+    [[ $test_root == /* && -d $test_root && ! -L $test_root ]] ||
+      diene_die InputContractInvalid 'the fake guest toolchain root is not a safe absolute directory'
+    root_path=${test_root%/}
+  else
+    root_path=
+  fi
+  [[ -d $evidence_dir && ! -L $evidence_dir ]] ||
+    diene_die GuestToolchainIdentityUnexpected 'guest toolchain evidence directory is unavailable'
+
+  pins_file="$evidence_dir/pins.txt"
+  install_log="$evidence_dir/install.log"
+  stage_identity="$evidence_dir/identity.txt"
+  for binary_path in "$pins_file" "$install_log" "$stage_identity"; do
+    [[ -f $binary_path && ! -L $binary_path && $(stat -c %a -- "$binary_path") == 600 ]] ||
+      diene_die GuestToolchainIdentityUnexpected \
+        'guest toolchain stage evidence is absent, linked, or not mode 0600'
+  done
+  expected_pins="executionMode=$DIENE_GUEST_TOOLCHAIN_EXECUTION_MODE"
+  while IFS='|' read -r name binary logical_expected token; do
+    expected_pins="$expected_pins
+$name $binary $logical_expected $token"
+  done <<<"$DIENE_GUEST_TOOLCHAIN_PACKAGES"
+  [[ $(wc -l <"$pins_file") == 11 && $(wc -c <"$pins_file") == $((${#expected_pins} + 1)) &&
+    $(cat "$pins_file") == "$expected_pins" ]] ||
+    diene_die GuestToolchainIdentityUnexpected \
+      'guest toolchain pin evidence differs from the admitted fixed closure'
+
+  readlink_bin="$root_path/usr/bin/readlink"
+  grep_bin="$root_path/usr/bin/grep"
+  sha256_bin="$root_path/usr/bin/sha256sum"
+  sed_bin="$root_path/usr/bin/sed"
+  tar_bin="$root_path/usr/bin/tar"
+  for binary_path in "$readlink_bin" "$grep_bin" "$sha256_bin" "$sed_bin" "$tar_bin"; do
+    [[ -x $binary_path ]] ||
+      diene_die GuestToolchainIdentityUnexpected \
+        'a required absolute-path guest toolchain proof binary is absent or not executable'
+  done
+
+  while IFS='|' read -r name binary logical_expected token; do
+    token="$token "
+    binary_path="$root_path$binary"
+    [[ -x $binary_path ]] ||
+      diene_die GuestToolchainIdentityUnexpected \
+        "the absolute-path guest toolchain binary $binary is absent or not executable"
+    resolved=$($readlink_bin -f -- "$binary_path" 2>/dev/null) ||
+      diene_die GuestToolchainIdentityUnexpected \
+        "the absolute-path guest toolchain binary $binary cannot be resolved"
+    [[ $resolved == "$root_path$logical_expected" && $resolved != */busybox ]] ||
+      diene_die GuestToolchainIdentityUnexpected \
+        "the absolute-path guest toolchain binary $binary resolved unexpectedly"
+    logical_resolved=${resolved#"$root_path"}
+    stdout_file="$evidence_dir/$name-version.txt"
+    stderr_file="$evidence_dir/$name-version.stderr"
+    : >"$stdout_file"
+    : >"$stderr_file"
+    chmod 0600 "$stdout_file" "$stderr_file"
+    if ! "$binary_path" --version >"$stdout_file" 2>"$stderr_file"; then
+      diene_die GuestToolchainIdentityUnexpected \
+        "the absolute-path guest toolchain identity probe for $name failed"
+    fi
+    if [[ -s $stderr_file ]] || ! "$grep_bin" -Fq -- "$token" "$stdout_file"; then
+      diene_die GuestToolchainIdentityUnexpected \
+        "the absolute-path guest toolchain identity for $name lacks its fixed GNU token"
+    fi
+    identity_lines="$identity_lines$name|$binary|$logical_resolved|$token
+"
+  done <<'GUEST_TOOLCHAIN_IDENTITIES'
+sed|/usr/bin/sed|/usr/bin/sed|(GNU sed)
+grep|/usr/bin/grep|/usr/bin/grep|(GNU grep)
+awk|/usr/bin/awk|/usr/bin/gawk|GNU Awk
+find|/usr/bin/find|/usr/bin/find|(GNU findutils)
+xargs|/usr/bin/xargs|/usr/bin/xargs|(GNU findutils)
+sha256sum|/usr/bin/sha256sum|/usr/bin/coreutils|(GNU coreutils)
+stat|/usr/bin/stat|/usr/bin/coreutils|(GNU coreutils)
+cut|/usr/bin/cut|/usr/bin/coreutils|(GNU coreutils)
+sort|/usr/bin/sort|/usr/bin/coreutils|(GNU coreutils)
+head|/usr/bin/head|/usr/bin/coreutils|(GNU coreutils)
+wc|/usr/bin/wc|/usr/bin/coreutils|(GNU coreutils)
+date|/usr/bin/date|/usr/bin/coreutils|(GNU coreutils)
+tr|/usr/bin/tr|/usr/bin/coreutils|(GNU coreutils)
+cat|/usr/bin/cat|/usr/bin/coreutils|(GNU coreutils)
+install|/usr/bin/install|/usr/bin/coreutils|(GNU coreutils)
+readlink|/usr/bin/readlink|/usr/bin/coreutils|(GNU coreutils)
+id|/usr/bin/id|/usr/bin/coreutils|(GNU coreutils)
+mktemp|/usr/bin/mktemp|/usr/bin/coreutils|(GNU coreutils)
+chmod|/usr/bin/chmod|/usr/bin/coreutils|(GNU coreutils)
+rm|/usr/bin/rm|/usr/bin/coreutils|(GNU coreutils)
+uname|/usr/bin/uname|/usr/bin/coreutils|(GNU coreutils)
+GUEST_TOOLCHAIN_IDENTITIES
+
+  scratch=$(mktemp -d "$evidence_dir/.identity-proof.XXXXXX") ||
+    diene_die GuestToolchainIdentityUnexpected 'guest toolchain behavior scratch directory cannot be created'
+  chmod 0700 "$scratch"
+  printf '%s\n' diene-gnu-toolchain >"$scratch/known.txt"
+  printf '%s  %s\n' c28908b77b6613d7f8595ab582fa4bbf7042b8fbb163625ab3522f79a8dc88a9 known.txt \
+    >"$scratch/known.sha256"
+  sha_stdout="$scratch/sha256.stdout"
+  sha_stderr="$scratch/sha256.stderr"
+  if ! (cd "$scratch" && "$sha256_bin" --check known.sha256 >"$sha_stdout" 2>"$sha_stderr") ||
+    [[ -s $sha_stderr ]] || ! "$grep_bin" -Fxq -- 'known.txt: OK' "$sha_stdout"; then
+    rm -rf -- "$scratch"
+    diene_die GuestToolchainIdentityUnexpected \
+      'GNU sha256sum --check did not verify the fixed known-byte behavior probe'
+  fi
+  printf '%s\n' a >"$scratch/sed.txt"
+  sed_stdout="$scratch/sed.stdout"
+  sed_stderr="$scratch/sed.stderr"
+  if ! "$sed_bin" -i 's/a/b/' "$scratch/sed.txt" >"$sed_stdout" 2>"$sed_stderr" ||
+    [[ -s $sed_stdout || -s $sed_stderr ]] || ! "$grep_bin" -Fxq -- b "$scratch/sed.txt"; then
+    rm -rf -- "$scratch"
+    diene_die GuestToolchainIdentityUnexpected \
+      'GNU sed -i did not perform the fixed in-place behavior probe'
+  fi
+
+  tar_resolved=$($readlink_bin -f -- "$tar_bin" 2>/dev/null) || {
+    rm -rf -- "$scratch"
+    diene_die GuestToolchainTarUnexpected 'the absolute-path guest tar cannot be resolved'
+  }
+  [[ $tar_resolved == "$root_path/usr/bin/busybox" ]] || {
+    rm -rf -- "$scratch"
+    diene_die GuestToolchainTarUnexpected 'the guest tar implementation is not the fixed BusyBox binary'
+  }
+  install -d -m 0700 "$scratch/tar-source" "$scratch/tar-output"
+  printf '%s\n' portable >"$scratch/tar-source/member"
+  tar_stdout="$scratch/tar.stdout"
+  tar_stderr="$scratch/tar.stderr"
+  : >"$tar_stdout"
+  : >"$tar_stderr"
+  if ! "$tar_bin" -cf "$scratch/probe.tar" -C "$scratch/tar-source" member \
+      >>"$tar_stdout" 2>>"$tar_stderr" ||
+    ! tar_listing=$("$tar_bin" -tf "$scratch/probe.tar" 2>>"$tar_stderr") ||
+    ! tar_types=$("$tar_bin" -tvf "$scratch/probe.tar" 2>>"$tar_stderr") ||
+    ! "$tar_bin" -xf "$scratch/probe.tar" -C "$scratch/tar-output" \
+      >>"$tar_stdout" 2>>"$tar_stderr" || [[ -s $tar_stderr ]] ||
+    [[ $tar_listing != member || ! -f $scratch/tar-output/member ]] ||
+    ! "$grep_bin" -Fxq -- portable "$scratch/tar-output/member"; then
+    rm -rf -- "$scratch"
+    diene_die GuestToolchainTarUnexpected \
+      'the BusyBox tar portable -cf/-tf/-tvf/-xf/-C/-f behavior probe failed'
+  fi
+  tar_type=${tar_types:0:1}
+  [[ $tar_type == - ]] || {
+    rm -rf -- "$scratch"
+    diene_die GuestToolchainTarUnexpected \
+      'the BusyBox tar verbose listing did not identify a regular member with a dash'
+  }
+  rm -rf -- "$scratch"
+  identity_lines="${identity_lines}behaviorSha256sumCheck=pass
+behaviorSedInPlace=pass
+tarImplementation=busybox
+tarResolvedPath=/usr/bin/busybox
+tarPortableFlags=-cf,-tf,-tvf,-xf,-C,-f
+tarTypeCharacter=-"
+  expected_identity=$identity_lines
+  [[ $(wc -c <"$stage_identity") == $((${#expected_identity} + 1)) &&
+    $(cat "$stage_identity") == "$expected_identity" ]] ||
+    diene_die GuestToolchainIdentityUnexpected \
+      'stage-0 guest toolchain identity evidence disagrees with the independent proof'
+
+  pins_digest=$(diene_file_digest "$pins_file")
+  install_log_digest=$(diene_file_digest "$install_log")
+  stage_identity_digest=$(diene_file_digest "$stage_identity")
+  identity=$(jq -Scn --argjson contract "$contract" --arg contractDigest "$contract_digest" \
+    --arg pinsDigest "$pins_digest" --arg installLogDigest "$install_log_digest" \
+    --arg stageIdentityDigest "$stage_identity_digest" '
+    $contract + {contractDigest:$contractDigest,absolutePathIdentity:true,
+      sha256sumCheckBehavior:true,sedInPlaceBehavior:true,tarImplementation:"busybox",
+      tarResolvedPath:"/usr/bin/busybox",tarPortableFlags:["-cf","-tf","-tvf","-xf","-C","-f"],
+      tarTypeCharacter:"-",pinsDigest:$pinsDigest,installLogDigest:$installLogDigest,
+      stageIdentityDigest:$stageIdentityDigest}')
+  receipt="$evidence_dir/identity.json"
+  printf '%s\n' "$identity" | diene_write_json "$receipt"
+  receipt_digest=$(diene_file_digest "$receipt")
+  jq -c --arg digest "$receipt_digest" '. + {identityReceiptDigest:$digest}' "$receipt"
+}
+
+diene_require_guest_toolchain_preflight_agreement() {
+  local preflight=${1:?preflight evidence required} receipt=${2:?identity receipt required}
+  local receipt_digest pins install_log stage_identity evidence
+  [[ -f $preflight && ! -L $preflight && -f $receipt && ! -L $receipt ]] ||
+    diene_die GuestToolchainIdentityUnexpected \
+      'guest toolchain preflight or identity receipt is absent'
+  pins="$(dirname -- "$receipt")/pins.txt"
+  install_log="$(dirname -- "$receipt")/install.log"
+  stage_identity="$(dirname -- "$receipt")/identity.txt"
+  for evidence in "$pins" "$install_log" "$stage_identity"; do
+    [[ -f $evidence && ! -L $evidence && $(stat -c %a -- "$evidence") == 600 ]] ||
+      diene_die GuestToolchainIdentityUnexpected \
+        'guest toolchain bound stage evidence is absent, linked, or not mode 0600'
+  done
+  receipt_digest=$(diene_file_digest "$receipt")
+  jq -e --arg digest "$receipt_digest" \
+    --arg pinsDigest "$(diene_file_digest "$pins")" \
+    --arg installLogDigest "$(diene_file_digest "$install_log")" \
+    --arg stageIdentityDigest "$(diene_file_digest "$stage_identity")" \
+    --slurpfile identity "$receipt" '
+    (.guestToolchain | del(.identityReceiptDigest)) == $identity[0] and
+    .guestToolchain.identityReceiptDigest == $digest and
+    $identity[0].pinsDigest == $pinsDigest and
+    $identity[0].installLogDigest == $installLogDigest and
+    $identity[0].stageIdentityDigest == $stageIdentityDigest
+  ' "$preflight" >/dev/null ||
+    diene_die GuestToolchainIdentityUnexpected \
+      'guest toolchain identity receipt and preflight evidence do not agree exactly'
 }
 
 diene_archive_is_safe() {
@@ -1314,7 +1671,7 @@ diene_load_remote_inputs() {
   local state_dir=${1:?state directory required}
   [[ $state_dir == /run/diene-ci && ! -L $state_dir ]] ||
     diene_die InputContractInvalid 'driver state directory must be the fixed /run/diene-ci path'
-  local input="$state_dir/inputs.json" guest_nix_contract
+  local input="$state_dir/inputs.json" guest_nix_contract guest_toolchain_contract
   [[ -f $input && ! -L $input ]] || diene_die InputContractInvalid 'immutable driver inputs are absent'
   jq -e '
     .apiVersion == "diene.atomi.cloud/ci-driver-inputs/v1" and
@@ -1331,11 +1688,16 @@ diene_load_remote_inputs() {
     (.admittedServiceCidr | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$")) and
     (.egress.contractDigest | test("^sha256:[0-9a-f]{64}$")) and
     (.egress.canaryImage | test("@sha256:[0-9a-f]{64}$")) and
-    (.guestNix | type == "object")
+    (.guestNix | type == "object") and
+    (.guestToolchain | type == "object")
   ' "$input" >/dev/null || diene_die InputContractInvalid 'immutable driver input shape is invalid'
   guest_nix_contract=$(diene_guest_nix_contract) || exit $?
   jq -e --argjson contract "$guest_nix_contract" '.guestNix == $contract' "$input" >/dev/null ||
     diene_die InputContractInvalid 'immutable guest Nix input differs from the fixed pinned contract'
+  guest_toolchain_contract=$(diene_guest_toolchain_contract) || exit $?
+  jq -e --argjson contract "$guest_toolchain_contract" '.guestToolchain == $contract' "$input" >/dev/null ||
+    diene_die InputContractInvalid \
+      'immutable guest toolchain input differs from the fixed pinned contract'
 
   export GITHUB_REPOSITORY_ID GITHUB_REPOSITORY GITHUB_SHA GITHUB_RUN_ID GITHUB_RUN_ATTEMPT
   export DIENE_BASE_WORKFLOW_REF DIENE_LANE DIENE_GARDEN_LOCK_DIGEST DIENE_ARTIFACT_DIGEST
@@ -1352,6 +1714,7 @@ diene_load_remote_inputs() {
   export DIENE_K3S_SERVICE_CIDR
   export DIENE_VENDOR_CREDENTIAL_BROKER_BIN
   export DIENE_GUEST_NIX_INPUT DIENE_GUEST_NIX_INSTALLER_PATH DIENE_GUEST_NIX_PAYLOAD_PATH
+  export DIENE_GUEST_TOOLCHAIN_INPUT
 
   GITHUB_REPOSITORY_ID=$(jq -r '.owner.repositoryId' "$input")
   GITHUB_REPOSITORY=$(jq -r '.owner.repositoryKey' "$input")
@@ -1391,6 +1754,7 @@ diene_load_remote_inputs() {
   DIENE_EGRESS_CONTRACT="$state_dir/egress-contract.json"
   DIENE_ARTIFACT_SUBJECT="$state_dir/artifact-subject.json"
   DIENE_GUEST_NIX_INPUT=$input
+  DIENE_GUEST_TOOLCHAIN_INPUT=$input
   DIENE_GUEST_NIX_INSTALLER_PATH="$state_dir/guest-nix-bootstrap.sh"
   DIENE_GUEST_NIX_PAYLOAD_PATH="$state_dir/guest-nix-installer"
   export DIENE_ARTIFACT_SUBJECT
