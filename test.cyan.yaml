@@ -37,7 +37,7 @@ tests:
       - "! grep -qE '^  (test|build|clean):' Taskfile.yaml"
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
-      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r -n1 yq eval "." >/dev/null'
     deterministic_state: {}
 
   - name: base_llm
@@ -78,7 +78,7 @@ tests:
       - test "$(find .claude/skills -name SKILL.md | wc -l | tr -d ' ')" = "7"
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
-      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r -n1 yq eval "." >/dev/null'
     deterministic_state: {}
 
   - name: docker_only
@@ -121,7 +121,7 @@ tests:
       - test "$(find .claude/skills -name SKILL.md | wc -l | tr -d ' ')" = "8"
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
-      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r -n1 yq eval "." >/dev/null'
     deterministic_state: {}
 
   - name: no_llm_docker
@@ -162,7 +162,7 @@ tests:
       - grep -q 'reusable-docker' .github/workflows/ci.yaml
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
-      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r -n1 yq eval "." >/dev/null'
     deterministic_state: {}
 
   - name: helm_only
@@ -209,7 +209,7 @@ tests:
       - test "$(find .claude/skills -name SKILL.md | wc -l | tr -d ' ')" = "8"
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
-      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r -n1 yq eval "." >/dev/null'
     deterministic_state: {}
 
   - name: docker_helm
@@ -255,7 +255,7 @@ tests:
       - test "$(find .claude/skills -name SKILL.md | wc -l | tr -d ' ')" = "9"
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
-      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r -n1 yq eval "." >/dev/null'
     deterministic_state: {}
 
   - name: secret_only
@@ -295,12 +295,12 @@ tests:
       - test -f .claude/skills/infisical/SKILL.md
       - grep -F 'infisical run --env=dev -- ' docs/developer/standard/infisical.md
       - grep -q 'infisical' nix/env.nix
-      - 'ruby -ryaml -e ''doc=YAML.safe_load(File.read("Taskfile.yaml")); cmds=doc["tasks"]["setup"]["cmds"]; exit(cmds.is_a?(Array) && cmds.include?("./scripts/local/secrets.sh") && cmds.size > 1 ? 0 : 1)'''
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'test "$(yq eval ".tasks.setup.cmds | type" Taskfile.yaml)" = "!!seq" && test "$(yq eval ".tasks.setup.cmds | length" Taskfile.yaml)" -gt 1 && yq eval -e ".tasks.setup.cmds[] == \"./scripts/local/secrets.sh\"" Taskfile.yaml >/dev/null'
       - test "$(find .claude/skills -name SKILL.md | wc -l | tr -d ' ')" = "8"
       - '! grep -rxq '':'' nix/*.nix'
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
-      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r -n1 yq eval "." >/dev/null'
     deterministic_state: {}
 
   - name: all_features
@@ -353,7 +353,7 @@ tests:
       - '! grep -rxq '':'' nix/*.nix'
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
-      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r -n1 yq eval "." >/dev/null'
     deterministic_state: {}
 
   - name: no_llm_all
@@ -397,5 +397,5 @@ tests:
       - '! grep -rxq '':'' nix/*.nix'
       - test ! -f flake.nix
       - "! grep -rqE 'let__[a-zA-Z_]+__' ."
-      - ruby -ryaml -e 'Dir.glob("**/*.yaml").each { |f| YAML.safe_load(File.read(f)) }; Dir.glob("**/*.yml").each { |f| YAML.safe_load(File.read(f)) }'
+      - nix shell github:NixOS/nixpkgs/4382ed2b7a6839d4280a9b386db49cbc5907414d#yq-go -c sh -c 'find . -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r -n1 yq eval "." >/dev/null'
     deterministic_state: {}
