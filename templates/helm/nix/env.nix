@@ -13,8 +13,6 @@ with packages;
 
   lint = [
     infralint
-    kubeconform
-    kyverno
   ];
 
   releaser = [
