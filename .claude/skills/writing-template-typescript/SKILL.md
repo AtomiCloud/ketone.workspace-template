@@ -261,7 +261,7 @@ const name = await i.text('Project name', 'name');
   plugins: [...],
   resolvers: [
     {
-      resolver: 'username/resolver-name:1',
+      resolver: 'username/resolver-name@1',
       config: { /* resolver-specific config */ },
       files: ['**/*.json'],
     },
@@ -271,16 +271,20 @@ const name = await i.text('Project name', 'name');
 
 ## cyan.yaml Artifact Declaration
 
-Every processor, plugin, and resolver referenced in the Cyan return object must also be declared in `cyan.yaml`. Version pinning is supported with `:version` syntax:
+Every processor, plugin, and resolver referenced in the Cyan return object must also be declared in `cyan.yaml`. Version pinning uses the `@version` suffix — `owner/name@1`:
 
 ```yaml
-processors: [cyan/default]
-plugins: [username/plugin:1]
+processors: [cyan/default@2]
+plugins: [username/plugin@1]
 resolvers:
-  - resolver: username/resolver:1
+  - ref: username/resolver@1
     config: {}
     files: ['**/*.json']
 ```
+
+⚠ The separator is `@`, **never `:`**. `owner/name:1` passes validation and pins **nothing** — the
+colon becomes part of the artifact *name*, so the ref silently resolves as unpinned against an
+artifact called `name:1`. Versions are non-negative **integers** (`1`, `2`), not semver.
 
 The `processors` and `plugins` fields accept arrays of strings. The `resolvers` field accepts an array of objects because each resolver needs additional `config` and `files` configuration.
 ```
