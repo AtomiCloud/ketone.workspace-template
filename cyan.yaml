@@ -1,21 +1,21 @@
-username: atomi
+cyanprint: 4
+kind: template
+owner: atomi
 name: workspace
 description: AtomiCloud's default workspace scaffold
-project: https://github.com/AtomiCloud/ketone.workspace-template
-source: https://github.com/AtomiCloud/ketone.workspace-template
-email: ernest@atomi.cloud
-tags: ["atomi","workspace"]
 readme: README.MD
+entry: cyan/index.ts
+bundledEntry: cyan/index.ts
 templates:
-- template: atomi/nix
-  answers:
-    cyan/nix/basic: 'yes'
-    cyan/nix/llm: 'no'
+  atomi/nix:
+    answers:
+      cyan/nix/basic: 'yes'
+      cyan/nix/llm: 'no'
 processors:
 - cyan/default
 plugins: []
 resolvers:
-- resolver: atomi/json-yaml
+- ref: atomi/json-yaml@1
   config:
     arrayStrategy: concat
   files:
@@ -26,18 +26,18 @@ resolvers:
   - 'Taskfile.yaml'
   - '.coderabbit.yaml'
   - 'atomi_release.yaml'
-- resolver: atomi/md
+- ref: atomi/md@1
   config: {}
   files:
   - 'CLAUDE.md'
   - 'README.md'
   - '.envrc'
-- resolver: atomi/ignore
+- ref: atomi/ignore@2
   config: {}
   files:
   - '.gitignore'
   - '.dockerignore'
-- resolver: atomi/nix
+- ref: atomi/nix@2
   config: {}
   files:
   - 'nix/packages.nix'
@@ -45,19 +45,3 @@ resolvers:
   - 'nix/shells.nix'
   - 'nix/fmt.nix'
   - 'nix/pre-commit.nix'
-commands:
-- 'chmod +x scripts/ci/*.sh 2>/dev/null || true'
-build:
-  registry: ${DOMAIN:-docker.io}/${GITHUB_REPO_REF:-atomi}
-  platforms:
-  - linux/amd64
-  - linux/arm64
-  images:
-    template:
-      image: workspace
-      dockerfile: cyan/Dockerfile
-      context: ./cyan
-    blob:
-      image: 'workspace-blob'
-      dockerfile: cyan/blob.Dockerfile
-      context: .
