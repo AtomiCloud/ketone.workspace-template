@@ -12,7 +12,7 @@ templates:
       cyan/nix/basic: 'yes'
       cyan/nix/llm: 'no'
 processors:
-- cyan/default
+- cyan/default@2
 plugins: []
 resolvers:
 - ref: atomi/json-yaml@1
@@ -45,3 +45,12 @@ resolvers:
   - 'nix/shells.nix'
   - 'nix/fmt.nix'
   - 'nix/pre-commit.nix'
+# INTENTIONALLY INERT until the surfaces sync: `scripts/local/setup.sh` is the owner's
+# stated design target for atomi/sh and is carried by the diene workspace node, but it
+# does not exist in THIS repo's template payload yet. An unmatched glob is inert, so this
+# is declarative now and becomes behavioural exactly when the contest arrives.
+# See the PR body -- this is deliberate, not a stale claim.
+- ref: atomi/sh@1
+  config: {}
+  files:
+  - 'scripts/local/setup.sh'
