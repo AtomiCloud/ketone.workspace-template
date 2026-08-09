@@ -16,23 +16,29 @@ Read `cyan.yaml` to extract:
 
 ### cyan.yaml Dependency Format with Version Pinning
 
-When referencing processors, plugins, resolvers, or templates in `cyan.yaml`, use version pinning for reproducibility:
+When referencing processors, plugins, resolvers, or templates in `cyan.yaml`, use version pinning for reproducibility. The form is `owner/name@version`:
 
 ```yaml
 processors:
-  - name: cyan/default:1.0.0 # pinned version
-  - name: myorg/my-processor:1.2.3
+  - cyan/default@2 # pinned version
+  - myorg/my-processor@1
 
 plugins:
-  - name: myorg/my-plugin:2.0.0
+  - myorg/my-plugin@2
 
 resolvers:
-  - resolver: myorg/my-resolver:1.0.0
+  - ref: myorg/my-resolver@1
     config: {}
     files: ['**/*.json']
 ```
 
-Omit the version (`:version`) to use the latest version, but advise users that pinning versions ensures reproducible builds.
+⚠ The separator is `@`, **never `:`**. `owner/name:1` passes validation and pins **nothing** — the
+colon becomes part of the artifact *name*, so the ref silently resolves as unpinned against an
+artifact called `name:1`. Versions are non-negative **integers** (`1`, `2`), not semver, and
+`processors`/`plugins` are arrays of plain ref strings (no `name:` key).
+
+Omit the `@version` suffix to float to the latest version, but advise users that pinning ensures
+reproducible builds.
 
 Read the entry point code (`cyan/index.ts` or equivalent for other languages) to extract:
 
