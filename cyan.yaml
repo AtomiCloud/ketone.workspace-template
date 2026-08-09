@@ -15,7 +15,7 @@ processors:
 - cyan/default@2
 plugins: []
 resolvers:
-- ref: atomi/json-yaml@1
+- ref: atomi/json-yaml@2
   config:
     arrayStrategy: concat
   files:
@@ -26,7 +26,7 @@ resolvers:
   - 'Taskfile.yaml'
   - '.coderabbit.yaml'
   - 'atomi_release.yaml'
-- ref: atomi/md@1
+- ref: atomi/md@2
   config: {}
   files:
   - 'CLAUDE.md'
