@@ -11,6 +11,8 @@ with packages;
     gitlint
     go-task
     infralint
+    kubeconform
+    kyverno
     pre-commit
     sg
     shellcheck
