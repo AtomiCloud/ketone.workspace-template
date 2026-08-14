@@ -372,26 +372,40 @@ printf '%q ' "$@" >>"${FAKE_GUEST_NIX_CURL_LOG:?}"
 printf '\n' >>"$FAKE_GUEST_NIX_CURL_LOG"
 output=
 url=
+max_redirs=
 while (($#)); do
   case $1 in
     --output) output=${2:?}; shift 2 ;;
-    --proto | --proto-redir | --max-redirs | --max-time | --retry) shift 2 ;;
+    --max-redirs) max_redirs=${2:?}; shift 2 ;;
+    --proto | --proto-redir | --max-time | --retry) shift 2 ;;
     --fail | --show-error | --silent | --tlsv1.2 | --location) shift ;;
     https://*) url=$1; shift ;;
     *) exit 127 ;;
   esac
 done
-[[ -n $output && -n $url ]] || exit 127
+[[ -n $output && -n $url && -n $max_redirs ]] || exit 127
 scenario=${FAKE_GUEST_NIX_FETCH_SCENARIO:-happy}
 case $scenario in
   redirect) exit 47 ;;
   transport-fail) exit 22 ;;
 esac
+# The redirect budget is part of the artifact class contract, not a transport
+# detail the caller may pick freely: guest Nix must still refuse every 3xx and
+# only the digest-pinned Wolfi package class may follow the one measured 303.
 case $url in
-  */nix-installer-x86_64-linux) source_file=${FAKE_GUEST_NIX_SOURCE_DIR:?}/guest-nix-installer; kind=payload ;;
-  */tag/v3.21.9) source_file=${FAKE_GUEST_NIX_SOURCE_DIR:?}/guest-nix-bootstrap.sh; kind=installer ;;
+  */nix-installer-x86_64-linux)
+    source_file=${FAKE_GUEST_NIX_SOURCE_DIR:?}/guest-nix-installer; kind=payload; allowed_redirs=0
+    ;;
+  */tag/v3.21.9)
+    source_file=${FAKE_GUEST_NIX_SOURCE_DIR:?}/guest-nix-bootstrap.sh; kind=installer; allowed_redirs=0
+    ;;
+  https://apk.cgr.dev/chainguard/x86_64/*.apk)
+    source_file=${FAKE_GUEST_TOOLCHAIN_SOURCE_DIR:?}/${url##*/}; kind=apk; allowed_redirs=1
+    ;;
   *) exit 127 ;;
 esac
+[[ $max_redirs == "$allowed_redirs" ]] || exit 47
+[[ -f $source_file ]] || exit 22
 case $scenario in
   "$kind-short") printf x >"$output" ;;
   "$kind-digest")
@@ -403,6 +417,100 @@ case $scenario in
 esac
 CURL
 chmod 0755 "$fake_guest_nix_curl"
+
+# The Wolfi guest toolchain is proved by really installing it, so the harness
+# needs the exact pinned package bytes. They are acquired reproducibly into
+# scratch and accepted only at their fixed length and digest, so the pin table
+# in production remains the sole authority; nothing is added to the repository.
+# DIENE_CONTRACT_APK_CACHE is an optional offline byte source that is still
+# subject to the same unconditional length and digest proof.
+guest_toolchain_apk_dir=$scratch/guest-toolchain-apk
+install -d -m 0700 "$guest_toolchain_apk_dir"
+mapfile -t guest_toolchain_pins < <(
+  # shellcheck source=/dev/null
+  source "$template_root/scripts/ci/environment-lib.sh"
+  printf '%s\n' "$DIENE_GUEST_TOOLCHAIN_PACKAGES"
+)
+guest_toolchain_repo_base=$(
+  # shellcheck source=/dev/null
+  source "$template_root/scripts/ci/environment-lib.sh"
+  printf '%s\n' "$DIENE_GUEST_TOOLCHAIN_REPO_BASE"
+)
+[[ ${#guest_toolchain_pins[@]} == 10 && $guest_toolchain_repo_base == https://* ]] ||
+  fail 'the production Wolfi toolchain closure is not the measured ten pinned packages'
+guest_toolchain_files=()
+guest_toolchain_uploads=()
+for guest_toolchain_pin in "${guest_toolchain_pins[@]}"; do
+  IFS='|' read -r guest_toolchain_pin_name guest_toolchain_pin_version \
+    guest_toolchain_pin_bytes guest_toolchain_pin_digest <<<"$guest_toolchain_pin"
+  guest_toolchain_file="$guest_toolchain_pin_name-$guest_toolchain_pin_version.apk"
+  guest_toolchain_files+=("$guest_toolchain_file")
+  guest_toolchain_uploads+=("/run/diene-ci/gnu/$guest_toolchain_file"
+    "/run/diene-ci/gnu/$guest_toolchain_file.sha256")
+  guest_toolchain_target=$guest_toolchain_apk_dir/$guest_toolchain_file
+  if [[ -n ${DIENE_CONTRACT_APK_CACHE:-} && -f ${DIENE_CONTRACT_APK_CACHE:-}/$guest_toolchain_file ]]; then
+    install -m 0600 "$DIENE_CONTRACT_APK_CACHE/$guest_toolchain_file" "$guest_toolchain_target"
+  else
+    command -v curl >/dev/null 2>&1 ||
+      fail "curl is required to acquire the pinned Wolfi package $guest_toolchain_file"
+    curl --fail --show-error --silent --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      --location --max-redirs 1 --max-time 300 --retry 0 \
+      --output "$guest_toolchain_target" "$guest_toolchain_repo_base/$guest_toolchain_file" ||
+      fail "the pinned Wolfi package $guest_toolchain_file could not be acquired for the harness"
+    chmod 0600 "$guest_toolchain_target"
+  fi
+  [[ $(wc -c <"$guest_toolchain_target") == "$guest_toolchain_pin_bytes" ]] ||
+    fail "the acquired $guest_toolchain_file does not match its pinned byte length"
+  [[ "sha256:$(sha256sum "$guest_toolchain_target" | awk '{print $1}')" == "$guest_toolchain_pin_digest" ]] ||
+    fail "the acquired $guest_toolchain_file does not match its pinned digest"
+  if [[ -n ${DIENE_CONTRACT_APK_CACHE:-} && -d ${DIENE_CONTRACT_APK_CACHE:-} &&
+    ! -f ${DIENE_CONTRACT_APK_CACHE:-}/$guest_toolchain_file ]]; then
+    install -m 0600 "$guest_toolchain_target" "$DIENE_CONTRACT_APK_CACHE/$guest_toolchain_file"
+  fi
+done
+guest_toolchain_good_packages=$(printf '%s\n' "${guest_toolchain_pins[@]}")
+
+# The independent expectation of the twenty-one proven utilities, the two
+# behaviour proofs, and the three BusyBox tar facts. It is written here rather
+# than read back out of the production text, so a silent narrowing of the
+# proven set cannot pass either the real Wolfi rail or the runner-side proof.
+guest_toolchain_identity_rows=(
+  'sed|/usr/bin/sed|/usr/bin/sed|(GNU sed)'
+  'grep|/usr/bin/grep|/usr/bin/grep|(GNU grep)'
+  'awk|/usr/bin/awk|/usr/bin/gawk|GNU Awk'
+  'find|/usr/bin/find|/usr/bin/find|(GNU findutils)'
+  'xargs|/usr/bin/xargs|/usr/bin/xargs|(GNU findutils)'
+  'sha256sum|/usr/bin/sha256sum|/usr/bin/coreutils|(GNU coreutils)'
+  'stat|/usr/bin/stat|/usr/bin/coreutils|(GNU coreutils)'
+  'cut|/usr/bin/cut|/usr/bin/coreutils|(GNU coreutils)'
+  'sort|/usr/bin/sort|/usr/bin/coreutils|(GNU coreutils)'
+  'head|/usr/bin/head|/usr/bin/coreutils|(GNU coreutils)'
+  'wc|/usr/bin/wc|/usr/bin/coreutils|(GNU coreutils)'
+  'date|/usr/bin/date|/usr/bin/coreutils|(GNU coreutils)'
+  'tr|/usr/bin/tr|/usr/bin/coreutils|(GNU coreutils)'
+  'cat|/usr/bin/cat|/usr/bin/coreutils|(GNU coreutils)'
+  'install|/usr/bin/install|/usr/bin/coreutils|(GNU coreutils)'
+  'readlink|/usr/bin/readlink|/usr/bin/coreutils|(GNU coreutils)'
+  'id|/usr/bin/id|/usr/bin/coreutils|(GNU coreutils)'
+  'mktemp|/usr/bin/mktemp|/usr/bin/coreutils|(GNU coreutils)'
+  'chmod|/usr/bin/chmod|/usr/bin/coreutils|(GNU coreutils)'
+  'rm|/usr/bin/rm|/usr/bin/coreutils|(GNU coreutils)'
+  'uname|/usr/bin/uname|/usr/bin/coreutils|(GNU coreutils)'
+)
+guest_toolchain_write_expected_identity() {
+  local row name binary logical token
+  for row in "${guest_toolchain_identity_rows[@]}"; do
+    IFS='|' read -r name binary logical token <<<"$row"
+    printf '%s|%s|%s|%s \n' "$name" "$binary" "$logical" "$token"
+  done
+  printf '%s\n' behaviorSha256sumCheck=pass behaviorSedInPlace=pass \
+    tarImplementation=busybox tarResolvedPath=/usr/bin/busybox \
+    tarPortableFlags=-cf,-tf,-tvf,-xf,-C,-f tarTypeCharacter=-
+}
+guest_toolchain_write_expected_pins() {
+  printf '%s\n' executionMode=offline-pinned-apk
+  tr '|' ' ' <<<"$guest_toolchain_good_packages"
+}
 
 # The lifecycle copy is an isolated synthetic rail. Override the downloader
 # function only in that scratch copy; production still resolves and validates
@@ -697,6 +805,36 @@ guest_nix_receipt_digest=$(diene_file_digest "$guest_nix_evidence/identity.json"
 guest_nix_preflight=$(jq -c --arg digest "$guest_nix_receipt_digest" \
   '. + {identityReceiptDigest:$digest}' "$guest_nix_evidence/identity.json")
 
+# Stage 0 is real in the pinned-Wolfi rail; here the synthetic guest only has
+# to carry the same bound shape so the outer lifecycle proves collection,
+# leakage scanning, and checkpoint binding of the toolchain evidence class.
+guest_toolchain_contract=$(jq -ce '.guestToolchain' "$inputs")
+guest_toolchain_evidence=$evidence/gnu-toolchain
+install -d -m 0700 "$guest_toolchain_evidence"
+{
+  printf '%s\n' "executionMode=$(jq -r '.executionMode' <<<"$guest_toolchain_contract")"
+  jq -r '.packages[] | "\(.name) \(.version) \(.bytes) \(.digest)"' <<<"$guest_toolchain_contract"
+} >"$guest_toolchain_evidence/pins.txt"
+printf '%s\n' 'OK: 26 MiB in 25 packages' >"$guest_toolchain_evidence/install.log"
+printf '%s|%s|%s|%s \n%s\n' sed /usr/bin/sed /usr/bin/sed '(GNU sed)' tarImplementation=busybox \
+  >"$guest_toolchain_evidence/identity.txt"
+chmod 0600 "$guest_toolchain_evidence/pins.txt" "$guest_toolchain_evidence/install.log" \
+  "$guest_toolchain_evidence/identity.txt"
+guest_toolchain_identity=$(jq -Scn --argjson contract "$guest_toolchain_contract" \
+  --arg contractDigest "$(diene_guest_toolchain_contract_digest)" \
+  --arg pinsDigest "$(diene_file_digest "$guest_toolchain_evidence/pins.txt")" \
+  --arg installLogDigest "$(diene_file_digest "$guest_toolchain_evidence/install.log")" \
+  --arg stageIdentityDigest "$(diene_file_digest "$guest_toolchain_evidence/identity.txt")" '
+  $contract + {contractDigest:$contractDigest,absolutePathIdentity:true,
+    sha256sumCheckBehavior:true,sedInPlaceBehavior:true,tarImplementation:"busybox",
+    tarResolvedPath:"/usr/bin/busybox",tarPortableFlags:["-cf","-tf","-tvf","-xf","-C","-f"],
+    tarTypeCharacter:"-",pinsDigest:$pinsDigest,installLogDigest:$installLogDigest,
+    stageIdentityDigest:$stageIdentityDigest}')
+printf '%s\n' "$guest_toolchain_identity" | diene_write_json "$guest_toolchain_evidence/identity.json"
+guest_toolchain_preflight=$(jq -c \
+  --arg digest "$(diene_file_digest "$guest_toolchain_evidence/identity.json")" \
+  '. + {identityReceiptDigest:$digest}' "$guest_toolchain_evidence/identity.json")
+
 install -d -m 0700 "$evidence/staging/orchestration"
 printf '%s\n' 'ESTAB 0 0 10.0.0.2:22 192.0.2.10:4242' \
   >"$evidence/staging/orchestration/ss-observation.txt"
@@ -711,7 +849,8 @@ jq -n --arg digest "$socket_digest" '
 chmod 0600 "$evidence/policy.json"
 
 jq -n --arg cluster "$cluster_id" --arg k3s "$admitted_k3s" \
-  --argjson guestNix "$guest_nix_preflight" '
+  --argjson guestNix "$guest_nix_preflight" \
+  --argjson guestToolchain "$guest_toolchain_preflight" '
   {outcome:"Pass",reasonCode:"NamespaceWolfiBuiltInK3sReady",clusterId:$cluster,
    identitySource:"cidfile-metadata-exact-id-ssh",os:{id:"wolfi",version:"rolling",uid:0},
    k3s:{version:$k3s,kubernetesVersion:$k3s,nodeCount:1,
@@ -719,7 +858,7 @@ jq -n --arg cluster "$cluster_id" --arg k3s "$admitted_k3s" \
    network:{podCidrs:["10.142.0.0/16"],serviceCidrs:["10.143.0.0/16"],ipv6Disabled:false,
             namespaceIngress:false,publicBinding:false},storage:{defaultClass:"local-path"},
    policyBackend:{mechanism:"iptables",backend:"nf_tables",version:"iptables v1.8.13 (nf_tables)"},
-   guestNix:$guestNix,
+   guestNix:$guestNix,guestToolchain:$guestToolchain,
    cacheAttached:false,platformStatus:"platform per-instance policy pending (support ask #4)"}' \
   >"$evidence/preflight.json"
 chmod 0600 "$evidence/preflight.json"
@@ -727,6 +866,8 @@ jq -e --arg digest "$guest_nix_receipt_digest" --slurpfile identity "$guest_nix_
   (.guestNix | del(.identityReceiptDigest)) == $identity[0] and
   .guestNix.identityReceiptDigest == $digest
 ' "$evidence/preflight.json" >/dev/null
+diene_require_guest_toolchain_preflight_agreement "$evidence/preflight.json" \
+  "$guest_toolchain_evidence/identity.json"
 
 input_digest=$(diene_sha256_text "$(jq -cS . "$inputs")")
 diene_checkpoint_init "$evidence/checkpoint-chain.json" "$input_digest"
@@ -1024,10 +1165,64 @@ case $command in
     esac
     ;;
   ssh)
-    id=${1:?}; flag=${2:-}; remote_command=${3:-}; (($# == 3)) || exit 127
-    [[ $flag == -T && -n $remote_command && -f $root/instances/$id/live ]] || exit 66
-    [[ $scenario != ssh-fail ]] || exit 42
-    [[ $scenario != ssh-delay ]] || sleep 3
+    # The binding ruling is one noninteractive session per call: -T selects no
+    # pseudo-terminal and the -- separator ends option parsing, so the reviewed
+    # program can never be re-read as an nsc flag.
+    id=${1:?}; flag=${2:-}; separator=${3:-}; remote_command=${4:-}; (($# == 4)) || exit 127
+    [[ $flag == -T && $separator == -- && -n $remote_command &&
+      -f $root/instances/$id/live ]] || exit 66
+    # This invocation is already in the log, so the count is this attempt's
+    # ordinal against this exact cluster.
+    ssh_attempt=$(grep -Ec "^ssh ${id} -T -- " "$log" || true)
+    # Unmarked scenarios must produce no ready marker at all, so they are
+    # decided before the marker is emitted. Everything else emits the exact
+    # marker as the first complete stdout line, exactly as the fixed remote
+    # program's first observable statement does.
+    case $scenario in
+      ssh-unmarked-fail) exit 42 ;;
+      ssh-unmarked-zero) exit 0 ;;
+      ssh-start-timeout-once) ((ssh_attempt > 1)) || exit 124 ;;
+      ssh-start-timeout-kill-once) ((ssh_attempt > 1)) || exit 137 ;;
+      ssh-start-timeout-always) exit 124 ;;
+      ssh-start-timeout-then-fail)
+        ((ssh_attempt > 1)) || exit 124
+        exit 42
+        ;;
+      ssh-preceding-output) printf '%s\n' 'preamble-before-marker' ;;
+      ssh-partial-marker)
+        printf '%s' 'DieneNscSshSessionReady:v1'
+        exit 124
+        ;;
+      ssh-late-marker)
+        # Stay silent through the whole watchdog, then emit the marker only
+        # from the TERM handler while the stop helper is inside kill-after. A
+        # marker produced after the deadline must never upgrade a
+        # watchdog-killed attempt to ready. The sleep is backgrounded so Bash
+        # can run the handler instead of deferring it until the child returns.
+        if ((ssh_attempt == 1)); then
+          trap 'printf "%s\n" "DieneNscSshSessionReady:v1"; exit 124' TERM
+          sleep 120 &
+          wait $! || true
+          exit 0
+        fi
+        ;;
+    esac
+    printf '%s\n' 'DieneNscSshSessionReady:v1'
+    case $scenario in
+      ssh-fail) exit 42 ;;
+      ssh-delay) sleep 3 ;;
+      ssh-marked-timeout) exit 124 ;;
+      ssh-marked-kill) exit 137 ;;
+      ssh-preceding-output) exit 124 ;;
+      ssh-hostile-signal)
+        # Refuse to die on TERM so the stop helper must actually sit in its
+        # fixed kill-after window; that window is where a second signal can
+        # interrupt a handler that reset itself to the default disposition.
+        trap '' TERM
+        sleep 30
+        exit 0
+        ;;
+    esac
     state="$root/instances/$id/fs/run/diene-ci"
     [[ $remote_command == *'sha256sum -c archive-validator.sha256'* &&
       $remote_command == *'./archive-validator.sh source.tar source'* ]] || exit 67
@@ -1060,6 +1255,61 @@ case $command in
       $remote_command == *"guest_nix_payload_bytes=${guest_nix_payload_bytes}"* ]] || exit 69
     [[ $remote_command != *'sh ./guest-nix-bootstrap.sh'* &&
       $remote_command != *'guest-nix-bootstrap.sh install'* ]] || exit 69
+    # Stage 0 is textually first in the same fixed program. Bind its exact
+    # offline argv, its refusals, and its pins here so the synthetic lifecycle
+    # cannot stay green against a rewritten or reordered bootstrap.
+    [[ $remote_command == *'# --- BEGIN guest toolchain stage 0 ---'* &&
+      $remote_command == *'# --- END guest toolchain stage 0 ---'* &&
+      $remote_command == *'guest_toolchain_require_clean_apk_env'* &&
+      $remote_command == *'/usr/bin/apk add --no-progress --no-network --allow-untrusted'* &&
+      $remote_command == *'guest_toolchain_pinned_asset_valid coreutils-9.11-r3.apk coreutils-9.11-r3.apk.sha256'* &&
+      $remote_command == *'/usr/bin/uname -m'* ]] || exit 71
+    guest_toolchain_stage0_line=$(printf '%s\n' "$remote_command" |
+      grep -n -F -- '# --- END guest toolchain stage 0 ---' | head -1 | cut -d: -f1)
+    guest_toolchain_validator_line=$(printf '%s\n' "$remote_command" |
+      grep -n -F -- './archive-validator.sh source.tar source' | head -1 | cut -d: -f1)
+    [[ -n $guest_toolchain_stage0_line && -n $guest_toolchain_validator_line &&
+      $guest_toolchain_stage0_line -lt $guest_toolchain_validator_line ]] || exit 71
+    while IFS='|' read -r toolchain_name toolchain_version toolchain_bytes toolchain_digest; do
+      toolchain_variable=${toolchain_name//-/_}
+      [[ $remote_command == *"guest_toolchain_${toolchain_variable}_digest=${toolchain_digest}"* &&
+        $remote_command == *"guest_toolchain_${toolchain_variable}_bytes=${toolchain_bytes}"* &&
+        $remote_command == *"/run/diene-ci/gnu/$toolchain_name-$toolchain_version.apk"* ]] || exit 71
+    done < <(jq -r '.guestToolchain.packages[] |
+      "\(.name)|\(.version)|\(.bytes)|\(.digest)"' "$state/inputs.json")
+    case $scenario in
+      guest-apk-tamper) printf X >>"$state/gnu/coreutils-9.11-r3.apk" ;;
+      guest-apk-sidecar-tamper) printf X >>"$state/gnu/sed-4.10-r1.apk.sha256" ;;
+      guest-apk-pair-tamper)
+        printf X | dd of="$state/gnu/grep-3.12-r6.apk" bs=1 seek=0 conv=notrunc status=none
+        (cd "$state/gnu" && sha256sum grep-3.12-r6.apk >grep-3.12-r6.apk.sha256)
+        ;;
+      guest-apk-symlink)
+        cp "$state/gnu/gawk-5.4.1-r0.apk" "$state/gnu/gawk-5.4.1-r0.apk.link-target"
+        rm "$state/gnu/gawk-5.4.1-r0.apk"
+        ln -s gawk-5.4.1-r0.apk.link-target "$state/gnu/gawk-5.4.1-r0.apk"
+        ;;
+      guest-apk-missing) rm -f "$state/gnu/libsepol-3.11-r0.apk" ;;
+    esac
+    event_log=${FAKE_GUEST_NIX_EVENT_LOG:?}
+    while IFS='|' read -r toolchain_name toolchain_version toolchain_bytes toolchain_digest; do
+      toolchain_file="$toolchain_name-$toolchain_version.apk"
+      (cd "$state/gnu" && fake_guest_nix_pinned_asset_valid "$toolchain_file" \
+        "$toolchain_file.sha256" "$toolchain_digest" "$toolchain_bytes") && continue
+      printf '%s\n' toolchain-verify-refused >>"$event_log"
+      printf '%s\n' 'GuestToolchainUntrusted: an uploaded guest toolchain package or sidecar changed' >&2
+      exit 64
+    done < <(jq -r '.guestToolchain.packages[] |
+      "\(.name)|\(.version)|\(.bytes)|\(.digest)"' "$state/inputs.json")
+    if [[ $scenario == guest-inherited-apk-* ]]; then
+      expected_hostile_apk_env=${FAKE_GUEST_NIX_EXPECTED_HOSTILE_ENV:?}
+      [[ -v $expected_hostile_apk_env ]] || exit 70
+      printf '%s\n' inherited-apk-env-refused >>"$event_log"
+      printf 'GuestToolchainUnavailable: inherited APK-family environment variables are prohibited: %s\n' \
+        "$expected_hostile_apk_env" >&2
+      exit 64
+    fi
+    printf '%s\n' toolchain-verified >>"$event_log"
     if [[ $scenario == remote-source-special ]]; then
       cp "${FAKE_HOSTILE_SOURCE_ARCHIVE:?}" "$state/source.tar"
     fi
@@ -1229,6 +1479,7 @@ prepare_run() {
   export FAKE_GUEST_NIX_GUARD=$guest_nix_guard
   export FAKE_GUEST_NIX_EVENT_LOG=$runner/guest-nix-events.log
   export FAKE_GUEST_NIX_SOURCE_DIR=$guest_nix_fixture_dir
+  export FAKE_GUEST_TOOLCHAIN_SOURCE_DIR=$guest_toolchain_apk_dir
   export FAKE_GUEST_NIX_CURL_LOG=$runner/guest-nix-curl.log
   export TEMPLATE_SCRIPT_DIR=$work/scripts/ci RUNNER_TEMP=$runner DIENE_SCHEMA_DIR=$work/schemas/ci
   export DIENE_CORE_REPORT=$runner/diene-environment-report.v1.json
@@ -2462,12 +2713,15 @@ printf '%s\n' \
   /run/diene-ci/guest-nix-installer.sha256 \
   /run/diene-ci/inputs.json \
   /run/diene-ci/receipt.json \
-  /run/diene-ci/source.tar | LC_ALL=C sort >"$expected_uploads"
+  /run/diene-ci/source.tar \
+  "${guest_toolchain_uploads[@]}" | LC_ALL=C sort >"$expected_uploads"
+[[ $(wc -l <"$expected_uploads") == 31 ]] ||
+  fail 'the expected immutable upload set is not exactly thirty-one paths'
 awk '$1 == "instance" && $2 == "upload" {print $5}' "$happy_log" | LC_ALL=C sort >"$actual_uploads"
 diff -u "$expected_uploads" "$actual_uploads" >/dev/null ||
-  fail 'the immutable upload path set is not the exact seven originals plus four guest Nix files'
+  fail 'the immutable upload path set is not the exact eleven originals plus twenty pinned Wolfi package files'
 [[ $(grep -Ec '^instance download ' "$happy_log") == 2 ]] || fail 'fixed proof download count is not exactly two'
-grep -Eq "^ssh ${happy_cluster} -T " "$happy_log" || fail 'driver did not use exact-id noninteractive ssh'
+grep -Eq "^ssh ${happy_cluster} -T -- " "$happy_log" || fail 'driver did not use exact-id noninteractive separated ssh'
 [[ $(grep -Ec "^destroy --force ${happy_cluster} " "$happy_log") == 1 ]] ||
   fail 'cleanup did not issue exactly one exact-id force destroy'
 grep -Eq '^list --all -o json ' "$happy_log" || fail 'positive absence did not query the complete list'
@@ -2510,6 +2764,32 @@ grep -Fxq -- nix-develop "$FAKE_GUEST_NIX_EVENT_LOG" ||
   fail 'the happy guest rail did not reach nix develop after its identity gates'
 ok 'both private pinned assets and exact sidecars upload and re-verify before the measured installer argv'
 
+for guest_toolchain_file in "${guest_toolchain_files[@]}"; do
+  for guest_toolchain_asset in "$guest_toolchain_file" "$guest_toolchain_file.sha256"; do
+    [[ -f $happy_instance_state/gnu/$guest_toolchain_asset &&
+      ! -L $happy_instance_state/gnu/$guest_toolchain_asset ]] ||
+      fail "the verified guest toolchain upload $guest_toolchain_asset is absent"
+    [[ $(stat -c %a -- "$happy_instance_state/gnu/$guest_toolchain_asset") == 600 ]] ||
+      fail "the verified guest toolchain upload $guest_toolchain_asset is not mode 0600"
+  done
+  (cd "$happy_instance_state/gnu" && sha256sum -c "$guest_toolchain_file.sha256" >/dev/null) ||
+    fail "the uploaded $guest_toolchain_file does not match its exact sidecar"
+done
+[[ $(find "$happy_instance_state/gnu" -type f | wc -l) == 20 ]] ||
+  fail 'the guest toolchain upload directory is not exactly the ten packages and ten sidecars'
+grep -Fxq -- toolchain-verified "$FAKE_GUEST_NIX_EVENT_LOG" ||
+  fail 'the happy guest rail did not verify the pinned toolchain closure before the guest Nix uploads'
+[[ $(grep -nFx -- toolchain-verified "$FAKE_GUEST_NIX_EVENT_LOG" | head -1 | cut -d: -f1) -lt \
+  $(grep -nFx -- uploads-verified "$FAKE_GUEST_NIX_EVENT_LOG" | head -1 | cut -d: -f1) ]] ||
+  fail 'the pinned toolchain closure was verified after the guest Nix assets'
+happy_curl_log=$RUNNER_TEMP/guest-nix-curl.log
+[[ $(grep -Ec -- '--max-redirs 1 ' "$happy_curl_log") == 10 &&
+  $(grep -Ec -- '--max-redirs 0 ' "$happy_curl_log") == 2 ]] ||
+  fail 'the pinned acquisition did not keep guest Nix at zero redirects and the package class at one'
+[[ $(grep -Ec -- 'apk.cgr.dev' "$happy_curl_log") == 10 ]] ||
+  fail 'the ten pinned Wolfi packages were not each acquired exactly once'
+ok 'ten pinned packages and ten sidecars upload, re-verify, and use the one admitted redirect budget'
+
 happy_collected=$(find "$RUNNER_TEMP/diene-namespace" -path '*/collected/evidence' -type d -print -quit)
 [[ -n $happy_collected ]] || fail 'the happy lifecycle retained no safely extracted evidence tree'
 happy_identity=$happy_collected/guest-nix/identity.json
@@ -2534,12 +2814,36 @@ jq -e --arg digest "$happy_identity_digest" --arg environmentDigest "$happy_envi
   (.guestNix | del(.identityReceiptDigest)) == $identity[0]
 ' "$happy_preflight" >/dev/null ||
   fail 'the collected identity receipt and preflight object do not agree exactly'
+happy_toolchain_identity=$happy_collected/gnu-toolchain/identity.json
+[[ -f $happy_toolchain_identity && ! -L $happy_toolchain_identity &&
+  $(stat -c %a -- "$happy_toolchain_identity") == 600 ]] ||
+  fail 'the collected guest toolchain identity receipt is not a regular mode-0600 file'
+happy_toolchain_contract_digest=$(
+  # shellcheck source=/dev/null
+  source "$template_root/scripts/ci/environment-lib.sh"
+  diene_guest_toolchain_contract_digest
+)
+jq -e --arg digest "sha256:$(sha256sum "$happy_toolchain_identity" | awk '{print $1}')" \
+  --arg contractDigest "$happy_toolchain_contract_digest" \
+  --slurpfile identity "$happy_toolchain_identity" '
+  .guestToolchain.executionMode == "offline-pinned-apk" and
+  .guestToolchain.apkBinPath == "/usr/bin/apk" and
+  .guestToolchain.tarImplementation == "busybox" and
+  (.guestToolchain.packages | length) == 10 and
+  (.guestToolchain.argv | .[0:4]) ==
+    ["add","--no-progress","--no-network","--allow-untrusted"] and
+  .guestToolchain.contractDigest == $contractDigest and
+  .guestToolchain.identityReceiptDigest == $digest and
+  (.guestToolchain | del(.identityReceiptDigest)) == $identity[0]
+' "$happy_preflight" >/dev/null ||
+  fail 'the collected toolchain identity receipt and preflight object do not agree exactly'
 happy_preflight_digest="sha256:$(sha256sum "$happy_preflight" | awk '{print $1}')"
 jq -e --arg digest "$happy_preflight_digest" '
   [.checkpoints[] | select(.id == "instance-preflight" and .evidenceDigest == $digest)] | length == 1
 ' "$happy_collected/checkpoint-chain.json" >/dev/null ||
   fail 'the checkpoint chain does not bind the preflight object containing the identity receipt digest'
 ok 'mode-0600 guest Nix identity agrees with preflight and is transitively checkpoint-bound'
+ok 'the collected guest toolchain contract, receipt, and preflight object are one checkpoint-bound chain'
 
 happy_socket=$happy_collected/staging/orchestration/ss-observation.txt
 [[ -f $happy_socket && ! -L $happy_socket && $(stat -c %a -- "$happy_socket") == 600 ]] ||
@@ -2754,6 +3058,145 @@ ssh_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluste
 [[ $(grep -Ec "^destroy --force ${ssh_id} " "$FAILURE_LOG") == 1 ]] ||
   fail 'SSH failure did not destroy its exact cluster once'
 [[ ! -e $FAILURE_NSC_ROOT/instances/$ssh_id/live ]] || fail 'SSH failure left its cluster live'
+# An ordinary driver failure is not a hang: it is never retried, and it never
+# borrows the timeout class.
+[[ $(grep -Ec "^ssh ${ssh_id} -T -- " "$FAILURE_LOG") == 1 ]] ||
+  fail 'a non-timeout driver failure was retried against the same cluster'
+assert_not_contains "$scratch/failure-ssh-fail.err" NamespaceSshSessionStartTimedOut
+assert_not_contains "$scratch/failure-ssh-fail.err" NamespaceSshDriverTimedOut
+ok 'a non-timeout driver failure is never retried and never claims a timeout class'
+
+# A session that never proves it started is not a driver failure and is not a
+# hang: it is its own fail-closed class, and it is not retried either.
+expect_lifecycle_failure 5144 ssh-unmarked-zero NamespaceSshSessionStartUnproven
+ssh_unproven_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^ssh ${ssh_unproven_id} -T -- " "$FAILURE_LOG") == 1 ]] ||
+  fail 'a zero exit without the ready marker was retried'
+[[ $(grep -Ec "^destroy --force ${ssh_unproven_id} " "$FAILURE_LOG") == 1 ]] ||
+  fail 'an unproven session start did not destroy its exact cluster once'
+ok 'a zero exit without the ready marker fails closed as unproven and is never retried'
+
+# ssh-fail above emits the marker first, so it only covers a MARKED ordinary
+# failure. An unmarked non-timeout exit is the other half: it is neither a
+# session-start hang nor an unproven zero, so it must still be the ordinary
+# driver-failure class and must still not buy a session retry.
+expect_lifecycle_failure 5150 ssh-unmarked-fail NamespaceSshDriverFailed
+ssh_unmarked_fail_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json \
+  -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^ssh ${ssh_unmarked_fail_id} -T -- " "$FAILURE_LOG") == 1 ]] ||
+  fail 'an unmarked non-timeout driver failure was retried'
+[[ $(grep -Ec "^destroy --force ${ssh_unmarked_fail_id} " "$FAILURE_LOG") == 1 &&
+  ! -e $FAILURE_NSC_ROOT/instances/$ssh_unmarked_fail_id/live ]] ||
+  fail 'an unmarked non-timeout driver failure did not destroy its exact cluster once'
+grep -Eq '^list --all -o json ' "$FAILURE_LOG" ||
+  fail 'an unmarked non-timeout driver failure did not positively prove absence'
+assert_not_contains "$scratch/failure-ssh-unmarked-fail.err" NamespaceSshSessionStartTimedOut
+assert_not_contains "$scratch/failure-ssh-unmarked-fail.err" NamespaceSshSessionStartUnproven
+ok 'an unmarked non-timeout exit stays the ordinary driver-failure class and is never retried'
+
+# Once the session is proven started, a later hang is a DRIVER timeout, a
+# different class, and it must not buy another session attempt.
+for ssh_marked_case in 'ssh-marked-timeout|5145' 'ssh-marked-kill|5146'; do
+  ssh_marked_scenario=${ssh_marked_case%%|*}
+  ssh_marked_run=${ssh_marked_case#*|}
+  expect_lifecycle_failure "$ssh_marked_run" "$ssh_marked_scenario" NamespaceSshDriverTimedOut
+  ssh_marked_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+  [[ $(grep -Ec "^ssh ${ssh_marked_id} -T -- " "$FAILURE_LOG") == 1 ]] ||
+    fail "$ssh_marked_scenario retried a driver timeout that had already proven its session start"
+  ssh_marked_staging=$(find "$FAILURE_RUNNER/diene-namespace" -path '*/staging/stderr' -print -quit)
+  [[ -z $ssh_marked_staging ]] ||
+    ! grep -q '^NamespaceSshSessionStartTimedOut: ' "$ssh_marked_staging" ||
+    fail "$ssh_marked_scenario recorded a session-start hang for a proven-started session"
+done
+ok 'a hang after the ready marker is a driver timeout, a distinct class, and buys no session retry'
+
+# The marker is accepted only as the first complete stdout line.
+expect_lifecycle_failure 5147 ssh-preceding-output NamespaceSshSessionStartTimedOut
+ok 'output preceding the ready marker does not satisfy the first-complete-line rule'
+expect_lifecycle_failure 5148 ssh-partial-marker NamespaceSshSessionStartTimedOut
+ok 'an unterminated ready marker does not satisfy the first-complete-line rule'
+
+# The binding ruling: an nsc SSH hang retries the SAME live instance, is free,
+# and is a distinct signature from readiness exhaustion. These cases prove the
+# retry happens, that it costs no create, and that it can then pass.
+ssh_retry_recovery_case() {
+  local run_id=${1:?run id required} scenario=${2:?scenario required} rc=${3:?timeout rc required}
+  prepare_run "$run_id"
+  run_orchestrator "$scenario" >"$scratch/ssh-retry-$scenario.out" \
+    2>"$scratch/ssh-retry-$scenario.err" || {
+    sed -n '1,160p' "$scratch/ssh-retry-$scenario.err" >&2
+    fail "$scenario did not recover after its session hang"
+  }
+  local cluster
+  cluster=$(find "$FAKE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+  [[ $(grep -Ec "^ssh ${cluster} -T -- " "$FAKE_NSC_LOG") == 2 ]] ||
+    fail "$scenario did not retry exactly once against the same exact cluster"
+  [[ $(grep -Ec '^create ' "$FAKE_NSC_LOG") == 1 ]] ||
+    fail "$scenario consumed a second create for a session hang"
+  [[ $(find "$FAKE_NSC_ROOT/instances" -mindepth 1 -maxdepth 1 -type d | wc -l) == 1 ]] ||
+    fail "$scenario created a second instance for a session hang"
+  jq -e '
+    .namespaceLifecycle.ssh.outcome == "Pass" and
+    .namespaceLifecycle.ssh.reasonCode == "NonInteractiveDriverCompletedAfterSshSessionRetry" and
+    .outcome == "Pass"
+  ' "$DIENE_CORE_REPORT" >/dev/null ||
+    fail "$scenario did not record a recovered pass distinct from a first-attempt pass"
+  local staging_stderr
+  staging_stderr=$(find "$RUNNER_TEMP/diene-namespace" -path '*/staging/stderr' -print -quit)
+  [[ -n $staging_stderr ]] || fail "$scenario retained no staging stderr evidence"
+  grep -Fxq -- \
+    "NamespaceSshSessionStartTimedOut: exact cluster_id $cluster attempt 1/2 did not emit DieneNscSshSessionReady:v1 before 30s (status $rc)" \
+    "$staging_stderr" ||
+    fail "$scenario did not append the exact stable session-hang marker for attempt 1"
+  [[ $(grep -Ec '^NamespaceSshSessionStartTimedOut: ' "$staging_stderr") == 1 ]] ||
+    fail "$scenario appended a session-hang marker for an attempt that did not hang"
+  ok "$scenario retries the same exact cluster once, costs no create, and then passes"
+}
+ssh_retry_recovery_case 5140 ssh-start-timeout-once 124
+ssh_retry_recovery_case 5141 ssh-start-timeout-kill-once 137
+
+# A marker that only appears after the watchdog already gave up -- emitted from
+# the child's own TERM handler during the kill-after window -- is not evidence
+# that the session started in time. An unconditional post-reap scan would
+# upgrade this attempt to ready and reclassify a session-start hang as a driver
+# timeout, silently destroying the same-ID retry the ruling requires. The final
+# scan is valid only for a child observed to have exited between polls.
+ssh_retry_recovery_case 5149 ssh-late-marker 124
+ssh_late_marker_staging=$(find "$RUNNER_TEMP/diene-namespace" -path '*/staging/stdout' -print -quit)
+[[ -n $ssh_late_marker_staging ]] ||
+  fail 'the late-marker case retained no staging stdout to prove the marker was really emitted'
+[[ $(grep -Fxc 'DieneNscSshSessionReady:v1' "$ssh_late_marker_staging") == 2 ]] ||
+  fail 'the late-marker case did not actually emit a post-deadline marker, so it proves nothing'
+ok 'a marker emitted only after the watchdog expired never upgrades the attempt to ready'
+
+expect_lifecycle_failure 5142 ssh-start-timeout-always NamespaceSshSessionStartTimedOut
+ssh_timeout_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^ssh ${ssh_timeout_id} -T -- " "$FAILURE_LOG") == 2 ]] ||
+  fail 'exhausted session hangs did not spend exactly the two bounded attempts'
+[[ $(grep -Ec '^create ' "$FAILURE_LOG") == 1 ]] ||
+  fail 'exhausted session hangs consumed a second create'
+[[ $(grep -Ec "^destroy --force ${ssh_timeout_id} " "$FAILURE_LOG") == 1 &&
+  ! -e $FAILURE_NSC_ROOT/instances/$ssh_timeout_id/live ]] ||
+  fail 'exhausted session hangs did not destroy their exact cluster exactly once'
+grep -Eq '^list --all -o json ' "$FAILURE_LOG" ||
+  fail 'exhausted session hangs did not prove absence after their exact destroy'
+ssh_timeout_staging=$(find "$FAILURE_RUNNER/diene-namespace" -path '*/staging/stderr' -print -quit)
+[[ $(grep -Ec '^NamespaceSshSessionStartTimedOut: ' "$ssh_timeout_staging") == 2 ]] ||
+  fail 'exhausted session hangs did not append one stable marker per bounded attempt'
+grep -Fxq -- \
+  "NamespaceSshSessionStartTimedOut: exact cluster_id $ssh_timeout_id attempt 2/2 did not emit DieneNscSshSessionReady:v1 before 120s (status 124)" \
+  "$ssh_timeout_staging" ||
+  fail 'the final session-hang marker does not name the exact cluster and bounded attempt'
+ok 'exhausted session hangs are a distinct stable reason with exact destroy and proven absence'
+
+expect_lifecycle_failure 5143 ssh-start-timeout-then-fail NamespaceSshDriverFailed
+ssh_mixed_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+[[ $(grep -Ec "^ssh ${ssh_mixed_id} -T -- " "$FAILURE_LOG") == 2 ]] ||
+  fail 'a hang followed by a driver failure did not spend exactly two bounded attempts'
+[[ $(grep -Ec '^create ' "$FAILURE_LOG") == 1 ]] ||
+  fail 'a hang followed by a driver failure consumed a second create'
+assert_contains "$scratch/failure-ssh-start-timeout-then-fail.err" NamespaceSshDriverFailed
+ok 'a hang whose retry fails for another reason keeps the ordinary driver-failure class'
 
 expect_lifecycle_failure 5004 collection-fail EvidenceCollectionFailed
 collection_id=$(find "$FAILURE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
@@ -2870,11 +3313,171 @@ cancel_lifecycle() {
   jq -e '.outcome == "Fail" and .reasonCode == "OrchestratorCancelled" and
     .namespaceLifecycle.destroy.outcome == "Pass" and .namespaceLifecycle.absence.outcome == "Pass"' \
     "$DIENE_CORE_REPORT" >/dev/null || fail "$signal cancellation report lost its original red result"
+  ! find "$RUNNER_TEMP" \( -path '*/gnu-toolchain/identity.json' -o -name 'preflight.json' \) \
+    -print -quit | grep -q . ||
+    fail "$signal cancellation retained a green guest toolchain identity or preflight record"
+  # A signal is not a session hang. The bounded retry must not begin another
+  # attempt once the trap has taken control, and the cancellation must keep its
+  # own reason rather than borrowing the session-timeout class.
+  [[ $(grep -Ec "^ssh ${cluster} -T -- " "$FAKE_NSC_LOG") == 1 ]] ||
+    fail "$signal cancellation began a bounded ssh retry after the trap took control"
+  assert_not_contains "$scratch/cancel-$signal.err" NamespaceSshSessionStartTimedOut
+  # Record how much cancellation evidence ONE signal produces, so the repeated
+  # signal cases below can prove a second signal adds nothing rather than
+  # guessing at an absolute line count.
+  case $signal in
+    TERM) CANCEL_BASELINE_TERM=$(grep -Fc OrchestratorCancelled "$scratch/cancel-$signal.err" || true) ;;
+    INT) CANCEL_BASELINE_INT=$(grep -Fc OrchestratorCancelled "$scratch/cancel-$signal.err" || true) ;;
+  esac
   ok "$signal cancellation remains red after exact cleanup"
 }
 
 cancel_lifecycle 5110 TERM 143
 cancel_lifecycle 5111 INT 130
+
+# The cancellation contract rests on two Bash facts, proved here directly
+# rather than inferred from a second default signal: an EXIT trap survives a
+# signal handler that calls exit, and `trap '' SIG` inside that handler makes a
+# repeated signal a no-op instead of restoring the default disposition. If the
+# handler used `trap - SIG` instead, the second signal would kill the process
+# mid-wait and skip exact destroy and absence entirely.
+cancel_exit_semantics=$scratch/cancel-exit-semantics.sh
+cat >"$cancel_exit_semantics" <<'CANCEL_EXIT_SEMANTICS'
+#!/usr/bin/env bash
+marker=${1:?marker required}
+: >"$marker"
+finalize() {
+  trap - EXIT
+  trap '' TERM INT HUP
+  printf 'exit-finalizer\n' >>"$marker"
+}
+on_signal() {
+  trap '' TERM INT HUP
+  printf 'signal-handler\n' >>"$marker"
+  sleep 2
+  printf 'signal-handler-survived\n' >>"$marker"
+  exit 143
+}
+trap finalize EXIT
+trap on_signal TERM INT HUP
+printf 'ready\n' >>"$marker"
+sleep 30
+CANCEL_EXIT_SEMANTICS
+chmod 0755 "$cancel_exit_semantics"
+cancel_exit_marker=$scratch/cancel-exit-semantics.marker
+"$BASH" "$cancel_exit_semantics" "$cancel_exit_marker" >/dev/null 2>&1 &
+cancel_exit_pid=$!
+cancel_exit_waited=0
+while ! grep -Fxq ready "$cancel_exit_marker" 2>/dev/null &&
+  ((cancel_exit_waited < 100)); do
+  cancel_exit_waited=$((cancel_exit_waited + 1))
+  sleep 0.05
+done
+grep -Fxq ready "$cancel_exit_marker" || fail 'the EXIT-semantics probe never armed its traps'
+kill -s TERM "$cancel_exit_pid"
+sleep 0.3
+kill -s TERM "$cancel_exit_pid" 2>/dev/null || true
+kill -s INT "$cancel_exit_pid" 2>/dev/null || true
+cancel_exit_rc=0
+wait "$cancel_exit_pid" || cancel_exit_rc=$?
+[[ $cancel_exit_rc == 143 ]] ||
+  fail "a repeated signal preempted the suppressed handler (got $cancel_exit_rc)"
+[[ $(grep -Fxc signal-handler "$cancel_exit_marker") == 1 ]] ||
+  fail 'the suppressed signal handler re-entered on a repeated signal'
+grep -Fxq signal-handler-survived "$cancel_exit_marker" ||
+  fail 'a repeated signal killed the handler during its stop wait'
+[[ $(grep -Fxc exit-finalizer "$cancel_exit_marker") == 1 ]] ||
+  fail 'the EXIT finalizer did not run exactly once after the handler exited'
+ok 'a suppressed signal handler survives repeated signals and its EXIT finalizer still runs once'
+
+# The same contract, now against the real orchestrator while the tracked child
+# refuses to die on TERM, so the stop helper is genuinely inside its fixed
+# kill-after window when the second signal lands.
+cancel_lifecycle_repeated() {
+  local run_id=${1:?run id required} first=${2:?first signal required}
+  local second=${3:?second signal required} expected=${4:?status required}
+  local label=$first-then-$second
+  prepare_run "$run_id"
+  local pidfile=$scratch/cancel-$label.pid killer rc cluster staging_stdout
+  : >"$pidfile"
+  (
+    local attempt pid=''
+    for ((attempt = 0; attempt < 600; attempt++)); do
+      [[ ! -s $pidfile ]] || read -r pid <"$pidfile"
+      if [[ -n $pid ]] && grep -Eq '^ssh ' "$FAKE_NSC_LOG"; then
+        kill -s "$first" "$pid"
+        # Synchronize on observable handler entry rather than a blind sleep.
+        # OrchestratorCancelled is written only after the handler has already
+        # installed its ignore for TERM INT HUP, so waiting for it guarantees
+        # the second signal is genuinely second. A blind delay could let the
+        # second signal be dispatched first and make an injector race look
+        # like production re-entry.
+        local entered=0 settle
+        for ((settle = 0; settle < 400; settle++)); do
+          if grep -Fq OrchestratorCancelled "$scratch/cancel-$label.err" 2>/dev/null; then
+            entered=1
+            break
+          fi
+          sleep 0.05
+        done
+        ((entered == 1)) || exit 2
+        kill -s "$second" "$pid" 2>/dev/null || true
+        sleep 0.2
+        kill -s "$second" "$pid" 2>/dev/null || true
+        exit 0
+      fi
+      sleep 0.05
+    done
+    exit 1
+  ) &
+  killer=$!
+  if (
+    cd -- "$work"
+    printf '%s\n' "$BASHPID" >"$pidfile"
+    exec env FAKE_NSC_SCENARIO=ssh-hostile-signal ./scripts/ci/environment-k3d-run.sh orchestrate
+  ) >"$scratch/cancel-$label.out" 2>"$scratch/cancel-$label.err"; then
+    wait "$killer" || true
+    fail "$label repeated cancellation unexpectedly passed"
+  else
+    rc=$?
+  fi
+  wait "$killer" || fail "$label repeated cancellation was not injected, or the first signal handler never announced itself"
+  [[ $rc == "$expected" ]] ||
+    fail "$label repeated cancellation returned $rc, expected the first signal's $expected"
+  local baseline
+  case $first in
+    TERM) baseline=${CANCEL_BASELINE_TERM:-0} ;;
+    INT) baseline=${CANCEL_BASELINE_INT:-0} ;;
+    *) fail "$label repeated cancellation has no single-signal baseline" ;;
+  esac
+  [[ $baseline -ge 1 ]] ||
+    fail "$label repeated cancellation has no single-signal baseline to compare against"
+  # Idempotence is the property under test: a second signal must add no further
+  # cancellation evidence beyond what one signal already produced.
+  [[ $(grep -Fc OrchestratorCancelled "$scratch/cancel-$label.err" || true) == "$baseline" ]] ||
+    fail "$label repeated cancellation recorded more cancellation evidence than a single signal"
+  cluster=$(find "$FAKE_NSC_ROOT/instances" -name meta.json -exec jq -r '.cluster_id' {} \;)
+  [[ $(grep -Ec "^ssh ${cluster} -T -- " "$FAKE_NSC_LOG") == 1 ]] ||
+    fail "$label repeated cancellation began another ssh attempt"
+  [[ $(grep -Ec "^destroy --force ${cluster} " "$FAKE_NSC_LOG") == 1 ]] ||
+    fail "$label repeated cancellation did not destroy its exact cluster exactly once"
+  [[ ! -e $FAKE_NSC_ROOT/instances/$cluster/live ]] ||
+    fail "$label repeated cancellation left its cluster live"
+  grep -Eq '^list --all -o json ' "$FAKE_NSC_LOG" ||
+    fail "$label repeated cancellation did not positively prove absence"
+  staging_stdout=$(find "$RUNNER_TEMP/diene-namespace" -path '*/staging/stdout' -print -quit)
+  [[ -n $staging_stdout ]] || fail "$label repeated cancellation retained no staging stdout"
+  [[ $(grep -Fxc 'DieneNscSshSessionReady:v1' "$staging_stdout") == 1 ]] ||
+    fail "$label repeated cancellation flushed its partial attempt evidence more than once"
+  jq -e '.outcome == "Fail" and .reasonCode == "OrchestratorCancelled" and
+    .namespaceLifecycle.destroy.outcome == "Pass" and
+    .namespaceLifecycle.absence.outcome == "Pass"' "$DIENE_CORE_REPORT" >/dev/null ||
+    fail "$label repeated cancellation lost its original red result or its exact cleanup"
+  ok "$label repeated cancellation keeps one reason, one destroy, proven absence, and status $expected"
+}
+cancel_lifecycle_repeated 5112 TERM TERM 143
+cancel_lifecycle_repeated 5113 TERM INT 143
+cancel_lifecycle_repeated 5114 INT TERM 130
 
 printf '== late cleanup closes debt but cannot rewrite red ==\n'
 
@@ -4070,6 +4673,127 @@ printf '%s\n' 'curl https://example.invalid/data |' \
 if rg -U -q "$guest_nix_pipe_shell_regex" "$scratch/guest-nix-guard-cross-file"; then
   fail 'two production files combined into a synthetic pipe-to-shell match'
 fi
+# The GNU bootstrap gets exactly one admitted package-manager call site. The
+# scan runs over the same continuation-joined production text as the guest Nix
+# gates, so a flag cannot escape onto the next physical line.
+guest_toolchain_apk_command_regex='(^|[^[:alnum:]_./-])(/[[:alnum:]_./-]+/)?apk[[:space:]]+[a-z]'
+mapfile -t guest_toolchain_apk_commands < <(
+  rg -N "$guest_toolchain_apk_command_regex" "$guest_nix_production_normalized" || true
+)
+[[ ${#guest_toolchain_apk_commands[@]} == 1 ]] ||
+  fail 'production text does not contain exactly one package-manager invocation'
+# Continuation joining leaves the reviewed argv double-spaced; the contract is
+# the token sequence, not the whitespace the joiner happened to produce. The
+# comparison is whole-argv equality against an expectation this harness builds
+# itself, so an extra argument, a glob, a duplicated path, a reordered closure,
+# or a changed redirection cannot hide behind a prefix or substring match.
+guest_toolchain_apk_call=$(tr -s ' ' <<<"${guest_toolchain_apk_commands[0]}")
+guest_toolchain_expected_apk_call() {
+  local package_paths='' name version
+  while IFS='|' read -r name version _ _; do
+    package_paths+=" /run/diene-ci/gnu/$name-$version.apk"
+  done <<<"$guest_toolchain_good_packages"
+  printf '%s%s %s\n' \
+    '/usr/bin/apk add --no-progress --no-network --allow-untrusted' "$package_paths" \
+    '>/run/diene-ci/evidence/gnu-toolchain/install.log 2>&1 || guest_toolchain_install_rc=$?'
+}
+guest_toolchain_apk_expected=$(guest_toolchain_expected_apk_call)
+[[ $guest_toolchain_apk_call == "$guest_toolchain_apk_expected" ]] || {
+  diff -u <(printf '%s\n' "$guest_toolchain_apk_expected") \
+    <(printf '%s\n' "$guest_toolchain_apk_call") >&2 || true
+  fail 'the one production apk call is not the exact fixed absolute offline install argv'
+}
+for guest_toolchain_apk_flag in --no-network --allow-untrusted --no-progress; do
+  [[ $guest_toolchain_apk_call == *"$guest_toolchain_apk_flag"* ]] ||
+    fail "the one production apk call omits the mandatory $guest_toolchain_apk_flag"
+done
+# Adversarial self-tests: the equality gate must reject each way a widened
+# install could be smuggled past a prefix or per-path occurrence check.
+guest_toolchain_apk_mutants=(
+  "extra-argument|$guest_toolchain_apk_expected --force-broken-world"
+  "glob-argument|${guest_toolchain_apk_expected/\/run\/diene-ci\/gnu\/sed-4.10-r1.apk//run/diene-ci/gnu/*.apk}"
+  "duplicate-path|${guest_toolchain_apk_expected/ \/run\/diene-ci\/gnu\/sed-4.10-r1.apk/ /run/diene-ci/gnu/sed-4.10-r1.apk /run/diene-ci/gnu/sed-4.10-r1.apk}"
+  "missing-path|${guest_toolchain_apk_expected/ \/run\/diene-ci\/gnu\/gawk-5.4.1-r0.apk/}"
+  "wrong-path|${guest_toolchain_apk_expected/gawk-5.4.1-r0.apk/gawk-5.4.2-r0.apk}"
+  "reordered-closure|${guest_toolchain_apk_expected/--allow-untrusted \/run\/diene-ci\/gnu\/libacl1-2.4.0-r1.apk/--allow-untrusted /run/diene-ci/gnu/coreutils-9.11-r3.apk}"
+  "leaked-redirection|${guest_toolchain_apk_expected/>\/run\/diene-ci\/evidence\/gnu-toolchain\/install.log 2>&1/2>\&1}"
+  "named-package|${guest_toolchain_apk_expected/\/run\/diene-ci\/gnu\/sed-4.10-r1.apk/sed}"
+)
+for guest_toolchain_apk_mutant in "${guest_toolchain_apk_mutants[@]}"; do
+  guest_toolchain_apk_mutant_label=${guest_toolchain_apk_mutant%%|*}
+  guest_toolchain_apk_mutant_text=${guest_toolchain_apk_mutant#*|}
+  [[ $guest_toolchain_apk_mutant_text != "$guest_toolchain_apk_expected" ]] ||
+    fail "the $guest_toolchain_apk_mutant_label apk argv mutant did not change the reviewed call"
+  [[ $guest_toolchain_apk_mutant_text != "$guest_toolchain_apk_call" ]] ||
+    fail "the $guest_toolchain_apk_mutant_label apk argv mutant equals the production call"
+done
+for guest_toolchain_apk_probe in 'apk add coreutils' '  apk add --allow-untrusted x.apk' \
+  '/sbin/apk add --no-network x.apk'; do
+  printf '%s\n' "$guest_toolchain_apk_probe" >"$scratch/guest-toolchain-apk-probe"
+  rg -N -q "$guest_toolchain_apk_command_regex" "$scratch/guest-toolchain-apk-probe" ||
+    fail "the apk call-site scan missed the invocation: $guest_toolchain_apk_probe"
+done
+printf '%s\n' 'DIENE_GUEST_TOOLCHAIN_APK_BIN=/usr/bin/apk' \
+  'https://apk.cgr.dev/chainguard/x86_64' 'coreutils-9.11-r3.apk exists' \
+  'executionMode=offline-pinned-apk' >"$scratch/guest-toolchain-apk-benign"
+if rg -N -q "$guest_toolchain_apk_command_regex" "$scratch/guest-toolchain-apk-benign"; then
+  fail 'the apk call-site scan mistakes a pinned constant or filename for an invocation'
+fi
+guest_toolchain_forbidden_apk_regex='apk[[:space:]]+(update|upgrade|fetch|del|add[[:space:]]+[a-z])|/etc/apk/repositories|/etc/apk/cache'
+if rg -n "$guest_toolchain_forbidden_apk_regex" \
+  "$guest_nix_production_normalized" >"$scratch/guest-toolchain-forbidden-apk"; then
+  sed -n '1,40p' "$scratch/guest-toolchain-forbidden-apk" >&2
+  fail 'production text refreshes, upgrades, fetches, or rewrites the guest package repository'
+fi
+guest_toolchain_tar_version_regex='(^|[^[:alnum:]_./-])(/[[:alnum:]_./-]+/)?tar[[:space:]]+--version'
+if rg -n "$guest_toolchain_tar_version_regex" \
+  "$guest_nix_production_normalized" >"$scratch/guest-toolchain-tar-version"; then
+  sed -n '1,40p' "$scratch/guest-toolchain-tar-version" >&2
+  fail 'production text infers a tar implementation from its --version output'
+fi
+printf '%s\n' '/usr/bin/tar --version' >"$scratch/guest-toolchain-tar-version-probe"
+rg -N -q "$guest_toolchain_tar_version_regex" "$scratch/guest-toolchain-tar-version-probe" ||
+  fail 'the forbidden tar --version scan cannot see an absolute tar version probe'
+
+# Every GNU-only tar flag in this repository is runner-side, inside the Nix CI
+# shell. The two BusyBox heredocs must never acquire one, and today that is an
+# accident of care rather than an enforced invariant.
+guest_toolchain_busybox_text=$scratch/guest-toolchain-busybox-heredocs
+{
+  sed -n "/<<'VALIDATOR'\$/,/^VALIDATOR\$/p" "$template_root/scripts/ci/environment-k3d-run.sh"
+  sed -n "/<<'REMOTE'\$/,/^REMOTE\$/p" "$template_root/scripts/ci/environment-k3d-run.sh"
+} >"$guest_toolchain_busybox_text"
+[[ $(grep -Fxc -- VALIDATOR "$guest_toolchain_busybox_text") == 1 &&
+  $(grep -Fxc -- REMOTE "$guest_toolchain_busybox_text") == 1 &&
+  $(wc -l <"$guest_toolchain_busybox_text") -gt 500 ]] ||
+  fail 'the BusyBox validator and remote heredocs could not be isolated for the tar flag guard'
+guest_toolchain_gnu_tar_regex='--quoting-style|--numeric-owner|--no-same-owner|--no-same-permissions|--keep-old-files'
+if rg -n -e "$guest_toolchain_gnu_tar_regex" \
+  "$guest_toolchain_busybox_text" >"$scratch/guest-toolchain-gnu-tar"; then
+  sed -n '1,40p' "$scratch/guest-toolchain-gnu-tar" >&2
+  fail 'a GNU-only tar flag entered the BusyBox remote or validator program'
+fi
+for guest_toolchain_gnu_tar_flag in --quoting-style=escape --numeric-owner --no-same-owner \
+  --no-same-permissions --keep-old-files; do
+  printf 'tar %s -tf archive\n' "$guest_toolchain_gnu_tar_flag" \
+    >"$scratch/guest-toolchain-gnu-tar-probe"
+  rg -N -q -e "$guest_toolchain_gnu_tar_regex" "$scratch/guest-toolchain-gnu-tar-probe" ||
+    fail "the BusyBox tar flag guard cannot see $guest_toolchain_gnu_tar_flag"
+done
+rg -N -q -e "$guest_toolchain_gnu_tar_regex" "$guest_nix_production_normalized" ||
+  fail 'the GNU-only tar flags vanished from the runner-side text the guard is scoped against'
+
+# The zero redirect budget is the default and stays the guest Nix policy; only
+# the digest-pinned Wolfi package class may spend the one measured 303.
+[[ $(rg -Nc 'diene_fetch_pinned_artifact ' "$guest_nix_production_normalized") == 3 ]] ||
+  fail 'the production rail no longer has exactly three pinned acquisition call sites'
+[[ $(rg -N 'diene_fetch_pinned_artifact .*guest-nix-[^ ]*" [0-9]+$' \
+  "$guest_nix_production_normalized" | wc -l) == 0 ]] ||
+  fail 'a guest Nix acquisition call site passes an explicit redirect budget'
+[[ $(rg -N 'diene_fetch_pinned_artifact .* 1$' "$guest_nix_production_normalized" | wc -l) == 1 ]] ||
+  fail 'the one-redirect budget is not confined to a single Wolfi package call site'
+ok 'exactly one absolute offline apk call, no repository writes, no GNU tar claim, and one redirect budget'
+
 pinned_shell_url='https://install.'
 pinned_shell_url+='determinate.systems/nix/tag/v3.21.9'
 pinned_payload_url="$pinned_shell_url/nix-installer-x86_64-linux"
@@ -4270,6 +4994,81 @@ for guest_nix_env_shell in "${guest_nix_env_shells[@]}"; do
     'the fixed-path inherited environment could not be enumerated'
 done
 ok 'the executable Bash and POSIX-sh boundary rejects every inherited NIX prefix and preserves curated Wolfi input'
+
+# Stage 0 runs before any profile exists, so the only ambient apk authority a
+# guest can carry is inherited environment. The refusal is proved on the same
+# extracted contract text and in the same two shells as its NIX sibling.
+guest_toolchain_env_contract_case() {
+  local label=${1:?apk environment case label required} expectation=${2:?expectation required}
+  local shell=${3:?shell required}
+  shift 3
+  local shell_label=${shell##*/} rc=0
+  local output=$scratch/guest-toolchain-env-$label-$shell_label.out
+  local error=$scratch/guest-toolchain-env-$label-$shell_label.err
+  # The single-quoted program is intentionally expanded only by the child shell.
+  # shellcheck disable=SC2016
+  if env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "$@" "$shell" -c '
+    guest_nix_fail() { printf "%s: %s\n" "$1" "$2" >&2; exit 64; }
+    . "$1"
+    guest_nix_require_commands
+    guest_toolchain_require_clean_apk_env
+    printf "REACHED\n"
+  ' guest-toolchain-env-contract "$guest_nix_env_contract" >"$output" 2>"$error"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [[ $expectation == pass ]]; then
+    [[ $rc == 0 && $(cat "$output") == REACHED && ! -s $error ]] ||
+      fail "$label did not pass the executable $shell_label apk environment boundary"
+    return
+  fi
+  [[ $rc == 64 ]] ||
+    fail "$label did not exit 64 at the executable $shell_label apk environment boundary"
+  assert_contains "$error" GuestToolchainUnavailable
+  assert_not_contains "$output" REACHED
+  local assignment name
+  for assignment in "$@"; do
+    name=${assignment%%=*}
+    if [[ $name == APK* ]]; then
+      assert_contains "$error" "$name"
+    fi
+  done
+}
+
+guest_toolchain_hostile_env_cases=(
+  'apk-config|APK_CONFIG=/tmp/hostile-apk.conf'
+  'apk-root|APKROOT=/tmp/hostile-root'
+  'apk-cache|APK_CACHE_DIR=/tmp/hostile-cache'
+  'apk-keys|APK_KEYS_DIR=/tmp/hostile-keys'
+  'apk-repositories|APK_REPOSITORIES=https://attacker.invalid'
+  'apk-bare|APK=1'
+  'apk-unknown|APK_G13_UNKNOWN=1'
+)
+for guest_toolchain_env_shell in "${guest_nix_env_shells[@]}"; do
+  for guest_toolchain_hostile_env_case in "${guest_toolchain_hostile_env_cases[@]}"; do
+    guest_toolchain_env_label=${guest_toolchain_hostile_env_case%%|*}
+    guest_toolchain_env_assignment=${guest_toolchain_hostile_env_case#*|}
+    guest_toolchain_env_contract_case "$guest_toolchain_env_label" refuse \
+      "$guest_toolchain_env_shell" "$guest_toolchain_env_assignment"
+  done
+  guest_toolchain_env_contract_case multiple refuse "$guest_toolchain_env_shell" \
+    APK_CONFIG=hostile APKROOT=hostile
+  guest_toolchain_env_contract_case secret-value refuse "$guest_toolchain_env_shell" \
+    APK_CONFIG=guest-toolchain-secret-value-g13
+  assert_not_contains \
+    "$scratch/guest-toolchain-env-secret-value-${guest_toolchain_env_shell##*/}.err" \
+    guest-toolchain-secret-value-g13
+  guest_toolchain_env_contract_case curated-wolfi pass "$guest_toolchain_env_shell" \
+    HOME=/root TERM=xterm LANG=C SHLVL=1 PWD=/run/diene-ci HOSTNAME=wolfi USER=root \
+    apk_config=1 MY_APK_CONFIG=1 CONTAINER_APK=1
+  guest_toolchain_env_contract_case enumeration-failure refuse "$guest_toolchain_env_shell" \
+    PATH="$guest_nix_broken_env_bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  assert_contains \
+    "$scratch/guest-toolchain-env-enumeration-failure-${guest_toolchain_env_shell##*/}.err" \
+    'could not be enumerated for APK names'
+done
+ok 'the executable Bash and POSIX-sh boundary rejects every inherited APK prefix before apk can run'
 
 remote_bootstrap_pin_line=$(rg -n '^guest_nix_pinned_asset_valid guest-nix-bootstrap\.sh ' \
   "$production_remote_command" | cut -d: -f1)
@@ -4505,12 +5304,445 @@ install -d -m 0700 "$nix_guard_binding_root/instances/cluster-0000000000000000/f
 nix_guard_binding_rc=0
 FAKE_NSC_ROOT=$nix_guard_binding_root FAKE_NSC_LOG=$nix_guard_binding_root/log \
   FAKE_GUEST_NIX_GUARD=$guest_nix_guard FAKE_GUEST_BIN=$fake_guest \
-  "$fake_nsc" ssh cluster-0000000000000000 -T \
+  "$fake_nsc" ssh cluster-0000000000000000 -T -- \
   'set -eu; sha256sum -c archive-validator.sha256; ./archive-validator.sh source.tar source; exec nix develop' \
   >/dev/null 2>&1 || nix_guard_binding_rc=$?
 [[ $nix_guard_binding_rc == 69 ]] ||
   fail 'the fake ssh leg does not bind the fixed guest nix guard to production text'
 ok 'the fixed rail preserves GuestNixToolchainAbsent while admitting only exact direct-binary pins'
+
+# The ruled session shape carries both properties at once: -T selects no pseudo
+# terminal, and -- ends option parsing so the reviewed program can never be
+# re-read as an nsc flag. Either property alone is a shape the ruling forbids.
+nix_guard_session_shape_case() {
+  local label=${1:?session shape label required} rc=0
+  shift
+  FAKE_NSC_ROOT=$nix_guard_binding_root FAKE_NSC_LOG=$nix_guard_binding_root/log \
+    FAKE_GUEST_NIX_GUARD=$guest_nix_guard FAKE_GUEST_BIN=$fake_guest \
+    "$fake_nsc" ssh cluster-0000000000000000 "$@" >/dev/null 2>&1 || rc=$?
+  [[ $rc == 127 || $rc == 66 ]] ||
+    fail "the fake ssh leg admitted the forbidden $label session shape (rc $rc)"
+}
+nix_guard_session_shape_case 'unseparated -T' -T 'set -eu; exec nix develop'
+nix_guard_session_shape_case 'separator without -T' -- 'set -eu; exec nix develop'
+nix_guard_session_shape_case 'interactive pty' -t -- 'set -eu; exec nix develop'
+nix_guard_session_shape_case 'reversed separator' -- -T 'set -eu; exec nix develop'
+nix_guard_session_shape_case 'bare positional command' 'set -eu; exec nix develop'
+ok 'the fake nsc ssh leg admits only the noninteractive double-dash-separated session shape'
+
+# The driver leg is one bounded noninteractive separated session per attempt.
+# These gates bind the shape: a hard timeout exists, the session is `-T --`
+# separated, stdin is closed, the budget is not ambient, and the phase digest
+# carries the attempt trace. The wall-clock constants themselves -- the 30s and
+# 120s start watchdogs and the per-lane aggregate budgets -- are bound further
+# below, against the workflow job timeouts they are sized from.
+ssh_leg_source=$template_root/scripts/ci/environment-k3d-run.sh
+mapfile -t ssh_leg_calls < <(rg -N 'nsc_bin" ssh ' "$guest_nix_production_normalized" || true)
+[[ ${#ssh_leg_calls[@]} == 1 ]] ||
+  fail 'production text does not contain exactly one nsc ssh driver call site'
+ssh_leg_call=$(tr -s ' ' <<<"${ssh_leg_calls[0]}")
+ssh_leg_call=${ssh_leg_call# }
+# The tokens are production source text and must stay unexpanded here.
+# shellcheck disable=SC2016
+for ssh_leg_token in 'timeout ' '"$nsc_bin" ssh "$ORCH_CLUSTER_ID" -T -- "$remote_command"' \
+  '</dev/null' '>"$attempt_stdout"' '2>"$attempt_stderr"'; do
+  [[ $ssh_leg_call == *"$ssh_leg_token"* ]] ||
+    fail "the driver ssh leg lost a required element: $ssh_leg_token"
+done
+# Each attempt writes to its own private file and is folded into the shared
+# staging streams exactly once, by a helper that latches. Binding the private
+# redirection alone would lose the append-once property, so bind both: the
+# attempt files are created mode 0600, and the flush is guarded by a latch it
+# sets itself, appends rather than truncates, and is what the stop path calls.
+# The seams are production source text and must stay unexpanded.
+# shellcheck disable=SC2016
+for ssh_leg_flush_seam in 'chmod 0600 "$attempt_stdout" "$attempt_stderr"' \
+  '((ORCH_SSH_ACTIVE_EVIDENCE_FLUSHED == 0)) || return 0' \
+  'cat -- "$ORCH_SSH_ACTIVE_STDOUT" >>"$DIENE_EVIDENCE_STAGING/stdout"' \
+  'cat -- "$ORCH_SSH_ACTIVE_STDERR" >>"$DIENE_EVIDENCE_STAGING/stderr"' \
+  'ORCH_SSH_ACTIVE_EVIDENCE_FLUSHED=1'; do
+  rg -qF -- "$ssh_leg_flush_seam" "$ssh_leg_source" ||
+    fail "the append-once attempt evidence flush lost a required seam: $ssh_leg_flush_seam"
+done
+[[ $(rg -Nc -- 'orchestrator_flush_active_ssh_evidence' "$ssh_leg_source") -ge 3 ]] ||
+  fail 'the attempt evidence flush is not reached from both the attempt and the stop paths'
+rg -qF -- 'orchestrator_flush_active_ssh_evidence || true' "$ssh_leg_source" ||
+  fail 'the stop path does not flush partial attempt evidence'
+# A truncating fold would silently discard the earlier attempt's evidence.
+if rg -n -e '>"\$DIENE_EVIDENCE_STAGING/(stdout|stderr)"' "$ssh_leg_source" |
+  rg -v -e '>>"\$DIENE_EVIDENCE_STAGING/' >"$scratch/ssh-leg-truncating-fold"; then
+  sed -n '1,40p' "$scratch/ssh-leg-truncating-fold" >&2
+  fail 'attempt evidence is folded into staging with a truncating redirection'
+fi
+[[ $ssh_leg_call == timeout\ * ]] ||
+  fail 'the driver ssh leg is not wrapped in a hard timeout'
+for ssh_leg_mutant in \
+  "unbounded|${ssh_leg_call#timeout *}" \
+  "positional-command|${ssh_leg_call/-T -- /-T }" \
+  "inherited-stdin|${ssh_leg_call/ <\/dev\/null/}" \
+  "interactive-session|${ssh_leg_call/-T --/-t --}"; do
+  ssh_leg_mutant_label=${ssh_leg_mutant%%|*}
+  [[ ${ssh_leg_mutant#*|} != "$ssh_leg_call" ]] ||
+    fail "the $ssh_leg_mutant_label ssh leg mutant did not change the reviewed call"
+done
+# Every external helper the bounded ssh leg depends on must be proven present
+# before any instance exists, so a missing helper is a cheap pre-create refusal
+# rather than a live instance stranded mid-leg. The fake nsc can mask these
+# commands, so the ruling admits a static ordering proof: each require must
+# appear before the state directory is bound and before the create array runs.
+ssh_leg_state_line=$(rg -n -F -- 'ORCH_STATE="${RUNNER_TEMP:?}/diene-namespace/$ORCH_RECEIPT_ID"' \
+  "$ssh_leg_source" | head -1 | cut -d: -f1)
+ssh_leg_create_line=$(rg -n -F -- 'local -a create=("$nsc_bin" create --ephemeral' \
+  "$ssh_leg_source" | head -1 | cut -d: -f1)
+[[ $ssh_leg_state_line =~ ^[1-9][0-9]*$ && $ssh_leg_create_line =~ ^[1-9][0-9]*$ &&
+  $ssh_leg_state_line -lt $ssh_leg_create_line ]] ||
+  fail 'the pre-create state and create boundaries are absent or misordered'
+for ssh_leg_helper in wc cmp sleep timeout; do
+  ssh_leg_helper_lines=$(rg -Nc -- "^  diene_require_command $ssh_leg_helper\$" "$ssh_leg_source" ||
+    printf 0)
+  [[ $ssh_leg_helper_lines == 1 ]] ||
+    fail "the ssh leg helper $ssh_leg_helper is not required exactly once before create"
+  ssh_leg_helper_line=$(rg -n -- "^  diene_require_command $ssh_leg_helper\$" \
+    "$ssh_leg_source" | head -1 | cut -d: -f1)
+  [[ $ssh_leg_helper_line -lt $ssh_leg_state_line ]] ||
+    fail "the ssh leg helper $ssh_leg_helper is required only after the state directory is bound"
+  [[ $ssh_leg_helper_line -lt $ssh_leg_create_line ]] ||
+    fail "the ssh leg helper $ssh_leg_helper is required only after nsc create"
+done
+ok 'wc, cmp, sleep, and timeout are each required exactly once before state binding and create'
+rg -qF -- 'ORCH_SSH_DIGEST=$(phase_digest ssh "$ORCH_CLUSTER_ID" "$ssh_attempt_trace")' \
+  "$ssh_leg_source" ||
+  fail 'the ssh phase digest does not bind the exact cluster and its attempt trace'
+if rg -n 'DIENE_NSC_SSH_TIMEOUT|DIENE_SSH_TIMEOUT|DIENE_NSC_SSH_ATTEMPTS|DIENE_SSH_ATTEMPTS' \
+  "$guest_nix_production_normalized" >"$scratch/ssh-leg-ambient"; then
+  sed -n '1,40p' "$scratch/ssh-leg-ambient" >&2
+  fail 'the ssh timeout or attempt budget acquired an ambient environment override'
+fi
+# A retry must never become a second instance: no create, no recreate helper,
+# and no readiness ordinal may appear inside the reviewed retry loop.
+ssh_leg_loop=$(awk '/^  for ssh_attempt in /{inside=1} inside; /^  done$/{if (inside) exit}' \
+  "$ssh_leg_source")
+[[ -n $ssh_leg_loop ]] || fail 'the bounded ssh retry loop could not be isolated'
+for ssh_leg_forbidden in 'create' 'orchestrator_create' 'sleep' 'readiness' 'ordinal'; do
+  [[ $ssh_leg_loop != *"$ssh_leg_forbidden"* ]] ||
+    fail "the bounded ssh retry loop contains a forbidden $ssh_leg_forbidden step"
+done
+ok 'the driver ssh leg is one bounded separated session whose retry adds no create, sleep, or ordinal'
+
+# Prove the hard-timeout mechanism really produces the two statuses the retry
+# keys on, so the classifier is bound to measured behaviour, not to belief.
+ssh_leg_signature_rc=0
+timeout --foreground --kill-after=5s 1s sleep 30 >/dev/null 2>&1 || ssh_leg_signature_rc=$?
+[[ $ssh_leg_signature_rc == 124 ]] ||
+  fail "a hard timeout did not yield the 124 retry signature (got $ssh_leg_signature_rc)"
+ssh_leg_stubborn=$scratch/ssh-leg-stubborn.sh
+printf '%s\n' '#!/bin/sh' 'trap "" TERM' 'sleep 30' >"$ssh_leg_stubborn"
+chmod 0755 "$ssh_leg_stubborn"
+ssh_leg_signature_rc=0
+timeout --foreground --kill-after=1s 1s "$ssh_leg_stubborn" >/dev/null 2>&1 ||
+  ssh_leg_signature_rc=$?
+[[ $ssh_leg_signature_rc == 137 ]] ||
+  fail "a hard kill-after did not yield the 137 retry signature (got $ssh_leg_signature_rc)"
+ok 'the hard-timeout mechanism empirically produces both the 124 and 137 retry signatures'
+
+# Cancellation depends on a mechanism, not on a belief: an EXTERNAL signal
+# delivered to a tracked background timeout must also arm the fixed kill-after
+# convergence and leave no surviving child, or the stop helper can hang forever
+# on a command that ignores TERM.
+ssh_leg_external_marker=$scratch/ssh-leg-external.marker
+ssh_leg_external_child=$scratch/ssh-leg-external-child.sh
+{
+  printf '%s\n' '#!/bin/sh' 'trap "" TERM'
+  printf 'printf %%s "$$" >%s\n' "$ssh_leg_external_marker"
+  printf '%s\n' 'sleep 300'
+} >"$ssh_leg_external_child"
+chmod 0755 "$ssh_leg_external_child"
+rm -f -- "$ssh_leg_external_marker"
+timeout --foreground --kill-after=2s 600s "$ssh_leg_external_child" >/dev/null 2>&1 &
+ssh_leg_external_pid=$!
+ssh_leg_external_waited=0
+while [[ ! -s $ssh_leg_external_marker && $ssh_leg_external_waited -lt 50 ]]; do
+  ssh_leg_external_waited=$((ssh_leg_external_waited + 1))
+  sleep 0.1
+done
+[[ -s $ssh_leg_external_marker ]] ||
+  fail 'the external-signal convergence probe never started its TERM-ignoring child'
+ssh_leg_external_child_pid=$(cat "$ssh_leg_external_marker")
+kill -TERM "$ssh_leg_external_pid"
+ssh_leg_signature_rc=0
+wait "$ssh_leg_external_pid" || ssh_leg_signature_rc=$?
+[[ $ssh_leg_signature_rc == 137 ]] ||
+  fail "an external TERM to the tracked timeout did not converge at 137 (got $ssh_leg_signature_rc)"
+ssh_leg_external_waited=0
+while kill -0 "$ssh_leg_external_child_pid" 2>/dev/null &&
+  [[ $ssh_leg_external_waited -lt 50 ]]; do
+  ssh_leg_external_waited=$((ssh_leg_external_waited + 1))
+  sleep 0.1
+done
+! kill -0 "$ssh_leg_external_child_pid" 2>/dev/null ||
+  fail 'the external-signal convergence left the TERM-ignoring child alive'
+ok 'an external signal to the tracked timeout converges at 137 and leaves no surviving child'
+
+# The aggregate SSH-leg budget is one deadline covering both start watchdogs,
+# both reaps, and all marked driver runtime. The reserve is therefore counted
+# exactly once: budget + 15m must fit the lane's declared job timeout, and the
+# watchdog windows must NOT be added on top again. The job timeouts are read
+# out of the reusable workflow rather than from a second copy of the numbers,
+# so the table cannot drift away from the jobs it is sized against.
+ssh_leg_reusable_workflow=$template_root/.github/workflows/⚡reusable-environment-k3d.yaml
+ssh_leg_reserve_minutes=15
+ssh_leg_lane_budgets=(
+  'environment-fleet-independence|fleet-independence|2700'
+  'environment-ditto-build-local|ditto-build-local|3600'
+  'environment-ditto-target-pull|ditto-target-pull|3600'
+  'environment-ditto-vendor|ditto-vendor|4500'
+  'environment-absol|absol|6300'
+)
+for ssh_leg_lane_budget in "${ssh_leg_lane_budgets[@]}"; do
+  IFS='|' read -r ssh_leg_job ssh_leg_lane ssh_leg_budget <<<"$ssh_leg_lane_budget"
+  # The jq path is a yq program, not shell.
+  # shellcheck disable=SC2016
+  ssh_leg_job_timeout=$(ssh_leg_job=$ssh_leg_job yq -r \
+    '.jobs[strenv(ssh_leg_job)]["timeout-minutes"]' "$ssh_leg_reusable_workflow")
+  [[ $ssh_leg_job_timeout =~ ^[1-9][0-9]*$ ]] ||
+    fail "the $ssh_leg_job job declares no numeric timeout to size the ssh leg against"
+  ((ssh_leg_budget % 60 == 0)) ||
+    fail "the $ssh_leg_lane aggregate ssh budget is not a whole number of minutes"
+  [[ $((ssh_leg_budget / 60 + ssh_leg_reserve_minutes)) == "$ssh_leg_job_timeout" ]] ||
+    fail "the $ssh_leg_lane aggregate ssh budget plus the ${ssh_leg_reserve_minutes}m reserve is not its ${ssh_leg_job_timeout}m job timeout"
+  ssh_leg_production_budget=$(
+    # shellcheck source=/dev/null
+    source "$template_root/scripts/ci/environment-k3d-run.sh" >/dev/null 2>&1 || true
+    DIENE_LANE=$ssh_leg_lane orchestrator_ssh_leg_budget_seconds
+  ) || fail "production exposes no aggregate ssh budget for $ssh_leg_lane"
+  [[ $ssh_leg_production_budget == "$ssh_leg_budget" ]] ||
+    fail "production sizes the $ssh_leg_lane aggregate ssh budget at $ssh_leg_production_budget, not $ssh_leg_budget"
+done
+# Adding the start watchdogs on top of the aggregate budget would double-count
+# the reserve; the widest lane must still fit with the reserve counted once.
+[[ $((6300 / 60 + ssh_leg_reserve_minutes)) == 120 ]] ||
+  fail 'the widest aggregate ssh budget no longer fits its job timeout with one reserve'
+ok 'every lane aggregate ssh budget plus one fifteen-minute reserve is exactly its job timeout'
+
+# Asymmetric start windows, drawn from and capped by the one aggregate deadline.
+# The seams are production source text and must stay unexpanded.
+# shellcheck disable=SC2016
+for ssh_leg_seam in 'ssh_leg_deadline=$((SECONDS + ssh_leg_budget_seconds))' \
+  'ssh_remaining_seconds=$((ssh_leg_deadline - SECONDS))' \
+  'timeout --foreground --kill-after=10s "${remaining_seconds}s"' \
+  'DieneNscSshSessionReady:v1'; do
+  rg -qF -- "$ssh_leg_seam" "$ssh_leg_source" ||
+    fail "the aggregate ssh leg lost a required seam: $ssh_leg_seam"
+done
+[[ $(rg -Nc -- 'ssh_leg_deadline=\$\(\(SECONDS \+ ssh_leg_budget_seconds\)\)' \
+  "$ssh_leg_source") == 1 ]] ||
+  fail 'the aggregate ssh deadline is computed more than once, so attempt 2 can be refreshed'
+for ssh_leg_window in 30 120; do
+  rg -qF -- "$ssh_leg_window" "$ssh_leg_source" ||
+    fail "the ${ssh_leg_window}s asymmetric start watchdog is absent"
+done
+ok 'the ssh leg draws asymmetric start windows from exactly one aggregate deadline'
+
+# Real lane budgets (2700s and up) always exceed the combined 150s watchdog
+# surface, so the capped path can never be reached through a lane. Prove it
+# statically, and then directly, with a synthetic remainder.
+# The seams are production source text and must stay unexpanded.
+# shellcheck disable=SC2034,SC2016
+for ssh_leg_cap_seam in 'if ((ssh_watchdog_seconds > ssh_remaining_seconds)); then' \
+  'ssh_watchdog_seconds=$ssh_remaining_seconds' \
+  'if ((ssh_remaining_seconds <= 0)); then' \
+  'watchdog_stopped'; do
+  rg -qF -- "$ssh_leg_cap_seam" "$ssh_leg_source" ||
+    fail "the aggregate ssh leg lost its remainder-capping seam: $ssh_leg_cap_seam"
+done
+# A watchdog-forced stop must freeze the attempt unready; only the pre-stop
+# boundary scan may admit a last-poll marker.
+rg -qF -- 'watchdog_stopped=true' "$ssh_leg_source" ||
+  fail 'the ssh leg never records that a stop was watchdog-forced'
+# The observation and the decision are separate concerns. The post-reap
+# first-line scan must run and be STORED on every branch, including frozen
+# ones, so the evidence exists; only the readiness upgrade may be gated. A
+# harness that bound the gate alone would let the scan itself be skipped.
+# The post-reap scan is the only one at function indent; the earlier two are
+# inside the poll loop and the pre-stop boundary, both nested deeper.
+[[ $(rg -Nc -- '^  if orchestrator_ssh_ready_marker_seen "\$attempt_stdout"; then$' \
+  "$ssh_leg_source") == 1 ]] ||
+  fail 'the post-reap first-line scan is not a single unambiguous statement'
+ssh_leg_final_scan=$(awk '
+  /^  if orchestrator_ssh_ready_marker_seen "\$attempt_stdout"; then$/ { inside = 1 }
+  inside { print }
+  inside && /^  fi$/ { exit }' "$ssh_leg_source")
+[[ $ssh_leg_final_scan == *'final_marker_seen=true'* ]] ||
+  fail 'the post-reap first-line scan does not store its observation unconditionally'
+[[ $ssh_leg_final_scan != *watchdog_stopped* &&
+  $ssh_leg_final_scan != *capped_timeout_reaped* ]] ||
+  fail 'the post-reap first-line scan is itself skipped on a frozen branch'
+[[ $(rg -Nc -- 'final_marker_seen=true' "$ssh_leg_source") == 1 ]] ||
+  fail 'the stored post-reap observation is written from more than one place'
+# Two distinct freeze causes, and the upgrade must require the absence of both.
+# An active watchdog stop canonicalizes the status to 124; a capped boundary
+# that only became visible after reap must NOT rewrite the real 124/137 it
+# already carries, or the trace would stop distinguishing the two.
+rg -qF -- 'if [[ $watchdog_stopped != true && $capped_timeout_reaped != true &&' \
+  "$ssh_leg_source" ||
+  fail 'the readiness upgrade does not require the absence of both freeze causes'
+for ssh_leg_freeze_cause in watchdog_stopped capped_timeout_reaped; do
+  [[ $(rg -Nc -- "^  local .*$ssh_leg_freeze_cause=false" "$ssh_leg_source" ||
+    printf 0) -ge 1 ]] ||
+    fail "the ssh leg freeze cause $ssh_leg_freeze_cause is not initialised false"
+  [[ $(rg -Nc -- "$ssh_leg_freeze_cause=true" "$ssh_leg_source") == 1 ]] ||
+    fail "the ssh leg freeze cause $ssh_leg_freeze_cause is set from more than one place"
+done
+ssh_leg_canonicalize=$(awk '
+  /^  if \[\[ \$watchdog_stopped == true \]\]; then$/ { inside = 1 }
+  inside { print }
+  inside && /^  fi$/ { exit }' "$ssh_leg_source")
+[[ $ssh_leg_canonicalize == *'rc=124'* ]] ||
+  fail 'an active watchdog stop does not canonicalize the attempt status'
+[[ $ssh_leg_canonicalize != *capped_timeout_reaped* ]] ||
+  fail 'a capped reaped timeout rewrites the exact status it already carried'
+
+ssh_leg_attempt_case() {
+  local label=${1:?attempt label required} child=${2:?child behaviour required}
+  local remaining=${3:?aggregate remainder required} watchdog=${4:?watchdog seconds required}
+  local expect_ready=${5:?readiness required} expect_rc=${6:?status required}
+  local root=$scratch/ssh-leg-attempt-$label
+  install -d -m 0700 "$root/state" "$root/staging"
+  local fake_nsc_bin=$root/nsc
+  case $child in
+    unmarked-hang)
+      printf '%s\n' '#!/usr/bin/env bash' 'sleep 120' >"$fake_nsc_bin"
+      ;;
+    marked-fast)
+      printf '%s\n' '#!/usr/bin/env bash' \
+        "printf '%s\\n' 'DieneNscSshSessionReady:v1'" 'exit 0' >"$fake_nsc_bin"
+      ;;
+    late-marker)
+      printf '%s\n' '#!/usr/bin/env bash' \
+        "trap 'printf \"%s\\n\" \"DieneNscSshSessionReady:v1\"; exit 124' TERM" \
+        'sleep 120 &' 'wait $! || true' 'exit 0' >"$fake_nsc_bin"
+      ;;
+    marked-between-polls)
+      # Alive through the initial scan, then a genuine self-directed exit with
+      # the marker, strictly before the shared one-second boundary. Nothing
+      # kills this child, so the voluntary-exit final scan must admit it.
+      printf '%s\n' '#!/usr/bin/env bash' 'sleep 0.3' \
+        "printf '%s\\n' 'DieneNscSshSessionReady:v1'" 'exit 0' >"$fake_nsc_bin"
+      ;;
+    *) fail "unknown ssh leg attempt child $child" ;;
+  esac
+  chmod 0755 "$fake_nsc_bin"
+  # The globals are consumed by the sourced production function.
+  # shellcheck disable=SC2034
+  local observed
+  observed=$(
+    # shellcheck source=/dev/null
+    source "$ssh_leg_source" >/dev/null 2>&1 || true
+    # These globals are read by the sourced production attempt function.
+    # shellcheck disable=SC2034
+    ORCH_STATE=$root/state
+    # shellcheck disable=SC2034
+    ORCH_CLUSTER_ID='cluster-000000000000cafe'
+    DIENE_EVIDENCE_STAGING=$root/staging
+    : >"$DIENE_EVIDENCE_STAGING/stdout"
+    : >"$DIENE_EVIDENCE_STAGING/stderr"
+    orchestrator_run_ssh_attempt "$fake_nsc_bin" 'true' 1 "$remaining" "$watchdog"
+    printf '%s|%s\n' "$ORCH_SSH_ATTEMPT_READY" "$ORCH_SSH_ATTEMPT_RC"
+  ) || fail "$label direct ssh attempt probe failed to run"
+  [[ $observed == "$expect_ready|$expect_rc" ]] ||
+    fail "$label direct ssh attempt observed $observed, expected $expect_ready|$expect_rc"
+}
+ssh_leg_attempt_case capped-unmarked unmarked-hang 300 2 false 124
+ssh_leg_attempt_case capped-marked marked-fast 300 2 true 0
+ssh_leg_attempt_case capped-late-marker late-marker 300 2 false 124
+# The capped-window race: when the aggregate remainder EQUALS the marker
+# watchdog, GNU timeout fires at the same instant the watchdog gives up. The
+# child is then terminated by timeout rather than by the stop helper, so it
+# looks like a voluntary exit and a watchdog_stopped flag set only on the
+# stop path stays false -- letting a marker printed from the child's TERM
+# handler win the post-reap scan. A marker produced by the deadline that killed
+# the session is never evidence the session started in time.
+ssh_leg_attempt_case racing-late-marker late-marker 2 2 false 124
+ssh_leg_attempt_case racing-late-marker-tight late-marker 1 1 false 124
+# The freeze must not overreach. A child that genuinely exits on its own at the
+# same capped values, having emitted the marker as its first complete line,
+# must still be admitted by the post-reap scan -- otherwise the fix for the
+# race would start rejecting healthy fast sessions instead.
+ssh_leg_attempt_case racing-marked marked-fast 2 2 true 0
+# A child that survives the initial scan and then exits of its own accord with
+# the marker must still be ready at capped values -- nothing killed it. This
+# runs at 2/2 rather than 1/1 deliberately: `SECONDS` has one-second
+# granularity, so a watchdog of N gives a real window anywhere in [N-1, N], and
+# at N=1 that window can be under the child's own delay. Pinning 1/1 made this
+# case pass in isolation and fail under load, which is a flaky gate, not a
+# finding. Which internal branch admits it (the later poll or the post-reap
+# scan) is not deterministically selectable with one-second polling, so the
+# behavioural gate binds the OUTCOME and the static gates above bind the
+# post-reap path itself -- the unconditional stored scan and its two-cause
+# upgrade. Together those cover the rule without asserting a race.
+ssh_leg_attempt_case racing-marked-between-polls marked-between-polls 2 2 true 0
+ok 'a watchdog capped by the aggregate remainder still freezes an unmarked attempt as unready'
+ok 'the capped-boundary freeze still admits a naturally exited marked session'
+
+# The attempt probe above proves readiness and status, but classification lives
+# in orchestrate and reads a caller-local aggregate-exhaustion flag, so the two
+# readiness-first branches are not reachable from it. Extract the real chain and
+# drive it directly across the full truth table, so a capped aggregate deadline
+# is proved to yield the session-start class rather than the driver class.
+ssh_leg_classifier=$scratch/ssh-leg-classifier.sh
+# The emitted lines are shell source for the extracted chain, not expansions.
+# shellcheck disable=SC2016
+{
+  printf '%s\n' 'orchestrator_fail() { printf "%s\n" "$2" >/dev/null; }'
+  printf '%s\n' 'DIENE_REASON_EXIT=64'
+  printf '%s\n' 'ssh_leg_classify() {'
+  printf '%s\n' '  ssh_rc=$1 ssh_ready=$2 ssh_aggregate_exhausted=$3 ssh_attempt=$4'
+  printf '%s\n' '  ORCH_SSH_OUTCOME= ORCH_SSH_REASON='
+  awk '/^  if \(\(ssh_rc == 0\)\) && \[\[ \$ssh_ready == true \]\]; then$/{inside=1}
+    inside {print}
+    inside && /^  fi$/{exit}' "$ssh_leg_source"
+  printf '%s\n' '  printf "%s|%s\n" "$ORCH_SSH_OUTCOME" "$ORCH_SSH_REASON"'
+  printf '%s\n' '}'
+} >"$ssh_leg_classifier"
+[[ $(grep -c 'ORCH_SSH_REASON=NamespaceSshDriverTimedOut' "$ssh_leg_classifier") == 1 &&
+  $(grep -c 'ORCH_SSH_REASON=NamespaceSshSessionStartTimedOut' "$ssh_leg_classifier") == 1 &&
+  $(grep -c 'ORCH_SSH_REASON=NamespaceSshSessionStartUnproven' "$ssh_leg_classifier") == 1 &&
+  $(grep -c 'ORCH_SSH_REASON=NamespaceSshDriverFailed' "$ssh_leg_classifier") == 1 ]] ||
+  fail 'the production ssh classification chain could not be isolated intact'
+bash -n "$ssh_leg_classifier" ||
+  fail 'the isolated ssh classification chain is not valid Bash'
+# shellcheck source=/dev/null
+source "$ssh_leg_classifier"
+ssh_leg_classify_case() {
+  local rc=${1:?} ready=${2:?} exhausted=${3:?} attempt=${4:?} expected=${5:?}
+  local observed
+  observed=$(ssh_leg_classify "$rc" "$ready" "$exhausted" "$attempt")
+  [[ $observed == "$expected" ]] ||
+    fail "ssh classification of rc=$rc ready=$ready exhausted=$exhausted attempt=$attempt was $observed, expected $expected"
+}
+# Readiness is tested first: the SAME status and the SAME aggregate expiry must
+# split into two different classes purely on whether the session proved itself.
+ssh_leg_classify_case 124 false true 2 'Fail|NamespaceSshSessionStartTimedOut'
+ssh_leg_classify_case 124 true true 2 'Fail|NamespaceSshDriverTimedOut'
+ssh_leg_classify_case 0 false true 2 'Fail|NamespaceSshSessionStartTimedOut'
+# A marked zero cannot coexist with aggregate exhaustion in production, because
+# exhaustion is only ever recorded alongside a 124. Assert the safe resolution
+# anyway: a proven-complete driver is a pass and a stale flag never reddens it.
+ssh_leg_classify_case 0 true true 2 'Pass|NonInteractiveDriverCompletedAfterSshSessionRetry'
+# Status-driven timeouts split the same way with no aggregate expiry at all.
+ssh_leg_classify_case 124 false false 1 'Fail|NamespaceSshSessionStartTimedOut'
+ssh_leg_classify_case 137 false false 2 'Fail|NamespaceSshSessionStartTimedOut'
+ssh_leg_classify_case 124 true false 1 'Fail|NamespaceSshDriverTimedOut'
+ssh_leg_classify_case 137 true false 2 'Fail|NamespaceSshDriverTimedOut'
+# Everything else, including the fail-closed unmarked zero.
+ssh_leg_classify_case 0 false false 1 'Fail|NamespaceSshSessionStartUnproven'
+ssh_leg_classify_case 42 false false 1 'Fail|NamespaceSshDriverFailed'
+ssh_leg_classify_case 42 true false 2 'Fail|NamespaceSshDriverFailed'
+ssh_leg_classify_case 143 true false 1 'Fail|NamespaceSshDriverFailed'
+ssh_leg_classify_case 130 false false 1 'Fail|NamespaceSshDriverFailed'
+ssh_leg_classify_case 0 true false 1 'Pass|NonInteractiveDriverCompleted'
+ssh_leg_classify_case 0 true false 2 'Pass|NonInteractiveDriverCompletedAfterSshSessionRetry'
+ok 'the real classification chain splits marked and unmarked timeouts on readiness first'
 
 printf '== the complete fixed remote rail executes in a disposable guest ==\n'
 
@@ -4562,6 +5794,45 @@ printf '%s\n' 'uid=0' 'nix=absent' 'etcNix=absent' 'shell=busybox-ash' \
 : >harness/remote.stdout
 : >harness/remote.stderr
 chmod 0600 harness/initial-state harness/remote.stdout harness/remote.stderr
+rail_scenario=$(cat harness/scenario)
+# Guest-side hostile injections. They mutate the disposable image, never the
+# fixed program, so stage 0 is measured against the guest it actually gets.
+case $rail_scenario in
+  g4-apk-absent) rm -f /usr/bin/apk ;;
+  g6-identity-rebind)
+    mv /usr/bin/apk /usr/bin/apk.real
+    printf '%s\n' '#!/bin/sh' 'set -e' '/usr/bin/apk.real "$@"' 'rm -f /usr/bin/sed' \
+      'ln -s /usr/bin/busybox /usr/bin/sed' >/usr/bin/apk
+    chmod 0755 /usr/bin/apk
+    ;;
+  g7-tar-stub)
+    rm -f /usr/bin/tar
+    printf '%s\n' '#!/bin/sh' 'exit 0' >/usr/bin/tar
+    chmod 0755 /usr/bin/tar
+    ;;
+  g8-apk-noop)
+    rm -f /usr/bin/apk
+    printf '%s\n' '#!/bin/sh' 'exit 0' >/usr/bin/apk
+    chmod 0755 /usr/bin/apk
+    ;;
+  g10-cancel)
+    mv /usr/bin/apk /usr/bin/apk.real
+    printf '%s\n' '#!/bin/sh' 'kill -TERM "$PPID"' 'sleep 5' 'exit 0' >/usr/bin/apk
+    chmod 0755 /usr/bin/apk
+    ;;
+  g12-no-network) : >/lib/apk/db/installed ;;
+esac
+if [ "$rail_scenario" = g11-rerun ]; then
+  : >harness/first.stdout
+  : >harness/first.stderr
+  chmod 0600 harness/first.stdout harness/first.stderr
+  set +e
+  /usr/bin/busybox ash /run/diene-ci/remote-program \
+    >harness/first.stdout 2>harness/first.stderr
+  printf '%s\n' "$?" >harness/first.rc
+  set -e
+  chmod 0600 harness/first.rc
+fi
 set +e
 /usr/bin/busybox ash /run/diene-ci/remote-program \
   >harness/remote.stdout 2>harness/remote.stderr
@@ -4581,7 +5852,9 @@ if [ -e "$guest_rail_profile" ] || [ -L "$guest_rail_profile" ]; then
   fi
   chmod 0600 harness/profile.resolved
 fi
-tar -cf - -C /run/diene-ci .
+# The collection tar is spelled through BusyBox directly: a hostile case may
+# have replaced /usr/bin/tar, and the state archive must still come back.
+/usr/bin/busybox tar -cf - -C /run/diene-ci .
 exit "$rail_rc"
 GUEST_RAIL_CONTAINER
 )
@@ -4599,11 +5872,16 @@ guest_rail_uploaded_files=(
   receipt.json
   source.tar
 )
+for guest_toolchain_file in "${guest_toolchain_files[@]}"; do
+  guest_rail_uploaded_files+=("gnu/$guest_toolchain_file" "gnu/$guest_toolchain_file.sha256")
+done
+[[ ${#guest_rail_uploaded_files[@]} == 31 ]] ||
+  fail 'the disposable guest seed is not the exact thirty-one uploaded transfer set'
 
 guest_rail_prepare_seed() {
   local seed=${1:?guest rail seed required} scenario=${2:?guest rail scenario required}
   local mutation=${3:-none} uploaded changed_digest
-  install -d -m 0700 "$seed" "$seed/harness"
+  install -d -m 0700 "$seed" "$seed/harness" "$seed/gnu"
   for uploaded in "${guest_rail_uploaded_files[@]}"; do
     [[ -f $happy_instance_state/$uploaded && ! -L $happy_instance_state/$uploaded ]] ||
       fail "the real post-upload guest seed is missing $uploaded"
@@ -4614,16 +5892,53 @@ guest_rail_prepare_seed() {
   chmod 0600 "$seed/remote-program.sha256"
   printf '%s\n' "$scenario" >"$seed/harness/scenario"
   chmod 0600 "$seed/harness/scenario"
-  if [[ $mutation == payload-pair ]]; then
-    printf X | dd of="$seed/guest-nix-installer" bs=1 seek=0 conv=notrunc status=none
-    (cd "$seed" && sha256sum guest-nix-installer >guest-nix-installer.sha256)
-    chmod 0600 "$seed/guest-nix-installer" "$seed/guest-nix-installer.sha256"
-    (cd "$seed" && sha256sum -c guest-nix-installer.sha256 >/dev/null) ||
-      fail 'the hostile changed asset and sidecar are not a self-consistent pair'
-    changed_digest="sha256:$(sha256sum "$seed/guest-nix-installer" | awk '{print $1}')"
-    [[ $changed_digest != "$guest_nix_fixture_payload_digest" ]] ||
-      fail 'the hostile changed asset pair did not diverge from the admitted payload pin'
-  fi
+  case $mutation in
+    payload-pair)
+      printf X | dd of="$seed/guest-nix-installer" bs=1 seek=0 conv=notrunc status=none
+      (cd "$seed" && sha256sum guest-nix-installer >guest-nix-installer.sha256)
+      chmod 0600 "$seed/guest-nix-installer" "$seed/guest-nix-installer.sha256"
+      (cd "$seed" && sha256sum -c guest-nix-installer.sha256 >/dev/null) ||
+        fail 'the hostile changed asset and sidecar are not a self-consistent pair'
+      changed_digest="sha256:$(sha256sum "$seed/guest-nix-installer" | awk '{print $1}')"
+      [[ $changed_digest != "$guest_nix_fixture_payload_digest" ]] ||
+        fail 'the hostile changed asset pair did not diverge from the admitted payload pin'
+      ;;
+    apk-pair)
+      printf X | dd of="$seed/gnu/coreutils-9.11-r3.apk" bs=1 seek=0 conv=notrunc status=none
+      (cd "$seed/gnu" && sha256sum coreutils-9.11-r3.apk >coreutils-9.11-r3.apk.sha256)
+      chmod 0600 "$seed/gnu/coreutils-9.11-r3.apk" "$seed/gnu/coreutils-9.11-r3.apk.sha256"
+      (cd "$seed/gnu" && sha256sum -c coreutils-9.11-r3.apk.sha256 >/dev/null) ||
+        fail 'the hostile changed package and sidecar are not a self-consistent pair'
+      ;;
+    apk-missing) rm -- "$seed/gnu/sed-4.10-r1.apk" ;;
+    apk-symlink)
+      cp "$seed/gnu/grep-3.12-r6.apk" "$seed/gnu/grep-3.12-r6.apk.link-target"
+      rm -- "$seed/gnu/grep-3.12-r6.apk"
+      ln -s grep-3.12-r6.apk.link-target "$seed/gnu/grep-3.12-r6.apk"
+      ;;
+    validator-order)
+      # An ordering probe, not an integrity probe: the real validator is kept
+      # intact behind a wrapper that records whether the proven-GNU stage-0
+      # record already existed the moment climb code first ran.
+      mv "$seed/archive-validator.sh" "$seed/archive-validator.real.sh"
+      cat >"$seed/archive-validator.sh" <<'GUEST_RAIL_ORDER_PROBE'
+#!/bin/sh
+set -eu
+if [ -f /run/diene-ci/evidence/gnu-toolchain/identity.txt ]; then
+  printf '%s\n' stage0-preceded-validator >/run/diene-ci/harness/order
+else
+  printf '%s\n' stage0-missing-at-validator >/run/diene-ci/harness/order
+fi
+chmod 0600 /run/diene-ci/harness/order
+exec /bin/sh /run/diene-ci/archive-validator.real.sh "$@"
+GUEST_RAIL_ORDER_PROBE
+      chmod 0600 "$seed/archive-validator.sh" "$seed/archive-validator.real.sh"
+      (cd "$seed" && sha256sum archive-validator.sh >archive-validator.sha256)
+      chmod 0600 "$seed/archive-validator.sha256"
+      ;;
+    none) ;;
+    *) fail "unknown guest rail seed mutation $mutation" ;;
+  esac
 }
 
 guest_rail_assert_safe_records() {
@@ -4647,7 +5962,7 @@ guest_rail_run_case() {
   local label=${1:?guest rail case label required} scenario=${2:?guest rail scenario required}
   local expected_rc=${3:?expected guest rail rc required} expected_reason=${4-}
   local root=$scratch/guest-rail/$label seed result seed_tar result_tar docker_error
-  local mutation=none rail_rc=0
+  local mutation=none rail_rc=0 stage0_refusal=false retry_probe=false
   local -a guest_environment=()
   seed=$root/seed
   result=$root/result
@@ -4659,6 +5974,15 @@ guest_rail_run_case() {
     S1) mutation='payload-pair' ;;
     S2) guest_environment=(--env 'NIX_INSTALLER_EXTRA_CONF=guest-rail-secret-extra') ;;
     S3) guest_environment=(--env 'NIX_CONFIG=guest-rail-secret-config') ;;
+    G1) mutation='apk-pair'; stage0_refusal=true ;;
+    G2) mutation='apk-missing'; stage0_refusal=true ;;
+    G3) mutation='apk-symlink'; stage0_refusal=true ;;
+    G4 | G6 | G7 | G8 | G10 | G12) stage0_refusal=true ;;
+    G5) guest_environment=(--env 'APK_CONFIG=guest-rail-secret-apk'); stage0_refusal=true ;;
+    G9) mutation='validator-order' ;;
+    # G11 legitimately reruns a completed pass, so its first leg owns the green
+    # records the hostile forbidden-artifact list exists to forbid.
+    G11) retry_probe=true ;;
   esac
   guest_rail_prepare_seed "$seed" "$scenario" "$mutation"
   tar --owner=0 --group=0 --numeric-owner -cf "$seed_tar" -C "$seed" .
@@ -4710,10 +6034,27 @@ guest_rail_run_case() {
       sed -n '1,160p' "$result/harness/remote.stderr" >&2
       fail "$label exact rail emitted no stable $expected_reason refusal"
     }
-    [[ $(grep -Ec '^GuestNix[A-Za-z]+:' "$result/harness/remote.stderr") == 1 ]] ||
-      fail "$label exact rail did not emit exactly one stable GuestNix refusal class"
+    [[ $(grep -Ec '^Guest(Nix|Toolchain)[A-Za-z]+:' "$result/harness/remote.stderr") == 1 ]] ||
+      fail "$label exact rail did not emit exactly one stable guest refusal class"
+  fi
+  if [[ $stage0_refusal == true ]]; then
+    # A refused bootstrap may not leave a proven-GNU record, and it may not have
+    # reached any climb code: the fake installer's event log is the first thing
+    # the rail writes after stage 0.
+    for forbidden_stage0 in \
+      "$result/evidence/gnu-toolchain/identity.txt" \
+      "$result/harness/events" \
+      "$result/source"; do
+      [[ ! -e $forbidden_stage0 && ! -L $forbidden_stage0 ]] ||
+        fail "$label stage-0 refusal left an identity record or reached climb code"
+    done
+  fi
+  if [[ $retry_probe == true ]]; then
+    ok "$label executes the exact rail twice and refuses $expected_reason with no partial state"
+    return
   fi
   for forbidden_green in \
+    "$result/evidence/gnu-toolchain/identity.json" \
     "$result/evidence/guest-nix/version.txt" \
     "$result/evidence/guest-nix/version.stderr" \
     "$result/evidence/guest-nix/identity.json" \
@@ -4729,7 +6070,11 @@ guest_rail_run_case() {
       fail "$label hostile rail created green identity or reached the Nix stub"
   done
   if [[ -d $result/evidence || -d $result/receipts ]]; then
+    # Stage 0's identity.txt is the proven-GNU bootstrap record that legitimately
+    # precedes every later refusal; the green preflight record is identity.json
+    # and it stays forbidden above for every case, including stage-0 refusals.
     ! find "$result/evidence" "$result/receipts" -type f \
+      ! -path '*/gnu-toolchain/identity.txt' \
       \( -iname '*identity*' -o -iname '*preflight*' \) -print 2>/dev/null | grep -q . ||
       fail "$label hostile rail created a green identity/preflight record"
   fi
@@ -4809,6 +6154,38 @@ GUEST_RAIL_EVENTS
 diff -u "$scratch/guest-rail-expected-events" "$guest_rail_happy/harness/events" >/dev/null ||
   fail 'S0 did not retain the exact ordered fixed-rail observations'
 ok 'S0 executes the complete fixed rail in its exact observable order'
+
+# The single most important assertion in this change: the whole rail above is
+# green *after* sed, grep, awk, sha256sum, find and xargs were really replaced.
+guest_rail_toolchain=$guest_rail_happy/evidence/gnu-toolchain
+guest_toolchain_write_expected_pins >"$scratch/guest-rail-expected-pins.txt"
+diff -u "$scratch/guest-rail-expected-pins.txt" "$guest_rail_toolchain/pins.txt" >/dev/null ||
+  fail 'S0 did not record the exact admitted ten-package offline pin evidence'
+guest_toolchain_write_expected_identity >"$scratch/guest-rail-expected-identity.txt"
+diff -u "$scratch/guest-rail-expected-identity.txt" "$guest_rail_toolchain/identity.txt" >/dev/null ||
+  fail 'S0 did not prove the exact twenty-one absolute-path GNU utilities and BusyBox tar'
+grep -Fq -- 'Installing coreutils (9.11-r3)' "$guest_rail_toolchain/install.log" ||
+  fail 'S0 did not really install the pinned Wolfi coreutils package offline'
+grep -Fq -- 'OK: ' "$guest_rail_toolchain/install.log" ||
+  fail 'S0 offline package install did not complete'
+[[ ! -e $guest_rail_toolchain/identity.json && ! -L $guest_rail_toolchain/identity.json ]] ||
+  fail 'stage 0 published a preflight identity receipt the runner alone may write'
+[[ $(find "$guest_rail_toolchain" -maxdepth 1 -name '*-version.txt' | wc -l) == 21 &&
+  $(find "$guest_rail_toolchain" -maxdepth 1 -name '*-version.stderr' -size +0 | wc -l) == 0 ]] ||
+  fail 'S0 did not retain twenty-one clean absolute-path identity probes'
+grep -Fq -- '(GNU sed) ' "$guest_rail_toolchain/sed-version.txt" ||
+  fail 'S0 lost the raw GNU sed identity output'
+grep -Fq -- '(GNU coreutils) ' "$guest_rail_toolchain/sha256sum-version.txt" ||
+  fail 'S0 lost the raw GNU coreutils identity output'
+assert_not_contains "$guest_rail_happy/harness/remote.stdout" Installing
+assert_not_contains "$guest_rail_happy/harness/remote.stderr" Installing
+[[ -z $(find "$guest_rail_happy/tmp" -maxdepth 1 -name 'gnu-toolchain.*' -print -quit 2>/dev/null) ]] ||
+  fail 'S0 left its guest toolchain behaviour scratch directory behind'
+for guest_toolchain_file in "${guest_toolchain_files[@]}"; do
+  [[ $(stat -c %a -- "$guest_rail_happy/gnu/$guest_toolchain_file") == 600 ]] ||
+    fail "S0 did not seal the verified package $guest_toolchain_file at mode 0600"
+done
+ok 'S0 really installs the pinned offline Wolfi closure, proves GNU identity, and leaks no apk output'
 
 cat >"$scratch/guest-rail-version.env" <<'GUEST_RAIL_VERSION_ENV'
 HOME=/run/diene-ci/home
@@ -4983,6 +6360,46 @@ grep -Fxq -- '/nix/store/diene-guest-rail/etc/profile.d/nix-daemon.sh' \
   "$GUEST_RAIL_RESULT/harness/profile.resolved" ||
   fail 'S13 did not reach the fixed direct-Nix availability guard'
 
+guest_rail_run_case G1 happy 64 GuestToolchainUntrusted
+guest_rail_run_case G2 happy 64 GuestToolchainUntrusted
+guest_rail_run_case G3 happy 64 GuestToolchainUntrusted
+guest_rail_run_case G4 g4-apk-absent 64 GuestToolchainUnavailable
+guest_rail_run_case G5 happy 64 GuestToolchainUnavailable
+assert_contains "$GUEST_RAIL_RESULT/harness/remote.stderr" APK_CONFIG
+assert_not_contains "$GUEST_RAIL_RESULT/harness/remote.stderr" guest-rail-secret-apk
+guest_rail_run_case G6 g6-identity-rebind 64 GuestToolchainIdentityUnexpected
+grep -Fq -- 'Installing sed (4.10-r1)' "$GUEST_RAIL_RESULT/evidence/gnu-toolchain/install.log" ||
+  fail 'G6 did not run the real install before its post-install identity rebind'
+guest_rail_run_case G7 g7-tar-stub 64 GuestToolchainTarUnexpected
+guest_rail_run_case G8 g8-apk-noop 64 GuestToolchainIdentityUnexpected
+[[ -f $GUEST_RAIL_RESULT/evidence/gnu-toolchain/install.log &&
+  ! -s $GUEST_RAIL_RESULT/evidence/gnu-toolchain/install.log ]] ||
+  fail 'G8 did not exercise a silently successful no-op package install'
+guest_rail_run_case G9 happy 0 ''
+grep -Fxq -- stage0-preceded-validator "$GUEST_RAIL_RESULT/harness/order" ||
+  fail 'G9 did not prove stage 0 completes before the archive validator runs'
+[[ -f $GUEST_RAIL_RESULT/evidence/gnu-toolchain/identity.txt ]] ||
+  fail 'G9 ordering probe ran without the stage-0 identity record'
+ok 'G9 proves the pinned GNU bootstrap completes before any climb code executes'
+guest_rail_run_case G10 g10-cancel nonzero ''
+[[ $(cat "$GUEST_RAIL_RESULT/harness/remote.rc") -ge 128 ]] ||
+  fail 'G10 did not cancel the exact rail with a signal status'
+guest_rail_run_case G11 g11-rerun 64 GuestNixPreexistingState
+[[ $(cat "$GUEST_RAIL_RESULT/harness/first.rc") == 0 ]] ||
+  fail 'G11 first pass did not complete the exact rail before the retry'
+[[ ! -s $GUEST_RAIL_RESULT/harness/first.stderr ]] ||
+  fail 'G11 first pass refused instead of completing the exact rail'
+# The retry is defined, not incidental: it stops at the pristine-guest gate that
+# now sits above stage 0, so apk is never re-run against a mutated guest.
+[[ $(grep -Fxc -- installer-install "$GUEST_RAIL_RESULT/harness/events") == 1 ]] ||
+  fail 'G11 retry re-entered the installed guest instead of refusing above stage 0'
+guest_rail_run_case G12 g12-no-network 64 GuestToolchainInstallFailed
+grep -Fq -- 'unable to select packages' \
+  "$GUEST_RAIL_RESULT/evidence/gnu-toolchain/install.log" ||
+  fail 'G12 did not prove the masked repository made the offline install fail closed'
+assert_not_contains "$GUEST_RAIL_RESULT/harness/remote.stdout" 'unable to select packages'
+ok 'G1-G12 refuse every package, apk, identity, tar, ordering, cancellation, and network vector'
+
 printf '== pinned guest Nix bootstrap fails closed ==\n'
 
 guest_nix_work_lib=$work/scripts/ci/environment-lib.sh
@@ -5069,6 +6486,50 @@ guest_nix_fetch_refusal 7313 installer-digest
 guest_nix_fetch_refusal 7314 payload-short
 guest_nix_fetch_refusal 7315 payload-digest
 ok 'redirect, transport, byte-count, and full-digest failures leave zero creates and no partial publication'
+
+guest_toolchain_fetch_refusal() {
+  local run_id=${1:?run id required} scenario=${2:?fetch scenario required}
+  prepare_run "$run_id"
+  expect_precreate_refusal GuestToolchainUntrusted env \
+    FAKE_GUEST_NIX_FETCH_SCENARIO="$scenario" ./scripts/ci/environment-k3d-run.sh orchestrate
+  ! find "$RUNNER_TEMP" -name '*.tmp.*' -print -quit | grep -q . ||
+    fail "$scenario left a private package acquisition temporary file"
+  ! find "$RUNNER_TEMP" -path '*/gnu/*' -name '*.apk.sha256' -print -quit | grep -q . ||
+    fail "$scenario published a package sidecar before its bytes verified"
+}
+guest_toolchain_fetch_refusal 7316 apk-short
+guest_toolchain_fetch_refusal 7317 apk-digest
+
+guest_toolchain_budget_refusal() {
+  local label=${1:?budget label required} url=${2:?url required} budget=${3:?budget required}
+  local root=$scratch/guest-toolchain-budget-$label rc=0
+  install -d -m 0700 "$root"
+  if (
+    # shellcheck source=/dev/null
+    source "$guest_nix_work_lib_backup"
+    # shellcheck disable=SC2329
+    diene_pinned_downloader() { printf '%s\n' "$fake_guest_nix_curl"; }
+    export FAKE_GUEST_NIX_CURL_LOG=$root.curl
+    export FAKE_GUEST_NIX_SOURCE_DIR=$guest_nix_fixture_dir
+    export FAKE_GUEST_TOOLCHAIN_SOURCE_DIR=$guest_toolchain_apk_dir
+    diene_fetch_pinned_artifact "$url" \
+      sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+      1 "$root/artifact" "$budget"
+  ) >"$root.out" 2>"$root.err"; then
+    fail "$label redirect budget unexpectedly passed"
+  else
+    rc=$?
+  fi
+  [[ $rc == 64 ]] || fail "$label redirect budget did not exit 64"
+  assert_contains "$root.err" InputContractInvalid
+  [[ ! -e $root/artifact && ! -s $root.curl ]] ||
+    fail "$label redirect budget fetched or published bytes before refusing"
+}
+guest_toolchain_budget_refusal nix-url-one-redirect \
+  'https://install.determinate.systems/nix/tag/v3.21.9' 1
+guest_toolchain_budget_refusal apk-url-two-redirects \
+  'https://apk.cgr.dev/chainguard/x86_64/sed-4.10-r1.apk' 2
+ok 'a short or changed package refuses before create and only the package class may spend one redirect'
 
 guest_nix_publication_refusal() {
   local label=${1:?publication label required} shape=${2:?publication shape required}
@@ -5207,7 +6668,7 @@ guest_nix_remote_refusal() {
   local expect_direct_nix=false
   case $scenario in
     guest-wrong-arch | guest-preexisting | guest-preexisting-etc-nix | \
-      guest-upload-* | guest-inherited-control-*) ;;
+      guest-upload-* | guest-inherited-control-* | guest-apk-* | guest-inherited-apk-*) ;;
     guest-wrong-installer-version | guest-empty-installer-version | \
       guest-multiline-installer-version | guest-extra-newline-installer-version | \
       guest-installer-version-stderr)
@@ -5362,7 +6823,17 @@ guest_nix_remote_refusal 7352 guest-inherited-control-unknown GuestNixInstallerU
   NIX_G9_UNKNOWN 1
 guest_nix_remote_refusal 7353 guest-inherited-control-nixpkgs GuestNixInstallerUntrusted \
   NIXPKGS_ALLOW_UNFREE 1
+guest_nix_remote_refusal 7354 guest-apk-tamper GuestToolchainUntrusted
+guest_nix_remote_refusal 7355 guest-apk-sidecar-tamper GuestToolchainUntrusted
+guest_nix_remote_refusal 7356 guest-apk-pair-tamper GuestToolchainUntrusted
+guest_nix_remote_refusal 7357 guest-apk-symlink GuestToolchainUntrusted
+guest_nix_remote_refusal 7358 guest-apk-missing GuestToolchainUntrusted
+guest_nix_remote_refusal 7359 guest-inherited-apk-config GuestToolchainUnavailable \
+  APK_CONFIG /tmp/attacker-apk.conf
+guest_nix_remote_refusal 7360 guest-inherited-apk-root GuestToolchainUnavailable \
+  APKROOT /tmp/attacker-root
 ok 'every remote refusal stops at its exact version, install, profile, and develop event boundary'
+ok 'a changed, missing, linked, or re-paired uploaded package refuses before the guest Nix rail'
 
 guest_nix_identity_probe() (
   local mode=${1:?identity mode required} root=${2:?identity root required}
@@ -5501,12 +6972,426 @@ driver_policy_line=$(rg -n 'diene_apply_interim_policy "\$resolved"' \
 driver_application_seam='"${DIENE_PLS_BIN:-pls}" env up '
 driver_application_line=$(rg -n -F "$driver_application_seam" \
   "$template_root/scripts/ci/environment-k3d-run.sh" | cut -d: -f1)
+preflight_toolchain_line=$(rg -n 'guest_toolchain=\$\(diene_guest_toolchain_identity' \
+  "$template_root/scripts/ci/environment-runner-preflight.sh" | cut -d: -f1)
+preflight_toolchain_agreement_line=$(rg -n '^diene_require_guest_toolchain_preflight_agreement' \
+  "$template_root/scripts/ci/environment-runner-preflight.sh" | cut -d: -f1)
+preflight_output_line=$(rg -n '^  diene_write_json "\$output"$' \
+  "$template_root/scripts/ci/environment-runner-preflight.sh" | cut -d: -f1)
+for preflight_boundary in "$preflight_toolchain_line" "$preflight_toolchain_agreement_line" \
+  "$preflight_output_line"; do
+  [[ $preflight_boundary =~ ^[1-9][0-9]*$ ]] ||
+    fail 'a runner preflight guest toolchain boundary is absent or ambiguous'
+done
 [[ $preflight_profile_line -lt $preflight_identity_line &&
-  $preflight_identity_line -lt $preflight_node_line &&
+  $preflight_identity_line -lt $preflight_toolchain_line &&
+  $preflight_toolchain_line -lt $preflight_node_line &&
+  $preflight_output_line -lt $preflight_toolchain_agreement_line &&
   $driver_preflight_line -lt $driver_policy_line &&
   $driver_preflight_line -lt $driver_application_line ]] ||
   fail 'guest Nix profile and identity are not ordered before posture, policy, and application mutation'
+# The independent re-proof must read absolute guest paths, never the dev shell.
+rg -q 'DIENE_GUEST_TOOLCHAIN_INPUT' "$template_root/scripts/ci/environment-runner-preflight.sh" ||
+  fail 'the real runner preflight no longer binds the admitted guest toolchain input'
 ok 'exact, empty, multiline, recorded, store-path, installed-copy, upload, receipt, and binding identity cases fail before mutation'
+ok 'the runner independently re-proves the guest toolchain before posture and agrees after publication'
+
+printf '== the pinned Wolfi GNU toolchain bootstrap fails closed ==\n'
+
+guest_toolchain_good_packages=$(
+  # shellcheck source=/dev/null
+  source "$guest_nix_work_lib_backup"
+  printf '%s\n' "$DIENE_GUEST_TOOLCHAIN_PACKAGES"
+)
+guest_toolchain_sed_row='sed|4.10-r1|341772|sha256:64f97fb24d76be3d835114b93ef77385c82a8f3b432a775ed72394e86171f28c'
+grep -Fxq -- "$guest_toolchain_sed_row" <<<"$guest_toolchain_good_packages" ||
+  fail 'the production Wolfi closure no longer carries the exact pinned sed row'
+
+# Every refusal below mutates exactly one field of the otherwise admitted
+# closure, so a pass proves the specific rule rather than a generic parse error.
+guest_toolchain_mutated_packages() {
+  local replacement=${1:?replacement row required}
+  local mutated
+  mutated=${guest_toolchain_good_packages/"$guest_toolchain_sed_row"/"$replacement"}
+  [[ $mutated != "$guest_toolchain_good_packages" ]] ||
+    fail 'a guest toolchain closure mutation did not change the admitted table'
+  printf '%s\n' "$mutated"
+}
+
+guest_toolchain_contract_refusal() {
+  local label=${1:?contract label required} rc=0
+  if (
+    # shellcheck source=/dev/null
+    source "$guest_nix_work_lib_backup"
+    case $label in
+      malformed-row)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(guest_toolchain_mutated_packages "$guest_toolchain_sed_row|extra")
+        ;;
+      short-digest)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(guest_toolchain_mutated_packages 'sed|4.10-r1|341772|sha256:abcd')
+        ;;
+      unprefixed-digest)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(guest_toolchain_mutated_packages \
+          'sed|4.10-r1|341772|64f97fb24d76be3d835114b93ef77385c82a8f3b432a775ed72394e86171f28c')
+        ;;
+      zero-bytes)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(guest_toolchain_mutated_packages \
+          'sed|4.10-r1|0|sha256:64f97fb24d76be3d835114b93ef77385c82a8f3b432a775ed72394e86171f28c')
+        ;;
+      negative-bytes)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(guest_toolchain_mutated_packages \
+          'sed|4.10-r1|-341772|sha256:64f97fb24d76be3d835114b93ef77385c82a8f3b432a775ed72394e86171f28c')
+        ;;
+      nonnumeric-bytes)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(guest_toolchain_mutated_packages \
+          'sed|4.10-r1|not-a-number|sha256:64f97fb24d76be3d835114b93ef77385c82a8f3b432a775ed72394e86171f28c')
+        ;;
+      unpinned-version)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(guest_toolchain_mutated_packages \
+          'sed|4.10|341772|sha256:64f97fb24d76be3d835114b93ef77385c82a8f3b432a775ed72394e86171f28c')
+        ;;
+      duplicate-package)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(guest_toolchain_mutated_packages \
+          'grep|4.10-r1|341772|sha256:64f97fb24d76be3d835114b93ef77385c82a8f3b432a775ed72394e86171f28c')
+        ;;
+      outside-closure)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(guest_toolchain_mutated_packages \
+          'diffutils|4.10-r1|341772|sha256:64f97fb24d76be3d835114b93ef77385c82a8f3b432a775ed72394e86171f28c')
+        ;;
+      short-closure)
+        DIENE_GUEST_TOOLCHAIN_PACKAGES=$(grep -Fxv -- "$guest_toolchain_sed_row" \
+          <<<"$guest_toolchain_good_packages")
+        ;;
+      ruled-drift) DIENE_GUEST_TOOLCHAIN_RULED_SET='coreutils findutils sed grep gawk diffutils' ;;
+      closure-drift) DIENE_GUEST_TOOLCHAIN_CLOSURE_SET='coreutils findutils sed grep gawk' ;;
+      apk-bin-drift) DIENE_GUEST_TOOLCHAIN_APK_BIN=/sbin/apk ;;
+      package-dir-drift) DIENE_GUEST_TOOLCHAIN_DIR=/tmp/gnu ;;
+      repository-drift) DIENE_GUEST_TOOLCHAIN_REPO_BASE=https://packages.invalid/x86_64 ;;
+      architecture-drift) DIENE_GUEST_TOOLCHAIN_ARCH=aarch64 ;;
+      execution-mode-drift) DIENE_GUEST_TOOLCHAIN_EXECUTION_MODE=online-apk ;;
+      *) exit 127 ;;
+    esac
+    export DIENE_GUEST_TOOLCHAIN_PACKAGES DIENE_GUEST_TOOLCHAIN_RULED_SET \
+      DIENE_GUEST_TOOLCHAIN_CLOSURE_SET DIENE_GUEST_TOOLCHAIN_APK_BIN \
+      DIENE_GUEST_TOOLCHAIN_DIR DIENE_GUEST_TOOLCHAIN_REPO_BASE \
+      DIENE_GUEST_TOOLCHAIN_ARCH DIENE_GUEST_TOOLCHAIN_EXECUTION_MODE
+    diene_guest_toolchain_contract
+  ) >"$scratch/guest-toolchain-contract-$label.out" 2>"$scratch/guest-toolchain-contract-$label.err"; then
+    fail "$label guest toolchain contract unexpectedly passed"
+  else
+    rc=$?
+  fi
+  [[ $rc == 64 ]] || fail "$label guest toolchain contract did not exit 64 (got $rc)"
+  assert_contains "$scratch/guest-toolchain-contract-$label.err" InputContractInvalid
+  [[ ! -s $scratch/guest-toolchain-contract-$label.out ]] ||
+    fail "$label guest toolchain contract emitted a partial contract before refusing"
+}
+
+for guest_toolchain_contract_case in malformed-row short-digest unprefixed-digest zero-bytes \
+  negative-bytes nonnumeric-bytes unpinned-version duplicate-package outside-closure \
+  short-closure ruled-drift closure-drift apk-bin-drift package-dir-drift repository-drift \
+  architecture-drift execution-mode-drift; do
+  guest_toolchain_contract_refusal "$guest_toolchain_contract_case"
+done
+ok 'malformed, unpinned, zero, negative, duplicate, outside-closure, and short-closure pins all refuse'
+
+guest_toolchain_contract_one=$(
+  # shellcheck source=/dev/null
+  source "$guest_nix_work_lib_backup"
+  diene_guest_toolchain_contract
+)
+guest_toolchain_contract_two=$(
+  # shellcheck source=/dev/null
+  source "$guest_nix_work_lib_backup"
+  diene_guest_toolchain_contract
+)
+guest_toolchain_digest_one=$(
+  # shellcheck source=/dev/null
+  source "$guest_nix_work_lib_backup"
+  diene_guest_toolchain_contract_digest
+)
+guest_toolchain_digest_two=$(
+  # shellcheck source=/dev/null
+  source "$guest_nix_work_lib_backup"
+  diene_guest_toolchain_contract_digest
+)
+[[ $guest_toolchain_contract_one == "$guest_toolchain_contract_two" &&
+  $guest_toolchain_digest_one == "$guest_toolchain_digest_two" ]] ||
+  fail 'the guest toolchain contract or its digest is not byte-identical across two derivations'
+[[ $guest_toolchain_digest_one =~ ^sha256:[0-9a-f]{64}$ ]] ||
+  fail 'the guest toolchain contract digest is not a full sha256 receipt'
+guest_toolchain_sorted_names='coreutils findutils gawk grep libacl1 libattr1 libpcre2-8-0 libselinux libsepol sed'
+[[ $(jq -r '[.packages[].name] | join(" ")' <<<"$guest_toolchain_contract_one") == "$guest_toolchain_sorted_names" ]] ||
+  fail 'the guest toolchain contract package array is not canonically name-sorted'
+jq -e '
+  .executionMode == "offline-pinned-apk" and .apkBinPath == "/usr/bin/apk" and
+  .packageDir == "/run/diene-ci/gnu" and .architecture == "x86_64" and
+  (.packages | length) == 10 and (.argv | length) == 14 and
+  (.argv | .[0:4]) == ["add","--no-progress","--no-network","--allow-untrusted"] and
+  (.argv | .[4:] | map(startswith("/run/diene-ci/gnu/")) | all) and
+  (.argv | .[4:]) == [
+    "/run/diene-ci/gnu/libacl1-2.4.0-r1.apk","/run/diene-ci/gnu/libattr1-2.6.0-r1.apk",
+    "/run/diene-ci/gnu/libpcre2-8-0-10.47-r0.apk","/run/diene-ci/gnu/libsepol-3.11-r0.apk",
+    "/run/diene-ci/gnu/libselinux-3.11-r0.apk","/run/diene-ci/gnu/coreutils-9.11-r3.apk",
+    "/run/diene-ci/gnu/findutils-4.11.0-r1.apk","/run/diene-ci/gnu/gawk-5.4.1-r0.apk",
+    "/run/diene-ci/gnu/grep-3.12-r6.apk","/run/diene-ci/gnu/sed-4.10-r1.apk"]
+' <<<"$guest_toolchain_contract_one" >/dev/null ||
+  fail 'the guest toolchain contract lost its fixed offline argv or dependency-first install order'
+ok 'the guest toolchain contract digest is deterministic, name-sorted, and fixed-argv bound'
+
+guest_toolchain_identity_rows=(
+  'sed|/usr/bin/sed|/usr/bin/sed|(GNU sed)'
+  'grep|/usr/bin/grep|/usr/bin/grep|(GNU grep)'
+  'awk|/usr/bin/awk|/usr/bin/gawk|GNU Awk'
+  'find|/usr/bin/find|/usr/bin/find|(GNU findutils)'
+  'xargs|/usr/bin/xargs|/usr/bin/xargs|(GNU findutils)'
+  'sha256sum|/usr/bin/sha256sum|/usr/bin/coreutils|(GNU coreutils)'
+  'stat|/usr/bin/stat|/usr/bin/coreutils|(GNU coreutils)'
+  'cut|/usr/bin/cut|/usr/bin/coreutils|(GNU coreutils)'
+  'sort|/usr/bin/sort|/usr/bin/coreutils|(GNU coreutils)'
+  'head|/usr/bin/head|/usr/bin/coreutils|(GNU coreutils)'
+  'wc|/usr/bin/wc|/usr/bin/coreutils|(GNU coreutils)'
+  'date|/usr/bin/date|/usr/bin/coreutils|(GNU coreutils)'
+  'tr|/usr/bin/tr|/usr/bin/coreutils|(GNU coreutils)'
+  'cat|/usr/bin/cat|/usr/bin/coreutils|(GNU coreutils)'
+  'install|/usr/bin/install|/usr/bin/coreutils|(GNU coreutils)'
+  'readlink|/usr/bin/readlink|/usr/bin/coreutils|(GNU coreutils)'
+  'id|/usr/bin/id|/usr/bin/coreutils|(GNU coreutils)'
+  'mktemp|/usr/bin/mktemp|/usr/bin/coreutils|(GNU coreutils)'
+  'chmod|/usr/bin/chmod|/usr/bin/coreutils|(GNU coreutils)'
+  'rm|/usr/bin/rm|/usr/bin/coreutils|(GNU coreutils)'
+  'uname|/usr/bin/uname|/usr/bin/coreutils|(GNU coreutils)'
+)
+# The independent expectation of the twenty-one proven utilities plus the two
+# behaviour proofs and the three BusyBox tar facts, written here rather than
+# read back from the production text so a silent narrowing cannot pass.
+guest_toolchain_write_expected_identity() {
+  local row name binary logical token
+  for row in "${guest_toolchain_identity_rows[@]}"; do
+    IFS='|' read -r name binary logical token <<<"$row"
+    printf '%s|%s|%s|%s \n' "$name" "$binary" "$logical" "$token"
+  done
+  printf '%s\n' behaviorSha256sumCheck=pass behaviorSedInPlace=pass \
+    tarImplementation=busybox tarResolvedPath=/usr/bin/busybox \
+    tarPortableFlags=-cf,-tf,-tvf,-xf,-C,-f tarTypeCharacter=-
+}
+guest_toolchain_write_expected_pins() {
+  printf '%s\n' executionMode=offline-pinned-apk
+  tr '|' ' ' <<<"$guest_toolchain_good_packages"
+}
+
+guest_toolchain_identity_probe() (
+  local mode=${1:?toolchain identity mode required} root=${2:?toolchain identity root required}
+  # shellcheck source=/dev/null
+  source "$guest_nix_work_lib_backup"
+  local bin=$root/usr/bin evidence=$root/evidence/gnu-toolchain input=$root/inputs.json
+  local coreutils_tool row name binary logical token
+  install -d -m 0700 "$root" "$bin" "$evidence"
+  cat >"$bin/sed" <<'FAKE_SED'
+#!/bin/sh
+if [ "$1" = --version ]; then
+  case ${FAKE_TOOLCHAIN_MODE:-happy} in
+    missing-token) printf '%s\n' 'sed (BusyBox) 1.37.0' ;;
+    probe-stderr) printf '%s\n' '/usr/bin/sed (GNU sed) 4.10'; printf '%s\n' warning >&2 ;;
+    probe-failure) exit 3 ;;
+    *) printf '%s\n' '/usr/bin/sed (GNU sed) 4.10' ;;
+  esac
+  exit 0
+fi
+[ "$1" != -i ] || [ "${FAKE_TOOLCHAIN_MODE:-happy}" != sed-in-place ] || exit 0
+exec sed "$@"
+FAKE_SED
+  cat >"$bin/grep" <<'FAKE_GREP'
+#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'grep (GNU grep) 3.12'; exit 0; fi
+exec grep "$@"
+FAKE_GREP
+  cat >"$bin/gawk" <<'FAKE_GAWK'
+#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'GNU Awk 5.4.1, API 4.1, PMA Avon 8-g1'; exit 0; fi
+exec awk "$@"
+FAKE_GAWK
+  cat >"$bin/find" <<'FAKE_FIND'
+#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'find (GNU findutils) 4.11.0'; exit 0; fi
+exec find "$@"
+FAKE_FIND
+  cat >"$bin/xargs" <<'FAKE_XARGS'
+#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'xargs (GNU findutils) 4.11.0'; exit 0; fi
+exec xargs "$@"
+FAKE_XARGS
+  cat >"$bin/coreutils" <<'FAKE_COREUTILS'
+#!/bin/sh
+tool=${0##*/}
+[ "$tool" != coreutils ] || exit 127
+if [ "$1" = --version ]; then printf '%s (GNU coreutils) 9.11\n' "$tool"; exit 0; fi
+if [ "$tool" = sha256sum ] && [ "$1" = --check ] &&
+  [ "${FAKE_TOOLCHAIN_MODE:-happy}" = sha256-check ]; then
+  printf '%s\n' 'known.txt: FAILED' >&2
+  exit 1
+fi
+exec "$tool" "$@"
+FAKE_COREUTILS
+  cat >"$bin/busybox" <<'FAKE_BUSYBOX'
+#!/bin/sh
+tool=${0##*/}
+[ "$tool" != busybox ] || exit 127
+if [ "$tool" = tar ] && [ "$1" = -tvf ] &&
+  [ "${FAKE_TOOLCHAIN_MODE:-happy}" = tar-type ]; then
+  printf '%s\n' 'lrwxrwxrwx 0/0 0 2026-08-02 00:00 member'
+  exit 0
+fi
+exec "$tool" "$@"
+FAKE_BUSYBOX
+  chmod 0755 "$bin/sed" "$bin/grep" "$bin/gawk" "$bin/find" "$bin/xargs" \
+    "$bin/coreutils" "$bin/busybox"
+  ln -s gawk "$bin/awk"
+  ln -s busybox "$bin/tar"
+  for coreutils_tool in sha256sum stat cut sort head wc date tr cat install readlink id \
+    mktemp chmod rm uname; do
+    ln -s coreutils "$bin/$coreutils_tool"
+  done
+  guest_toolchain_write_expected_pins >"$evidence/pins.txt"
+  printf '%s\n' 'OK: 26 MiB in 25 packages' >"$evidence/install.log"
+  guest_toolchain_write_expected_identity >"$evidence/identity.txt"
+  chmod 0600 "$evidence/pins.txt" "$evidence/install.log" "$evidence/identity.txt"
+  jq -n --argjson guestToolchain "$(diene_guest_toolchain_contract)" \
+    '{guestToolchain:$guestToolchain}' >"$input"
+  case $mode in
+    busybox-resolution)
+      rm "$bin/sed"
+      ln -s busybox "$bin/sed"
+      ;;
+    tar-not-busybox)
+      rm "$bin/tar"
+      printf '%s\n' '#!/bin/sh' 'exec tar "$@"' >"$bin/tar"
+      chmod 0755 "$bin/tar"
+      ;;
+    absent-binary) rm "$bin/xargs" ;;
+    pins-drift) printf '%s\n' 'sed 4.10-r1 1 sha256:00' >"$evidence/pins.txt" ;;
+    pins-mode) chmod 0644 "$evidence/pins.txt" ;;
+    install-log-absent) rm "$evidence/install.log" ;;
+    stage-identity-drift) printf '%s\n' 'tarImplementation=gnu' >>"$evidence/identity.txt" ;;
+    stage-identity-mode) chmod 0644 "$evidence/identity.txt" ;;
+    contract-drift)
+      jq '.guestToolchain.apkBinPath = "/sbin/apk"' "$input" >"$input.tmp"
+      mv "$input.tmp" "$input"
+      ;;
+  esac
+  export FAKE_TOOLCHAIN_MODE=$mode
+  # Stop at the first refusal so every case proves exactly one stable class:
+  # `set -e` is suspended inside the `if` that calls this probe, so a failed
+  # command substitution would otherwise fall through into a second refusal.
+  local guest_toolchain
+  guest_toolchain=$(diene_guest_toolchain_identity "$input" "$evidence" "$root") || exit $?
+  jq -n --argjson guestToolchain "$guest_toolchain" '{guestToolchain:$guestToolchain}' \
+    >"$evidence/preflight.json" || exit $?
+  case $mode in
+    receipt-mismatch)
+      jq '.tarTypeCharacter = "l"' "$evidence/identity.json" >"$evidence/identity.json.tmp"
+      mv "$evidence/identity.json.tmp" "$evidence/identity.json"
+      ;;
+    binding-digest-mismatch)
+      jq '.guestToolchain.identityReceiptDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"' \
+        "$evidence/preflight.json" >"$evidence/preflight.json.tmp"
+      mv "$evidence/preflight.json.tmp" "$evidence/preflight.json"
+      ;;
+    pins-post-identity-tamper) printf '%s\n' 'sed 4.10-r1 1 sha256:00' >>"$evidence/pins.txt" ;;
+    install-log-post-identity-tamper) printf '%s\n' tampered >>"$evidence/install.log" ;;
+  esac
+  diene_require_guest_toolchain_preflight_agreement "$evidence/preflight.json" \
+    "$evidence/identity.json"
+)
+
+guest_toolchain_identity_refusal() {
+  local label=${1:?toolchain identity case required} reason=${2:?refusal class required} rc=0
+  local root=$scratch/guest-toolchain-identity-$label
+  if guest_toolchain_identity_probe "$label" "$root" >"$root.out" 2>"$root.err"; then
+    fail "$label guest toolchain identity unexpectedly passed"
+  else
+    rc=$?
+  fi
+  [[ $rc == 64 ]] || fail "$label guest toolchain identity did not exit 64 (got $rc)"
+  assert_contains "$root.err" "$reason"
+  [[ $(grep -Ec '^Guest(Nix|Toolchain)[A-Za-z]+:' "$root.err") == 1 ]] ||
+    fail "$label guest toolchain identity did not emit exactly one stable refusal class"
+}
+
+guest_toolchain_identity_refusal busybox-resolution GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal missing-token GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal probe-stderr GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal probe-failure GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal absent-binary GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal sha256-check GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal sed-in-place GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal tar-not-busybox GuestToolchainTarUnexpected
+guest_toolchain_identity_refusal tar-type GuestToolchainTarUnexpected
+guest_toolchain_identity_refusal pins-drift GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal pins-mode GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal install-log-absent GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal stage-identity-drift GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal stage-identity-mode GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal contract-drift GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal receipt-mismatch GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal binding-digest-mismatch GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal pins-post-identity-tamper GuestToolchainIdentityUnexpected
+guest_toolchain_identity_refusal install-log-post-identity-tamper GuestToolchainIdentityUnexpected
+ok 'busybox, token, stderr, behaviour, tar, evidence, contract, and binding drift all refuse independently'
+
+guest_toolchain_identity_happy_root=$scratch/guest-toolchain-identity-happy
+guest_toolchain_identity_probe happy "$guest_toolchain_identity_happy_root" \
+  >"$guest_toolchain_identity_happy_root.out" 2>"$guest_toolchain_identity_happy_root.err" || {
+  sed -n '1,160p' "$guest_toolchain_identity_happy_root.err" >&2
+  fail 'the exact absolute-path guest toolchain identity did not pass'
+}
+guest_toolchain_happy_evidence=$guest_toolchain_identity_happy_root/evidence/gnu-toolchain
+jq -e '
+  .absolutePathIdentity == true and .sha256sumCheckBehavior == true and
+  .sedInPlaceBehavior == true and .tarImplementation == "busybox" and
+  .tarResolvedPath == "/usr/bin/busybox" and .tarTypeCharacter == "-" and
+  .tarPortableFlags == ["-cf","-tf","-tvf","-xf","-C","-f"] and
+  (.contractDigest | test("^sha256:[0-9a-f]{64}$"))
+' "$guest_toolchain_happy_evidence/identity.json" >/dev/null ||
+  fail 'the passing guest toolchain identity receipt lost a proven fact'
+[[ -z $(find "$guest_toolchain_happy_evidence" -maxdepth 1 -name '.identity-proof.*' -print -quit) ]] ||
+  fail 'the passing guest toolchain identity left its behaviour scratch directory behind'
+[[ $(find "$guest_toolchain_happy_evidence" -maxdepth 1 -name '*-version.txt' | wc -l) == 21 ]] ||
+  fail 'the guest toolchain identity did not independently probe all twenty-one utilities'
+ok 'the independent absolute-path proof records twenty-one utilities, both behaviours, and BusyBox tar'
+
+guest_toolchain_evidence_dir_refusal() {
+  local label=${1:?evidence label required} staging=${2-} rc=0
+  if (
+    # shellcheck source=/dev/null
+    source "$guest_nix_work_lib_backup"
+    if [[ -n $staging ]]; then export DIENE_EVIDENCE_STAGING=$staging; else unset DIENE_EVIDENCE_STAGING; fi
+    diene_guest_toolchain_evidence_dir
+  ) >"$scratch/guest-toolchain-evidence-$label.out" 2>"$scratch/guest-toolchain-evidence-$label.err"; then
+    fail "$label guest toolchain evidence directory unexpectedly passed"
+  else
+    rc=$?
+  fi
+  [[ $rc == 64 ]] || fail "$label guest toolchain evidence directory did not exit 64"
+  assert_contains "$scratch/guest-toolchain-evidence-$label.err" GuestToolchainIdentityUnexpected
+}
+guest_toolchain_evidence_root=$scratch/guest-toolchain-evidence-root
+install -d -m 0700 "$guest_toolchain_evidence_root/staging" "$guest_toolchain_evidence_root/other"
+guest_toolchain_evidence_dir_refusal unset ''
+guest_toolchain_evidence_dir_refusal relative staging
+guest_toolchain_evidence_dir_refusal absent "$guest_toolchain_evidence_root/missing/staging"
+guest_toolchain_evidence_dir_refusal misnamed "$guest_toolchain_evidence_root/other"
+guest_toolchain_evidence_created=$(
+  # shellcheck source=/dev/null
+  source "$guest_nix_work_lib_backup"
+  export DIENE_EVIDENCE_STAGING=$guest_toolchain_evidence_root/staging
+  diene_guest_toolchain_evidence_dir
+)
+[[ $guest_toolchain_evidence_created == "$guest_toolchain_evidence_root/gnu-toolchain" &&
+  -d $guest_toolchain_evidence_created &&
+  $(stat -c %a -- "$guest_toolchain_evidence_created") == 700 ]] ||
+  fail 'the driver-owned guest toolchain evidence directory is not the private sibling of staging'
+ok 'guest toolchain evidence requires an absolute driver-owned staging sibling at mode 0700'
 
 printf '== resolver, hostile probe, and vendor broker fail closed ==\n'
 
